@@ -1,0 +1,154 @@
+# =============================================================================
+# AI Testing Automation — Phase 0 POC
+# Docker Compose Infrastructure
+# =============================================================================
+# Services:
+#   selenium     - Selenium standalone Chrome (browser automation)
+#   pushgateway  - Receives batch test metrics
+#   prometheus   - Scrapes and stores metrics
+#   grafana      - Queries and visualizes test results
+#   test-runner  - Robot Framework execution container (run on-demand)
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Selenium Standalone Chrome
+  # Provides remote WebDriver for browser automation
+  # noVNC available at http://localhost:7900 (password: secret)
+  # ---------------------------------------------------------------------------
+  selenium:
+    image: selenium/standalone-chrome:4.49.0
+    container_name: ai-test-selenium
+    shm_size: 2g
+    ports:
+      - "${SELENIUM_PORT:-4444}:4444"
+      - "${SELENIUM_VNC_PORT:-7900}:7900"
+    environment:
+      - SE_NODE_MAX_SESSIONS=2
+      - SE_SESSION_TIMEOUT=300
+    networks:
+      - testing-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4444/wd/hub/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Prometheus Pushgateway
+  # Receives batch test metrics from Robot Listener
+  # Grouping key: job=qa_tests, instance=<project>_<suite>_<browser>
+  # ---------------------------------------------------------------------------
+  pushgateway:
+    image: prom/pushgateway:v1.11.3
+    container_name: ai-test-pushgateway
+    ports:
+      - "${PUSHGATEWAY_PORT:-9091}:9091"
+    networks:
+      - testing-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9091/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # Prometheus
+  # Scrapes Pushgateway for test execution metrics
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    container_name: ai-test-prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    networks:
+      - testing-network
+    depends_on:
+      pushgateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Grafana
+  # Visualizes test execution metrics from Prometheus
+  # Dashboard auto-provisioned on startup
+  # Default login: admin / admin
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:13.2.2
+    container_name: ai-test-grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - testing-network
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # Test Runner (on-demand)
+  # Supports two modes:
+  #   Robot:  docker compose run --rm test-runner robot [args] tests/...
+  #   AI:    docker compose run --rm test-runner python -m automation.runner --suite ...
+  # ---------------------------------------------------------------------------
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.testrunner
+    container_name: ai-test-runner
+    environment:
+      - SELENIUM_REMOTE_URL=${SELENIUM_REMOTE_URL:-http://selenium:4444}
+      - PUSHGATEWAY_URL=${PUSHGATEWAY_URL:-http://pushgateway:9091}
+      - BASE_URL=${BASE_URL:-https://trackpilot.pods365.com}
+      - BROWSER=${BROWSER:-chrome}
+      - PROJECT_NAME=${PROJECT_NAME:-trackpilot}
+      - VALID_USER_EMAIL=${VALID_USER_EMAIL:-}
+      - VALID_USER_PASSWORD=${VALID_USER_PASSWORD:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - TEST_SUITE=${TEST_SUITE:-testsuites/trackpilot.testsuite.md}
+    volumes:
+      - ./artifacts:/opt/testing/artifacts
+      - ./testsuites:/opt/testing/testsuites:ro
+    networks:
+      - testing-network
+    depends_on:
+      selenium:
+        condition: service_healthy
+      pushgateway:
+        condition: service_healthy
+    profiles:
+      - test
+
+networks:
+  testing-network:
+    name: ai-testing-network
+    driver: bridge

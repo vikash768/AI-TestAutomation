@@ -1,0 +1,29 @@
+# Environment
+.env
+*.pyc
+__pycache__/
+*.pyo
+.venv/
+venv/
+env/
+
+# Artifacts (generated at runtime)
+artifacts/robot/
+artifacts/screenshots/
+artifacts/logs/
+artifacts/runs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes
+prometheus_data/
+grafana_data/
