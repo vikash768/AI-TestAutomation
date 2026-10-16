@@ -16,6 +16,8 @@ import base64
 from pathlib import Path
 from typing import Any
 
+from automation.secrets.sanitizer import sanitize_text
+
 logger = logging.getLogger(__name__)
 
 # File extensions to scan for frontend / app elements
@@ -82,10 +84,18 @@ class RepoReader:
                         self.last_error = self._sanitize_error(result.stderr or result.stdout)
                         logger.warning("Could not update cached repository: %s", self.last_error)
                 except Exception as e:
-                    logger.debug("Non-fatal error updating repository %s: %s", dest_dir, e)
+                    logger.debug(
+                        "Non-fatal error updating repository %s: %s",
+                        dest_dir,
+                        sanitize_text(str(e)),
+                    )
                 return dest_dir
 
-            logger.info("Cloning repository from %s into %s (depth=1)...", self._repo_url, dest_dir)
+            logger.info(
+                "Cloning repository from %s into %s (depth=1)...",
+                sanitize_text(self._repo_url),
+                dest_dir,
+            )
             clone_command = ["git", "clone", "--depth", "1"]
             if self._repo_ref:
                 clone_command.extend(["--branch", self._repo_ref])
@@ -106,16 +116,23 @@ class RepoReader:
                 self.last_error = err
                 logger.warning(
                     "Could not clone repository '%s' (exit code %d): %s",
-                    self._repo_url, result.returncode, err
+                    sanitize_text(self._repo_url), result.returncode, err
                 )
                 return None
         except subprocess.TimeoutExpired:
             self.last_error = "Timed out while cloning the repository"
-            logger.warning("Timed out cloning repository '%s'. Proceeding with suite instructions.", self._repo_url)
+            logger.warning(
+                "Timed out cloning repository '%s'. Proceeding with suite instructions.",
+                sanitize_text(self._repo_url),
+            )
             return None
         except Exception as e:
             self.last_error = self._sanitize_error(str(e))
-            logger.warning("Error fetching repository '%s': %s. Proceeding with suite instructions.", self._repo_url, self.last_error)
+            logger.warning(
+                "Error fetching repository '%s': %s. Proceeding with suite instructions.",
+                sanitize_text(self._repo_url),
+                self.last_error,
+            )
             return None
 
     def inspect_codebase(self, repo_path: Path | None = None, target_type: str = "web") -> dict[str, Any]:
@@ -131,7 +148,7 @@ class RepoReader:
         path = repo_path or self.fetch_or_locate_repo()
         if not path or not path.is_dir():
             return {
-                "repo_url": self._repo_url,
+                "repo_url": sanitize_text(self._repo_url),
                 "repo_path": None,
                 "repo_error": self.last_error,
                 "scanned_files": 0,
@@ -219,7 +236,7 @@ class RepoReader:
         summary_prompt = "\n".join(f"- {part}" for part in summary_parts)
 
         return {
-            "repo_url": self._repo_url,
+            "repo_url": sanitize_text(self._repo_url),
             "repo_path": str(path),
             "repo_error": self.last_error,
             "scanned_files": scanned_count,
@@ -275,7 +292,7 @@ class RepoReader:
 
     @staticmethod
     def _sanitize_error(message: str) -> str:
-        sanitized = message.strip()
+        sanitized = sanitize_text(message.strip())
         for secret_name in ("GH_TOKEN", "GITHUB_TOKEN"):
             secret = os.environ.get(secret_name, "")
             if secret:

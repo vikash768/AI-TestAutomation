@@ -1,11 +1,22 @@
 # Environment
 .env
-*.pyc
+.env.*
+!.env.example
+
+# Python
 __pycache__/
+*.py[cod]
 *.pyo
 .venv/
 venv/
 env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
 # Artifacts (generated at runtime)
 artifacts/robot/
@@ -13,6 +24,39 @@ artifacts/screenshots/
 artifacts/logs/
 artifacts/runs/
 artifacts/cache/
+artifacts/repos/
+artifacts/builds/
+/log.html
+/report.html
+/output.xml
+*.log
+*.pid
+
+# Credentials and signing material
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+service-account*.json
+service_account*.json
+*-service-account.json
+*-service-account-key.json
+google-credentials*.json
+gcp-credentials*.json
+credentials.local.json
+credentials.*.local.json
+
+# Local mobile/desktop builds
+*.apk
+*.aab
+*.ipa
+*.xcarchive/
+*.app/
+*.msi
 
 # IDE
 .idea/

@@ -15,7 +15,7 @@ services:
   # ---------------------------------------------------------------------------
   # Selenium Standalone Chrome
   # Provides remote WebDriver for browser automation
-  # noVNC available at http://localhost:7900 (password: secret)
+  # noVNC password must be supplied through the local environment.
   # ---------------------------------------------------------------------------
   selenium:
     image: selenium/standalone-chrome:4.49.0
@@ -27,6 +27,7 @@ services:
     environment:
       - SE_NODE_MAX_SESSIONS=2
       - SE_SESSION_TIMEOUT=300
+      - SE_VNC_PASSWORD=${SELENIUM_VNC_PASSWORD:?Set SELENIUM_VNC_PASSWORD in .env}
     networks:
       - testing-network
     healthcheck:
@@ -88,7 +89,7 @@ services:
   # Grafana
   # Visualizes test execution metrics from Prometheus
   # Dashboard auto-provisioned on startup
-  # Default login: admin / admin
+  # Admin password must be supplied through the local environment.
   # ---------------------------------------------------------------------------
   grafana:
     image: grafana/grafana:13.2.2
@@ -97,7 +98,7 @@ services:
       - "${GRAFANA_PORT:-3000}:3000"
     environment:
       - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER:-admin}
-      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:?Set GF_SECURITY_ADMIN_PASSWORD in .env}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro

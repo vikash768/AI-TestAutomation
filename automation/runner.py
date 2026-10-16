@@ -251,15 +251,18 @@ class AITestRunner:
                         pass
                 logger.warning(
                     "Pushgateway at '%s' is not resolvable on this host. Disabling Prometheus push.",
-                    pushgateway_url,
+                    sanitize_text(pushgateway_url),
                 )
             except Exception:
-                logger.warning("Failed to initialize PushgatewayPublisher for %s", pushgateway_url)
+                logger.warning(
+                    "Failed to initialize PushgatewayPublisher for %s",
+                    sanitize_text(pushgateway_url),
+                )
         return NoOpPublisher()
 
     def _create_driver(self) -> webdriver.Remote:
         """Create a remote Selenium WebDriver."""
-        logger.info("Connecting to Selenium at %s", self._selenium_url)
+        logger.info("Connecting to Selenium at %s", sanitize_text(self._selenium_url))
         options = ChromeOptions()
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
@@ -279,7 +282,11 @@ class AITestRunner:
         from appium import webdriver as appium_webdriver
         from appium.options.common import AppiumOptions
 
-        logger.info("Connecting to Appium at %s (platform=%s)", self._appium_server_url, self._appium_platform)
+        logger.info(
+            "Connecting to Appium at %s (platform=%s)",
+            sanitize_text(self._appium_server_url),
+            self._appium_platform,
+        )
 
         options = AppiumOptions()
 
@@ -343,7 +350,7 @@ class AITestRunner:
         logger.info("Target: %s", self._target_type)
         if self._target_type == "web":
             logger.info("Browser: %s", self._browser_name)
-            logger.info("URL: %s", self._base_url)
+            logger.info("URL: %s", sanitize_text(self._base_url))
         else:
             logger.info("Platform: %s", self._appium_platform)
             logger.info("App: %s", self._app_build_path or self._bundle_id or self._app_package or "(not set)")
@@ -555,13 +562,19 @@ class AITestRunner:
             try:
                 shared_driver = self._create_appium_driver()
             except Exception as e:
-                logger.warning("Failed to initialize shared Appium session: %s. Using per-test sessions.", e)
+                logger.warning(
+                    "Failed to initialize shared Appium session: %s. Using per-test sessions.",
+                    sanitize_text(str(e)),
+                )
                 shared_driver = None
         else:
             try:
                 shared_driver = self._create_driver()
             except Exception as e:
-                logger.warning("Failed to initialize shared Selenium session: %s. Using per-test sessions.", e)
+                logger.warning(
+                    "Failed to initialize shared Selenium session: %s. Using per-test sessions.",
+                    sanitize_text(str(e)),
+                )
                 shared_driver = None
 
         try:
@@ -575,7 +588,10 @@ class AITestRunner:
                     try:
                         shared_driver = self._create_driver()
                     except Exception as exc:
-                        logger.warning("Failed to recreate shared Selenium driver: %s", exc)
+                        logger.warning(
+                            "Failed to recreate shared Selenium driver: %s",
+                            sanitize_text(str(exc)),
+                        )
                         shared_driver = None
 
                 result = self._execute_single_test(test_case, shared_driver=shared_driver)
@@ -585,7 +601,7 @@ class AITestRunner:
                     "  → %s (%.2fs)%s",
                     result.status.value,
                     result.duration_seconds,
-                    f" — {result.failure_reason}" if result.failure_reason else "",
+                    f" — {sanitize_text(result.failure_reason)}" if result.failure_reason else "",
                 )
                 self._publish_live_progress(
                     result=result,
@@ -1071,7 +1087,7 @@ Examples:
     try:
         summary = runner.run()
     except SetupContextError as exc:
-        logger.error("Test setup failed: %s", exc)
+        logger.error("Test setup failed: %s", sanitize_text(str(exc)))
         sys.exit(2)
 
     # Exit with non-zero if any tests failed

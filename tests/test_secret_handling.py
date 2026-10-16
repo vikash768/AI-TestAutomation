@@ -21,7 +21,12 @@ from automation.actions.schema import (
 from automation.ai.suite_parser import PageContext, TestCategory, TestInstruction
 from automation.ai.test_generator import TestGenerator
 from automation.secrets.resolver import SecretResolutionError, SecretResolver
-from automation.secrets.sanitizer import REDACTED, sanitize_data
+from automation.secrets.sanitizer import (
+    REDACTED,
+    sanitize_data,
+    sanitize_filename_component,
+    sanitize_text,
+)
 
 
 FAKE_SECRET = "SUPER_SECRET_TEST_VALUE_92841"
@@ -144,6 +149,31 @@ def test_sanitizer_recognizes_sensitive_keys(key):
 
     assert sanitized[key] == REDACTED
     assert sanitized["normal"] == "unchanged"
+
+
+def test_sanitizer_redacts_url_credentials_and_authorization_values():
+    text = (
+        f"https://local-user:{FAKE_SECRET}@example.invalid/path"
+        f"?api_token={FAKE_SECRET} Authorization: Bearer {FAKE_SECRET}"
+    )
+
+    sanitized = sanitize_text(text, environ={})
+
+    assert FAKE_SECRET not in sanitized
+    assert sanitized.count(REDACTED) >= 3
+
+
+def test_filename_sanitizer_does_not_persist_known_secret(monkeypatch):
+    monkeypatch.setenv("VALID_USER_PASSWORD", FAKE_SECRET)
+
+    filename = sanitize_filename_component(
+        f"failure-{FAKE_SECRET}/../../escape",
+        default="failure",
+    )
+
+    assert FAKE_SECRET not in filename
+    assert "/" not in filename
+    assert ".." not in filename
 
 
 class _FakeElement:

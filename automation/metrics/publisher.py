@@ -17,6 +17,7 @@ from typing import Any, Optional
 from prometheus_client import push_to_gateway
 
 from automation.metrics.metrics import create_metrics, create_registry
+from automation.secrets.sanitizer import sanitize_data, sanitize_text
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +113,7 @@ class PrometheusPushgatewayPublisher(MetricsPublisher):
         self._grouping_key: dict[str, str] = {}
         logger.info(
             "PrometheusPushgatewayPublisher initialized — target: %s",
-            self._pushgateway_url,
+            sanitize_text(self._pushgateway_url),
         )
 
     def publish_test_result(
@@ -130,7 +131,7 @@ class PrometheusPushgatewayPublisher(MetricsPublisher):
         status: str,
         duration_seconds: float,
     ) -> None:
-        labels = {
+        labels = sanitize_data({
             "project": project,
             "suite": suite,
             "browser": browser,
@@ -140,7 +141,7 @@ class PrometheusPushgatewayPublisher(MetricsPublisher):
             "page": page,
             "functionality": functionality,
             "run_id": run_id,
-        }
+        })
         numeric_status = STATUS_MAP.get(status.upper(), 0)
         self._metrics["qa_test_case_status"].labels(**labels).set(numeric_status)
         self._metrics["qa_test_case_duration_seconds"].labels(**labels).set(
@@ -163,12 +164,12 @@ class PrometheusPushgatewayPublisher(MetricsPublisher):
         skipped: int,
         duration_seconds: float,
     ) -> None:
-        labels = {
+        labels = sanitize_data({
             "project": project,
             "suite": suite,
             "browser": browser,
             "test_type": test_type,
-        }
+        })
         self._metrics["qa_test_total"].labels(**labels).set(total)
         self._metrics["qa_test_passed"].labels(**labels).set(passed)
         self._metrics["qa_test_failed"].labels(**labels).set(failed)
@@ -185,7 +186,7 @@ class PrometheusPushgatewayPublisher(MetricsPublisher):
 
         # Store grouping key for push
         self._grouping_key = {
-            "instance": f"{project}_{suite}_{browser}",
+            "instance": sanitize_text(f"{project}_{suite}_{browser}"),
         }
 
         logger.info(
@@ -208,12 +209,16 @@ class PrometheusPushgatewayPublisher(MetricsPublisher):
             )
             logger.info(
                 "Metrics pushed to Pushgateway at %s (job=%s, grouping=%s)",
-                self._pushgateway_url,
+                sanitize_text(self._pushgateway_url),
                 self._job_name,
-                self._grouping_key,
+                sanitize_data(self._grouping_key),
             )
-        except Exception:
-            logger.exception("Failed to push metrics to Pushgateway")
+        except Exception as exc:
+            logger.error(
+                "Failed to push metrics to Pushgateway (%s): %s",
+                type(exc).__name__,
+                sanitize_text(str(exc)),
+            )
             raise
 
 
@@ -226,10 +231,10 @@ class NoOpPublisher(MetricsPublisher):
     """Logs metrics but does not push anywhere. Useful for local debugging."""
 
     def publish_test_result(self, **kwargs: Any) -> None:
-        logger.info("NoOp — test result: %s", kwargs)
+        logger.info("NoOp — test result: %s", sanitize_data(kwargs))
 
     def publish_suite_result(self, **kwargs: Any) -> None:
-        logger.info("NoOp — suite result: %s", kwargs)
+        logger.info("NoOp — suite result: %s", sanitize_data(kwargs))
 
     def flush(self) -> None:
         logger.info("NoOp — flush (nothing to send)")

@@ -44,7 +44,7 @@ from automation.actions.schema import (
     LocatorStrategy,
 )
 from automation.secrets.resolver import SecretResolutionError, SecretResolver
-from automation.secrets.sanitizer import sanitize_text
+from automation.secrets.sanitizer import sanitize_filename_component, sanitize_text
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +204,8 @@ class SeleniumExecutor:
         """Capture a screenshot and return the file path."""
         try:
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            filename = f"{name}_{timestamp}.png"
+            safe_name = sanitize_filename_component(name, default="failure")
+            filename = f"{safe_name}_{timestamp}.png"
             filepath = self._screenshot_dir / filename
             self._driver.save_screenshot(str(filepath))
             logger.info("Screenshot saved: %s", filepath)
@@ -300,7 +301,11 @@ class SeleniumExecutor:
                     EC.presence_of_element_located((by_type, selector_value))
                 )
                 if loc is not locator:
-                    logger.info("Found element using fallback locator: %s=%s", loc.strategy.value, loc.value)
+                    logger.info(
+                        "Found element using fallback locator: %s=%s",
+                        loc.strategy.value,
+                        sanitize_text(loc.value),
+                    )
                 return element
             except (TimeoutException, NoSuchElementException, InvalidSelectorException) as e:
                 last_error = e
@@ -327,7 +332,11 @@ class SeleniumExecutor:
                     EC.visibility_of_element_located((by_type, selector_value))
                 )
                 if loc is not locator:
-                    logger.info("Found visible element using fallback locator: %s=%s", loc.strategy.value, loc.value)
+                    logger.info(
+                        "Found visible element using fallback locator: %s=%s",
+                        loc.strategy.value,
+                        sanitize_text(loc.value),
+                    )
                 return element
             except (TimeoutException, NoSuchElementException, InvalidSelectorException) as e:
                 last_error = e

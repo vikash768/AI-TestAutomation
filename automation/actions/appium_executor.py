@@ -43,7 +43,7 @@ from automation.actions.schema import (
     WEB_ONLY_ACTIONS,
 )
 from automation.secrets.resolver import SecretResolutionError, SecretResolver
-from automation.secrets.sanitizer import sanitize_text
+from automation.secrets.sanitizer import sanitize_filename_component, sanitize_text
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +147,7 @@ class AppiumExecutor:
                 self._driver.activate_app(target_pkg)
                 time.sleep(1.0)
         except Exception as e:
-            logger.debug("Foreground check error (non-fatal): %s", e)
+            logger.debug("Foreground check error (non-fatal): %s", sanitize_text(str(e)))
 
     def execute(self, action: Action) -> dict[str, Any]:
         """Execute a single structured action.
@@ -233,7 +233,8 @@ class AppiumExecutor:
         """Capture a screenshot and return the file path."""
         try:
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            filename = f"{name}_{timestamp}.png"
+            safe_name = sanitize_filename_component(name, default="failure")
+            filename = f"{safe_name}_{timestamp}.png"
             filepath = self._screenshot_dir / filename
             self._driver.save_screenshot(str(filepath))
             logger.info("Screenshot saved: %s", filepath)
@@ -350,7 +351,11 @@ class AppiumExecutor:
                     EC.presence_of_element_located((by_type, selector_value))
                 )
                 if loc is not locator:
-                    logger.info("Found element using fallback locator: %s=%s", loc.strategy.value, loc.value)
+                    logger.info(
+                        "Found element using fallback locator: %s=%s",
+                        loc.strategy.value,
+                        sanitize_text(loc.value),
+                    )
                 return element
             except (TimeoutException, NoSuchElementException):
                 continue
@@ -484,7 +489,11 @@ class AppiumExecutor:
                         element = WebDriverWait(self._driver, min(timeout, 2.5) if len(all_locators) > 1 else min(timeout, 3.5)).until(
                             EC.visibility_of_element_located((by_type, selector_value))
                         )
-                        logger.info("Found visible element after scroll: %s=%s", loc.strategy.value, loc.value)
+                        logger.info(
+                            "Found visible element after scroll: %s=%s",
+                            loc.strategy.value,
+                            sanitize_text(loc.value),
+                        )
                         return element
                     except (TimeoutException, NoSuchElementException):
                         continue
@@ -493,7 +502,7 @@ class AppiumExecutor:
                 self._driver.swipe(width // 2, int(height * 0.35), width // 2, int(height * 0.70), 400)
                 time.sleep(0.5)
             except Exception as e:
-                logger.debug("Scroll attempt error: %s", e)
+                logger.debug("Scroll attempt error: %s", sanitize_text(str(e)))
 
         by_type, value_fn = self._BY_MAP[locator.strategy]
         selector_value = value_fn(locator.value)

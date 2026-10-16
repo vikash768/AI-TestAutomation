@@ -23,6 +23,16 @@ _SENSITIVE_KEY_PARTS = (
     "credential",
 )
 
+_URL_USERINFO_RE = re.compile(
+    r"(?i)\b([a-z][a-z0-9+.-]*://)([^/\s:@]+):([^@/\s]+)@"
+)
+_SENSITIVE_PARAMETER_RE = re.compile(
+    r"(?i)([?&](?:password|passwd|secret|token|(?:api|access|auth)[_-]?token|api[_-]?key|apikey|authorization|credential)=)([^&#\s]+)"
+)
+_AUTHORIZATION_RE = re.compile(
+    r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)\s+)([^\s,;]+)"
+)
+
 
 def _normalized_key(key: Any) -> str:
     text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key or ""))
@@ -64,11 +74,21 @@ def sanitize_text(
     """Replace known environment secrets in text with symbolic placeholders."""
     if not isinstance(value, str):
         return value
-    sanitized = value
+    sanitized = _URL_USERINFO_RE.sub(r"\1<redacted>:<redacted>@", value)
+    sanitized = _SENSITIVE_PARAMETER_RE.sub(r"\1<redacted>", sanitized)
+    sanitized = _AUTHORIZATION_RE.sub(r"\1<redacted>", sanitized)
     for name, secret in _known_secret_values(environ):
         if secret in sanitized:
             sanitized = sanitized.replace(secret, make_secret_placeholder(name))
     return sanitized
+
+
+def sanitize_filename_component(value: Any, *, default: str = "artifact") -> str:
+    """Return a secret-safe, path-safe filename component."""
+    sanitized = str(sanitize_text(value) or "")
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", sanitized).strip("._-")
+    sanitized = re.sub(r"\.{2,}", "_", sanitized)
+    return sanitized[:120] or default
 
 
 def sanitize_value(
