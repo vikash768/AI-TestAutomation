@@ -4,6 +4,7 @@ Documentation     Common high-level keywords for the application under test.
 ...               that abstract away locator details and page interactions.
 ...               This abstraction layer prepares for future AI action mapping.
 Library           SeleniumLibrary
+Library           automation.robot.secure_keywords.SecureKeywords
 Variables         ../variables/common.py
 Resource          browser.resource
 
@@ -60,23 +61,31 @@ Enter Email
 
 Enter Password
     [Documentation]    Types the password into the password field.
+    [Tags]    secret
     [Arguments]    ${password}
-    ${done}=    Try Input Text    css:[data-testid="password-input"]    ${password}
+    ${done}=    Try Input Text    css:[data-testid="password-input"]    ${password}    sensitive=${TRUE}
     IF    not ${done}
-        ${done}=    Try Input Text    id:password    ${password}
+        ${done}=    Try Input Text    id:password    ${password}    sensitive=${TRUE}
     END
     IF    not ${done}
-        Try Input Text    css:input[type="password"]    ${password}
+        Try Input Text    css:input[type="password"]    ${password}    sensitive=${TRUE}
     END
 
 Try Input Text
     [Documentation]    Tries to input text into a field. Returns True if successful.
-    [Arguments]    ${locator}    ${text}
+    [Arguments]    ${locator}    ${text}    ${sensitive}=${FALSE}
     ${visible}=    Run Keyword And Return Status
     ...    Wait Until Element Is Visible    ${locator}    timeout=${SHORT_TIMEOUT}
     IF    ${visible}
-        Clear Element Text    ${locator}
-        Input Text    ${locator}    ${text}
+        ${secret_reference}=    Value Is Secret Placeholder    ${text}
+        IF    ${secret_reference}
+            Input Secret Text    ${locator}    ${text}
+        ELSE IF    ${sensitive}
+            Input Password    ${locator}    ${text}
+        ELSE
+            Clear Element Text    ${locator}
+            Input Text    ${locator}    ${text}
+        END
         RETURN    ${TRUE}
     END
     RETURN    ${FALSE}

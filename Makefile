@@ -79,6 +79,7 @@ test-robot:
 		--listener automation/listeners/prometheus_listener.py \
 		--outputdir /opt/testing/artifacts/robot \
 		--loglevel INFO \
+		--removekeywords tag:secret \
 		tests/robot/suites/
 
 ## Clean up test run outputs (runs, screenshots, logs) while keeping AI test plan cache

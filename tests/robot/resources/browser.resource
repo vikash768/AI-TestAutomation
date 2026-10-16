@@ -4,8 +4,8 @@ Documentation     Browser management resource.
 ...               and closing browser sessions via remote Selenium.
 ...               Tests should use these keywords — never put Selenium
 ...               URLs or browser config directly in test files.
-Library           SeleniumLibrary    timeout=${DEFAULT_TIMEOUT}
 Variables         ../variables/common.py
+Library           SeleniumLibrary    timeout=${DEFAULT_TIMEOUT}
 
 
 *** Keywords ***

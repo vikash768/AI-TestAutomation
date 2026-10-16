@@ -1,8 +1,9 @@
 """
-Common Robot Framework variables loaded from environment.
+Common Robot Framework configuration and symbolic credential variables.
 
-All sensitive values (credentials, URLs) come from environment variables
-which are set via .env and passed through Docker Compose.
+Non-secret configuration comes from environment variables passed through
+Docker Compose. Credentials remain symbolic here and are resolved only by
+the secure execution keyword immediately before Selenium input.
 
 Usage in .robot files:
     ${BASE_URL}
@@ -14,6 +15,8 @@ Usage in .robot files:
 
 import os
 
+from automation.secrets.resolver import make_secret_placeholder
+
 
 # --- Application Under Test ---
 BASE_URL = os.environ.get("BASE_URL", "")
@@ -22,9 +25,9 @@ BROWSER = os.environ.get("BROWSER", "chrome")
 # --- Selenium ---
 SELENIUM_REMOTE_URL = os.environ.get("SELENIUM_REMOTE_URL", "http://selenium:4444")
 
-# --- Credentials (from .env — NEVER hardcoded) ---
-VALID_USER_EMAIL = os.environ.get("VALID_USER_EMAIL", "")
-VALID_USER_PASSWORD = os.environ.get("VALID_USER_PASSWORD", "")
+# --- Credentials (resolved only by automation.robot.secure_keywords) ---
+VALID_USER_EMAIL = make_secret_placeholder("VALID_USER_EMAIL")
+VALID_USER_PASSWORD = make_secret_placeholder("VALID_USER_PASSWORD")
 
 # --- Timeouts ---
 DEFAULT_TIMEOUT = "15s"

@@ -16,18 +16,19 @@ Environment variables consumed:
     BROWSER           - Browser name for metrics labels (default: chrome)
 """
 
+from __future__ import annotations
+
 import logging
 import os
-import re
 import time
-
-from robot.api import logger as robot_logger
+import uuid
 
 from automation.metrics.publisher import (
     MetricsPublisher,
     NoOpPublisher,
     PrometheusPushgatewayPublisher,
 )
+from automation.secrets.sanitizer import sanitize_data, sanitize_text
 from automation.utilities.test_ids import extract_test_id
 
 # ---------------------------------------------------------------------------
@@ -49,10 +50,15 @@ class PrometheusListener:
 
     ROBOT_LISTENER_API_VERSION = 3
 
-    def __init__(self) -> None:
-        self._project = os.environ.get("PROJECT_NAME", "poc")
-        self._browser = os.environ.get("BROWSER", "chrome")
-        self._test_type = os.environ.get("TEST_TYPE", "browser")
+    def __init__(
+        self,
+        publisher: MetricsPublisher | None = None,
+        run_id: str | None = None,
+    ) -> None:
+        self._project = sanitize_text(os.environ.get("PROJECT_NAME", "poc"))
+        self._browser = sanitize_text(os.environ.get("BROWSER", "chrome"))
+        self._test_type = sanitize_text(os.environ.get("TEST_TYPE", "browser"))
+        self._run_id = sanitize_text(run_id or f"robot-{uuid.uuid4().hex}")
         self._suite_name = ""
         self._suite_start_time: float = 0.0
 
@@ -61,13 +67,18 @@ class PrometheusListener:
         self._current_test_start: float = 0.0
 
         # Initialize publisher
-        self._publisher = self._create_publisher()
+        self._publisher = publisher or self._create_publisher()
         log.info(
             "PrometheusListener initialized — project=%s, browser=%s, test_type=%s",
             self._project,
             self._browser,
             self._test_type,
         )
+
+    @property
+    def run_id(self) -> str:
+        """Stable identifier shared by all metrics from this Robot execution."""
+        return self._run_id
 
     @staticmethod
     def _create_publisher() -> MetricsPublisher:
@@ -78,8 +89,12 @@ class PrometheusListener:
             return NoOpPublisher()
         try:
             return PrometheusPushgatewayPublisher(pushgateway_url=pushgateway_url)
-        except Exception:
-            log.exception("Failed to create PushgatewayPublisher — falling back to NoOp")
+        except Exception as exc:
+            log.error(
+                "Failed to create PushgatewayPublisher (%s): %s — falling back to NoOp",
+                type(exc).__name__,
+                sanitize_text(str(exc)),
+            )
             return NoOpPublisher()
 
     # ------------------------------------------------------------------
@@ -90,28 +105,31 @@ class PrometheusListener:
         """Called when a test suite starts."""
         # Use the top-level suite name for metrics
         if not self._suite_name:
-            self._suite_name = data.name or "unknown"
+            self._suite_name = sanitize_text(data.name or "unknown")
             self._suite_start_time = time.time()
             log.info("Suite started: %s", self._suite_name)
 
     def start_test(self, data, result) -> None:
         """Called when an individual test starts."""
         self._current_test_start = time.time()
-        test_id = extract_test_id(data.name)
-        log.info("Test started: %s (id=%s)", data.name, test_id)
+        test_name = sanitize_text(data.name or "unknown")
+        test_id = sanitize_text(extract_test_id(test_name))
+        log.info("Test started: %s (id=%s)", test_name, test_id)
 
     def end_test(self, data, result) -> None:
         """Called when an individual test ends."""
         duration = time.time() - self._current_test_start
-        test_id = extract_test_id(data.name)
-        status = result.status  # 'PASS', 'FAIL', or 'SKIP'
+        test_name = sanitize_text(data.name or "unknown")
+        test_id = sanitize_text(extract_test_id(test_name))
+        status = sanitize_text(result.status)  # 'PASS', 'FAIL', or 'SKIP'
 
         self._test_results.append(
-            {
+            sanitize_data({
                 "test_id": test_id,
+                "test_name": test_name,
                 "status": status,
                 "duration": duration,
-            }
+            })
         )
 
         self._publisher.publish_test_result(
@@ -120,6 +138,10 @@ class PrometheusListener:
             browser=self._browser,
             test_type=self._test_type,
             test_id=test_id,
+            test_name=test_name,
+            page="robot",
+            functionality="legacy",
+            run_id=self._run_id,
             status=status,
             duration_seconds=duration,
         )
@@ -167,5 +189,9 @@ class PrometheusListener:
         try:
             self._publisher.flush()
             log.info("Metrics flushed successfully")
-        except Exception:
-            log.exception("Failed to flush metrics")
+        except Exception as exc:
+            log.error(
+                "Failed to flush metrics (%s): %s",
+                type(exc).__name__,
+                sanitize_text(str(exc)),
+            )
