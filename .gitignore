@@ -12,6 +12,7 @@ artifacts/robot/
 artifacts/screenshots/
 artifacts/logs/
 artifacts/runs/
+artifacts/cache/
 
 # IDE
 .idea/

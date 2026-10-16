@@ -14,6 +14,8 @@ import enum
 from dataclasses import dataclass, field
 from typing import Any
 
+from automation.secrets.sanitizer import sanitize_data, sanitize_text, sanitize_value
+
 
 class ActionType(enum.Enum):
     """Deterministic action types for browser and native app automation."""
@@ -208,47 +210,63 @@ class Action:
     timeout: float = 15.0
     extra: dict[str, Any] = field(default_factory=dict)
 
+    def _value_is_sensitive(self) -> bool:
+        """Return whether the action value represents credential input."""
+        if self.action_type != ActionType.TYPE:
+            return False
+        locator_value = self.locator.value if self.locator else ""
+        context = f"{self.description} {locator_value}"
+        return any(
+            marker in context.lower()
+            for marker in (
+                "password", "passwd", "secret", "token", "api key",
+                "api_key", "apikey", "authorization", "credential",
+            )
+        )
+
     def to_dict(self) -> dict:
         """Serialize action to dict for logging/reporting."""
         result: dict[str, Any] = {
             "action": self.action_type.value,
-            "description": self.description,
+            "description": sanitize_text(self.description),
         }
         if self.locator:
             result["locator"] = {
                 "strategy": self.locator.strategy.value,
-                "value": self.locator.value,
+                "value": sanitize_text(self.locator.value),
             }
         if self.value is not None:
-            locator_value = self.locator.value.lower() if self.locator else ""
-            is_password_input = (
-                self.action_type == ActionType.TYPE
-                and ("password" in self.description.lower() or "password" in locator_value)
+            result["value"] = sanitize_value(
+                self.value,
+                sensitive=self._value_is_sensitive(),
             )
-            result["value"] = "<redacted>" if is_password_input else self.value
         if self.timeout != 15.0:
             result["timeout"] = self.timeout
         if self.extra:
-            result["extra"] = self.extra
-        return result
+            result["extra"] = sanitize_data(self.extra)
+        return sanitize_data(result)
 
     def to_cache_dict(self) -> dict:
         """Serialize action to dict for persistent test caching."""
-        return {
+        result = {
             "action_type": self.action_type.value,
-            "description": self.description,
+            "description": sanitize_text(self.description),
             "locator": {
                 "strategy": self.locator.strategy.value,
-                "value": self.locator.value,
+                "value": sanitize_text(self.locator.value),
             } if self.locator else None,
             "fallback_locators": [
-                {"strategy": fl.strategy.value, "value": fl.value}
+                {"strategy": fl.strategy.value, "value": sanitize_text(fl.value)}
                 for fl in self.fallback_locators
             ],
-            "value": self.value,
+            "value": sanitize_value(
+                self.value,
+                sensitive=self._value_is_sensitive(),
+            ),
             "timeout": self.timeout,
-            "extra": self.extra,
+            "extra": sanitize_data(self.extra),
         }
+        return sanitize_data(result)
 
     @classmethod
     def from_cache_dict(cls, data: dict) -> "Action":
@@ -328,24 +346,24 @@ class TestCase:
 
     def to_dict(self) -> dict:
         """Serialize test case for logging/reporting."""
-        return {
+        return sanitize_data({
             "test_id": self.test_id,
             "test_name": self.test_name,
             "page": self.page,
             "functionality": self.functionality,
             "scenario": self.scenario,
             "preconditions": self.preconditions,
-            "test_data": {k: v for k, v in self.test_data.items() if "password" not in k.lower()},
+            "test_data": self.test_data,
             "steps": [s.to_dict() for s in self.steps],
             "expected_result": self.expected_result,
             "priority": self.priority,
             "test_type": self.test_type,
             "tags": self.tags,
-        }
+        })
 
     def to_cache_dict(self) -> dict:
         """Serialize test case to dict for persistent test caching."""
-        return {
+        return sanitize_data({
             "test_id": self.test_id,
             "test_name": self.test_name,
             "page": self.page,
@@ -358,7 +376,7 @@ class TestCase:
             "priority": self.priority,
             "test_type": self.test_type,
             "tags": self.tags,
-        }
+        })
 
     @classmethod
     def from_cache_dict(cls, data: dict) -> "TestCase":
@@ -430,4 +448,4 @@ class TestResult:
         result["browser"] = self.browser
         result["project"] = self.project
         result["timestamp"] = self.timestamp
-        return result
+        return sanitize_data(result)

@@ -52,6 +52,8 @@ from automation.metrics.publisher import (
     NoOpPublisher,
     PrometheusPushgatewayPublisher,
 )
+from automation.secrets.resolver import SecretResolutionError, SecretResolver
+from automation.secrets.sanitizer import sanitize_data, sanitize_text
 from automation.validation.evidence import EvidenceCollector
 
 # ---------------------------------------------------------------------------
@@ -346,7 +348,7 @@ class AITestRunner:
             logger.info("Platform: %s", self._appium_platform)
             logger.info("App: %s", self._app_build_path or self._bundle_id or self._app_package or "(not set)")
         if self._app_repo_url:
-            logger.info("Repo: %s", self._app_repo_url)
+            logger.info("Repo: %s", sanitize_text(self._app_repo_url))
         logger.info("Run ID: %s", self._run_id)
         logger.info("=" * 60)
 
@@ -365,7 +367,10 @@ class AITestRunner:
                 f"{self._target_type.upper()}_APP_REPO_URL variable or APP_REPO_URL."
             )
         if self._app_repo_url:
-            logger.info("Reading codebase through repository: %s...", self._app_repo_url)
+            logger.info(
+                "Reading codebase through repository: %s...",
+                sanitize_text(self._app_repo_url),
+            )
             try:
                 from automation.ai.repo_reader import RepoReader
                 reader = RepoReader(
@@ -433,17 +438,16 @@ class AITestRunner:
             codebase_context["build"] = build_context
 
         inspection_path = self._run_dir / "inspection-context.json"
-        inspection_path.write_text(json.dumps(inspection_context, indent=2), encoding="utf-8")
+        inspection_path.write_text(
+            json.dumps(sanitize_data(inspection_context), indent=2),
+            encoding="utf-8",
+        )
         logger.info("Inspection evidence saved: %s", inspection_path)
 
         # Step 2: Generate test cases
         logger.info("[2/6] Generating test cases...")
-        email = os.environ.get("VALID_USER_EMAIL", "")
-        password = os.environ.get("VALID_USER_PASSWORD", "")
         generator = TestGenerator(
             base_url=self._base_url,
-            email=email,
-            password=password,
             target_type=self._target_type,
             appium_platform=getattr(self, "_appium_platform", ""),
             codebase_context=codebase_context,
@@ -481,7 +485,10 @@ class AITestRunner:
                 "instructions have generated tests."
             )
         coverage_path = self._run_dir / "coverage-summary.json"
-        coverage_path.write_text(json.dumps(coverage_summary, indent=2), encoding="utf-8")
+        coverage_path.write_text(
+            json.dumps(sanitize_data(coverage_summary), indent=2),
+            encoding="utf-8",
+        )
         logger.info(
             "Markdown coverage: %d/%d instructions (%.2f%%)",
             covered_instructions,
@@ -606,9 +613,14 @@ class AITestRunner:
 
     def _ensure_web_authenticated(self, driver) -> None:
         """Ensure web session is authenticated with credentials for protected admin panel pages."""
-        email = os.environ.get("VALID_USER_EMAIL", "")
-        password = os.environ.get("VALID_USER_PASSWORD", "")
-        if not email or not password or not self._base_url:
+        if not self._base_url:
+            return
+
+        try:
+            resolver = SecretResolver()
+            email = resolver.resolve("{{VALID_USER_EMAIL}}")
+            password = resolver.resolve("{{VALID_USER_PASSWORD}}")
+        except SecretResolutionError:
             return
 
         try:
@@ -640,7 +652,10 @@ class AITestRunner:
             WebDriverWait(driver, 10.0).until(lambda d: "/login" not in d.current_url)
             logger.info("Session authenticated successfully (current URL: %s)", driver.current_url)
         except Exception as exc:
-            logger.debug("Auto-authentication check completed/bypassed: %s", exc)
+            logger.debug(
+                "Auto-authentication check completed/bypassed: %s",
+                sanitize_text(str(exc)),
+            )
 
     def _publish_live_progress(
         self,
@@ -773,7 +788,8 @@ class AITestRunner:
 
         except Exception as e:
             duration = time.time() - test_start
-            logger.exception("Unexpected error in test %s", test_case.test_id)
+            safe_error = sanitize_text(str(e))
+            logger.error("Unexpected error in test %s: %s", test_case.test_id, safe_error)
 
             # Try to capture evidence even on unexpected errors
             classification = FailureClassification.AUTOMATION_ERROR
@@ -787,11 +803,11 @@ class AITestRunner:
                 test_name=test_case.test_name,
                 status=TestStatus.FAIL,
                 expected=test_case.expected_result,
-                actual=str(e),
+                actual=safe_error,
                 duration_seconds=duration,
-                failure_reason=str(e),
+                failure_reason=safe_error,
                 failure_classification=classification,
-                error_details=traceback.format_exc(),
+                error_details=sanitize_text(traceback.format_exc()),
                 page=test_case.page,
                 functionality=test_case.functionality,
                 browser=platform_label,
@@ -854,7 +870,7 @@ class AITestRunner:
 
         # Save summary
         summary_path = self._run_dir / "summary.json"
-        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        summary_path.write_text(json.dumps(sanitize_data(summary), indent=2), encoding="utf-8")
 
         # Save failures separately for quick inspection
         failures = [r.to_dict() for r in results if r.status == TestStatus.FAIL]
@@ -875,7 +891,7 @@ class AITestRunner:
                 entry["failure"] = r.failure_reason
             if r.failure_classification:
                 entry["classification"] = r.failure_classification.value
-            log_entries.append(entry)
+            log_entries.append(sanitize_data(entry))
 
         log_path = self._run_dir / "execution.log"
         log_path.write_text(

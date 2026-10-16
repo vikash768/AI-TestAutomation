@@ -84,6 +84,7 @@ def test_action_and_testcase_cache_serialization():
 
 
 def test_generator_caching(tmp_path, monkeypatch):
+    monkeypatch.setenv("REGENERATE_TESTS", "1")
     monkeypatch.setenv("VALID_USER_EMAIL", "admin@example.com")
     monkeypatch.setenv("VALID_USER_PASSWORD", "Secret123")
     gen = TestGenerator(base_url="https://trackpilot.pods365.com", target_type="web")

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,8 @@ from automation.actions.schema import (
     LocatorStrategy,
     WEB_ONLY_ACTIONS,
 )
+from automation.secrets.resolver import SecretResolutionError, SecretResolver
+from automation.secrets.sanitizer import sanitize_text
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,7 @@ class AppiumExecutor:
         screenshot_dir: str = "artifacts/screenshots",
         default_timeout: float = 15.0,
         platform: str = "",
+        secret_resolver: SecretResolver | None = None,
     ):
         self._driver = driver
         self._screenshot_dir = Path(screenshot_dir)
@@ -108,6 +112,7 @@ class AppiumExecutor:
         self._platform = platform.lower() or str(
             driver.capabilities.get("platformName", "")
         ).lower()
+        self._secret_resolver = secret_resolver or SecretResolver()
 
     @property
     def driver(self) -> WebDriver:
@@ -167,44 +172,59 @@ class AppiumExecutor:
         handler = self._get_handler(action.action_type)
 
         try:
-            actual = handler(action)
+            execution_action = replace(
+                action,
+                value=(
+                    self._secret_resolver.resolve(action.value)
+                    if action.value is not None
+                    else None
+                ),
+                extra=self._secret_resolver.resolve_data(action.extra),
+            )
+            actual = handler(execution_action)
             duration = time.time() - start
             return {
                 "success": True,
-                "actual": str(actual) if actual else "",
+                "actual": sanitize_text(str(actual)) if actual else "",
                 "error": None,
                 "classification": None,
                 "duration": round(duration, 3),
             }
+        except SecretResolutionError as e:
+            raise ActionExecutionError(
+                str(e),
+                classification=FailureClassification.TEST_DATA_ERROR,
+                action=action,
+            ) from e
         except ActionExecutionError:
             raise
         except TimeoutException as e:
             raise ActionExecutionError(
-                f"Timeout executing {action.action_type.value}: {e}",
+                f"Timeout executing {action.action_type.value}: {sanitize_text(str(e))}",
                 classification=FailureClassification.TIMEOUT,
                 action=action,
             ) from e
         except NoSuchElementException as e:
             raise ActionExecutionError(
-                f"Element not found for {action.action_type.value}: {e}",
+                f"Element not found for {action.action_type.value}: {sanitize_text(str(e))}",
                 classification=FailureClassification.LOCATOR_ERROR,
                 action=action,
             ) from e
         except StaleElementReferenceException as e:
             raise ActionExecutionError(
-                f"Stale element for {action.action_type.value}: {e}",
+                f"Stale element for {action.action_type.value}: {sanitize_text(str(e))}",
                 classification=FailureClassification.AUTOMATION_ERROR,
                 action=action,
             ) from e
         except WebDriverException as e:
             raise ActionExecutionError(
-                f"WebDriver error for {action.action_type.value}: {e}",
+                f"WebDriver error for {action.action_type.value}: {sanitize_text(str(e))}",
                 classification=FailureClassification.ENVIRONMENT_ERROR,
                 action=action,
             ) from e
         except Exception as e:
             raise ActionExecutionError(
-                f"Unexpected error for {action.action_type.value}: {e}",
+                f"Unexpected error for {action.action_type.value}: {sanitize_text(str(e))}",
                 classification=FailureClassification.UNKNOWN,
                 action=action,
             ) from e

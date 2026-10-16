@@ -28,42 +28,6 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-
-def _load_dotenv_if_present() -> None:
-    """Load key generator variables from .env if present and not already set in environment."""
-    env_file = _PROJECT_ROOT / ".env"
-    if env_file.exists():
-        try:
-            parsed: dict[str, str] = {}
-            for line in env_file.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                k = k.strip()
-                v = v.strip().strip("'\"")
-                # Handle ${VAR} substitutions within .env
-                for var_k, var_v in parsed.items():
-                    v = v.replace(f"${{{var_k}}}", var_v)
-                parsed[k] = v
-            # Set into os.environ only generator-relevant keys if not already defined
-            generator_keys = {
-                "GEMINI_API_KEY", "GEMINI_MODEL", "BASE_URL",
-                "VALID_USER_EMAIL", "VALID_USER_PASSWORD",
-                "WEB_VALID_USER_EMAIL", "WEB_VALID_USER_PASSWORD",
-                "MOBILE_VALID_USER_EMAIL", "MOBILE_VALID_USER_PASSWORD",
-                "DESKTOP_VALID_USER_EMAIL", "DESKTOP_VALID_USER_PASSWORD",
-                "AI_MAX_CATEGORIES", "AI_MAX_TESTS",
-            }
-            for k, v in parsed.items():
-                if k in generator_keys and k not in os.environ:
-                    os.environ[k] = v
-        except Exception:
-            pass
-
-
-_load_dotenv_if_present()
-
 from google import genai
 from google.genai import types
 
@@ -81,8 +45,13 @@ from automation.ai.suite_parser import (
     SuiteContext,
     TestCategory,
 )
+from automation.secrets.resolver import SecretResolver, make_secret_placeholder
+from automation.secrets.sanitizer import sanitize_data, sanitize_text
 
 logger = logging.getLogger(__name__)
+
+VALID_USER_EMAIL_PLACEHOLDER = make_secret_placeholder("VALID_USER_EMAIL")
+VALID_USER_PASSWORD_PLACEHOLDER = make_secret_placeholder("VALID_USER_PASSWORD")
 
 
 # ---------------------------------------------------------------------------
@@ -201,26 +170,20 @@ class TestGenerator:
             else ({"summary_prompt": str(codebase_context)} if codebase_context else {})
         )
 
-        # base_url is only required for web targets
+        # The planner never receives real credentials. Constructor credential
+        # arguments remain accepted for API compatibility but are intentionally
+        # replaced with symbolic execution-time placeholders.
         if self._target_type == "web":
             self._base_url = base_url or os.environ.get("BASE_URL", "")
-            target_email = os.environ.get("WEB_VALID_USER_EMAIL") or os.environ.get("VALID_USER_EMAIL", "")
-            target_password = os.environ.get("WEB_VALID_USER_PASSWORD") or os.environ.get("VALID_USER_PASSWORD", "")
         elif self._target_type == "mobile":
             self._base_url = ""
-            target_email = os.environ.get("MOBILE_VALID_USER_EMAIL") or os.environ.get("VALID_USER_EMAIL", "")
-            target_password = os.environ.get("MOBILE_VALID_USER_PASSWORD") or os.environ.get("VALID_USER_PASSWORD", "")
         elif self._target_type == "desktop":
             self._base_url = ""
-            target_email = os.environ.get("DESKTOP_VALID_USER_EMAIL") or os.environ.get("VALID_USER_EMAIL", "")
-            target_password = os.environ.get("DESKTOP_VALID_USER_PASSWORD") or os.environ.get("VALID_USER_PASSWORD", "")
         else:
             self._base_url = ""
-            target_email = os.environ.get("VALID_USER_EMAIL", "")
-            target_password = os.environ.get("VALID_USER_PASSWORD", "")
 
-        self._email = email or target_email
-        self._password = password or target_password
+        self._email = VALID_USER_EMAIL_PLACEHOLDER
+        self._password = VALID_USER_PASSWORD_PLACEHOLDER
         self._test_id_counters: dict[str, int] = {}
 
         max_categories = os.environ.get("AI_MAX_CATEGORIES", "").strip()
@@ -262,7 +225,9 @@ class TestGenerator:
 
         self._cache_dir = Path("artifacts/cache")
         suite_id = "trackpilot" if "trackpilot" in (self._base_url or "").lower() else (self._target_type or "suite")
-        self._cache_file = self._cache_dir / f"test_generator_{self._target_type}_{suite_id}.json"
+        # Use a new cache namespace so pre-hardening cache files, which may
+        # contain resolved credentials, are never loaded by hardened code.
+        self._cache_file = self._cache_dir / f"test_generator_safe_v2_{self._target_type}_{suite_id}.json"
         self._cache: dict[str, Any] = self._load_cache()
 
     def _load_cache(self) -> dict[str, Any]:
@@ -282,15 +247,27 @@ class TestGenerator:
         """Persist generated test cases to disk cache."""
         try:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
-            self._cache_file.write_text(json.dumps(self._cache, indent=2), encoding="utf-8")
+            safe_cache = sanitize_data(self._cache)
+            self._cache = safe_cache
+            self._cache_file.write_text(json.dumps(safe_cache, indent=2), encoding="utf-8")
         except Exception as exc:
             logger.warning("Failed to write test generator cache: %s", exc)
 
     def _sanitize_test_case(self, tc: TestCase) -> TestCase:
         """Sanitize test case steps, locators, and credentials."""
+        tc.test_name = sanitize_text(tc.test_name)
+        tc.scenario = sanitize_text(tc.scenario)
+        tc.expected_result = sanitize_text(tc.expected_result)
+        tc.preconditions = sanitize_data(tc.preconditions)
+        tc.tags = sanitize_data(tc.tags)
+
         for step in tc.steps:
+            step.description = sanitize_text(step.description)
+            step.extra = sanitize_data(step.extra)
+
             # 1. Sanitize locators
             if step.locator:
+                step.locator.value = sanitize_text(step.locator.value)
                 prim, extra_falls = _sanitize_locator(step.locator)
                 step.locator = prim
                 if extra_falls:
@@ -298,6 +275,7 @@ class TestGenerator:
 
             sanitized_fallbacks: list[Locator] = []
             for fl in step.fallback_locators:
+                fl.value = sanitize_text(fl.value)
                 san_fl, more_fls = _sanitize_locator(fl)
                 if san_fl:
                     sanitized_fallbacks.append(san_fl)
@@ -307,12 +285,15 @@ class TestGenerator:
             # 2. Value type coercion
             if step.value is not None and not isinstance(step.value, str):
                 step.value = str(step.value)
+            if step.value is not None:
+                step.value = sanitize_text(step.value)
 
             # 3. Credential hallucination & placeholder normalization
             if step.action_type == ActionType.TYPE:
                 desc = step.description.lower()
                 loc_val = (step.locator.value if step.locator else "").lower()
-                val = step.value or ""
+                val = self._resolve_instruction_value(step.value or "")
+                step.value = val
 
                 # Password field handling
                 if "password" in desc or "password" in loc_val:
@@ -328,18 +309,10 @@ class TestGenerator:
                             "valid", "correct credentials", "valid email format",
                             "uppercase and lowercase", "valid login",
                         )
-                    ) or val in (
-                        "${VALID_USER_PASSWORD}", "${PASSWORD}",
-                        f"{self._password}.com", f"{self._password}@pods365.com",
-                    ) or (bool(self._password) and val == self._email)
+                    ) or val == self._password
 
-                    if is_valid_auth and self._password:
+                    if is_valid_auth:
                         step.value = self._password
-                    elif val in ("${VALID_USER_PASSWORD}", "${PASSWORD}") and self._password:
-                        step.value = self._password
-                    elif self._password and val.endswith(".com") and not self._password.endswith(".com"):
-                        if val.startswith(self._password):
-                            step.value = self._password
 
                 # Email field handling
                 elif any(k in desc for k in ("email", "username")) or any(k in loc_val for k in ("email", "username")):
@@ -349,26 +322,22 @@ class TestGenerator:
                             "valid test email", "valid email", "correct email",
                             "admin email", "configured email",
                         )
-                    ) or val in ("${VALID_USER_EMAIL}", "${EMAIL}")
+                    ) or val == self._email
 
-                    if is_valid_email and self._email:
-                        step.value = self._email
-                    elif val in ("${VALID_USER_EMAIL}", "${EMAIL}") and self._email:
+                    if is_valid_email:
                         step.value = self._email
 
-        # Normalize test_data dictionary
+        # Keep generated TestCase objects secret-free before serialization.
         if isinstance(tc.test_data, dict):
-            if "password" in tc.test_data and self._password:
-                pwd = str(tc.test_data["password"])
-                if pwd in (
-                    f"{self._password}.com", f"{self._password}@pods365.com",
-                    "${VALID_USER_PASSWORD}", "${PASSWORD}",
-                ) or (pwd.startswith(self._password) and pwd.endswith(".com")):
+            tc.test_data = sanitize_data(tc.test_data)
+            if "password" in tc.test_data:
+                value = str(tc.test_data["password"])
+                if SecretResolver.contains_secret_placeholder(value):
                     tc.test_data["password"] = self._password
-            if "email" in tc.test_data and self._email:
-                em = str(tc.test_data["email"])
-                if em in ("${VALID_USER_EMAIL}", "${EMAIL}"):
-                    tc.test_data["email"] = self._email
+            if "email" in tc.test_data:
+                tc.test_data["email"] = self._resolve_instruction_value(
+                    str(tc.test_data["email"])
+                )
 
         return tc
 
@@ -741,6 +710,7 @@ Guidelines:
 - IMPORTANT LOCATOR SYNTAX: Use strictly standard W3C CSS selectors. NEVER use jQuery or Playwright pseudo-selectors like :contains(), :has-text(), or text= in CSS selectors. Use XPath for text matching (e.g. "//button[contains(., 'Save')]").
 - FOR AUTHENTICATION: Always use the exact Configured Test Password "{self._password}" for positive authentication. Do NOT add ".com" or alter the password.
 """
+        prompt = sanitize_text(prompt)
         model_name = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
         raw_text = ""
         last_api_err = None
@@ -1702,11 +1672,14 @@ Guidelines:
         return actions
 
     def _resolve_instruction_value(self, value: str) -> str:
-        """Resolve credential placeholders without storing secrets in suite files."""
-        return {
-            "${VALID_USER_EMAIL}": self._email,
-            "${VALID_USER_PASSWORD}": self._password,
-        }.get(value, value)
+        """Normalize suite placeholders without resolving environment secrets."""
+        aliases = {
+            "${EMAIL}": self._email,
+            "{{EMAIL}}": self._email,
+            "${PASSWORD}": self._password,
+            "{{PASSWORD}}": self._password,
+        }
+        return aliases.get(value, SecretResolver.canonicalize(sanitize_text(value)))
 
     def _instruction_to_desktop_actions(self, text: str) -> list[Action]:
         """Convert instructions to platform-neutral native desktop actions."""

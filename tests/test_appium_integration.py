@@ -479,15 +479,15 @@ class TestGeneratorTargetType:
         gen = TestGenerator(base_url="https://example.com")
         assert gen._target_type == "web"
 
-    def test_mobile_credential_placeholders_are_resolved(self):
+    def test_mobile_credential_placeholders_remain_symbolic(self):
         gen = TestGenerator(
             target_type="mobile",
             appium_platform="android",
             email="user@example.com",
             password="secret-value",
         )
-        assert gen._resolve_instruction_value("${VALID_USER_EMAIL}") == "user@example.com"
-        assert gen._resolve_instruction_value("${VALID_USER_PASSWORD}") == "secret-value"
+        assert gen._resolve_instruction_value("${VALID_USER_EMAIL}") == "{{VALID_USER_EMAIL}}"
+        assert gen._resolve_instruction_value("${VALID_USER_PASSWORD}") == "{{VALID_USER_PASSWORD}}"
 
     def test_desktop_fallback_does_not_generate_android_locator(self):
         gen = TestGenerator(target_type="desktop", appium_platform="macos")
