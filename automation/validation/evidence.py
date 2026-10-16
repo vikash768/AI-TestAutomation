@@ -3,18 +3,21 @@ Evidence Collector.
 
 Captures diagnostic evidence on test failures:
 - Screenshots
-- Browser console errors
-- Current URL
+- Browser console errors (web) or empty (native)
+- Current URL (web) or empty (native)
 - Error details
 - Failure classification
+
+Works with both SeleniumExecutor and AppiumExecutor via duck typing.
+Both executors provide: capture_screenshot(), get_console_errors(), get_current_url().
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from typing import Any, Protocol, runtime_checkable
 
-from automation.actions.executor import SeleniumExecutor
 from automation.actions.schema import (
     FailureClassification,
     TestCase,
@@ -25,10 +28,20 @@ from automation.actions.schema import (
 logger = logging.getLogger(__name__)
 
 
-class EvidenceCollector:
-    """Collects failure evidence from the browser state."""
+@runtime_checkable
+class ExecutorProtocol(Protocol):
+    """Protocol that both SeleniumExecutor and AppiumExecutor satisfy."""
 
-    def __init__(self, executor: SeleniumExecutor, project: str = "", browser: str = ""):
+    def capture_screenshot(self, name: str = "failure") -> str | None: ...
+    def get_console_errors(self) -> list[str]: ...
+    def get_current_url(self) -> str: ...
+
+
+class EvidenceCollector:
+    """Collects failure evidence from the executor state."""
+
+    def __init__(self, executor: ExecutorProtocol, project: str = "", browser: str = ""):
+
         self._executor = executor
         self._project = project
         self._browser = browser

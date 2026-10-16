@@ -16,6 +16,10 @@ rm -rf artifacts/robot/*
 rm -rf artifacts/screenshots/*
 rm -rf artifacts/logs/*
 rm -rf artifacts/runs/*
+if [ "${CLEAN_CACHE:-false}" = "true" ]; then
+    echo "Clearing AI test plan cache..."
+    rm -rf artifacts/cache/*
+fi
 
 echo "Clearing Pushgateway metrics..."
 curl -sf -X PUT "http://localhost:${PUSHGATEWAY_PORT:-9091}/api/v1/admin/wipe" 2>/dev/null || \

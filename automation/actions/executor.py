@@ -28,6 +28,7 @@ from selenium.common.exceptions import (
     WebDriverException,
     StaleElementReferenceException,
     ElementNotInteractableException,
+    InvalidSelectorException,
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -76,6 +77,8 @@ class SeleniumExecutor:
         LocatorStrategy.TEXT: (By.XPATH, lambda v: f"//*[contains(text(),'{v}')]"),
         LocatorStrategy.LINK_TEXT: (By.LINK_TEXT, lambda v: v),
         LocatorStrategy.PARTIAL_LINK_TEXT: (By.PARTIAL_LINK_TEXT, lambda v: v),
+        LocatorStrategy.TAG_NAME: (By.TAG_NAME, lambda v: v),
+        LocatorStrategy.CLASS_NAME: (By.CLASS_NAME, lambda v: v),
     }
 
     # Key name mapping for PRESS_KEY action
@@ -229,6 +232,7 @@ class SeleniumExecutor:
             ActionType.WAIT_VISIBLE: self._handle_wait_visible,
             ActionType.WAIT_NOT_VISIBLE: self._handle_wait_not_visible,
             ActionType.WAIT_URL_CONTAINS: self._handle_wait_url_contains,
+            ActionType.WAIT_URL_NOT_CONTAINS: self._handle_wait_url_not_contains,
             ActionType.PRESS_KEY: self._handle_press_key,
             ActionType.VERIFY_TEXT: self._handle_verify_text,
             ActionType.VERIFY_NOT_TEXT: self._handle_verify_not_text,
@@ -278,7 +282,7 @@ class SeleniumExecutor:
                 if loc is not locator:
                     logger.info("Found element using fallback locator: %s=%s", loc.strategy.value, loc.value)
                 return element
-            except (TimeoutException, NoSuchElementException) as e:
+            except (TimeoutException, NoSuchElementException, InvalidSelectorException) as e:
                 last_error = e
                 continue
 
@@ -305,7 +309,7 @@ class SeleniumExecutor:
                 if loc is not locator:
                     logger.info("Found visible element using fallback locator: %s=%s", loc.strategy.value, loc.value)
                 return element
-            except (TimeoutException, NoSuchElementException) as e:
+            except (TimeoutException, NoSuchElementException, InvalidSelectorException) as e:
                 last_error = e
                 continue
 
@@ -394,6 +398,12 @@ class SeleniumExecutor:
         assert action.value is not None
         WebDriverWait(self._driver, action.timeout).until(
             EC.url_contains(action.value)
+        )
+
+    def _handle_wait_url_not_contains(self, action: Action):
+        assert action.value is not None
+        WebDriverWait(self._driver, action.timeout).until(
+            lambda driver: action.value not in driver.current_url
         )
 
     def _handle_press_key(self, action: Action):

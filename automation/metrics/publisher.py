@@ -91,8 +91,8 @@ class PrometheusPushgatewayPublisher(MetricsPublisher):
         job      = qa_tests
         instance = <project>_<suite>_<browser>
 
-    Metrics are pushed once at the end of the run (flush), not per-test,
-    to minimize HTTP calls and ensure atomic metric updates.
+    The runner flushes cumulative metrics after each test for live Grafana
+    visibility, then publishes one final aggregate at suite completion.
 
     Stale metrics: Pushgateway replaces all metrics for a given grouping
     key on each push. Old values are overwritten, not accumulated.

@@ -16,7 +16,7 @@ import os
 
 
 # --- Application Under Test ---
-BASE_URL = os.environ.get("BASE_URL", "https://trackpilot.pods365.com")
+BASE_URL = os.environ.get("BASE_URL", "")
 BROWSER = os.environ.get("BROWSER", "chrome")
 
 # --- Selenium ---

@@ -4,3 +4,5 @@ selenium==4.36.0
 prometheus-client==0.26.0
 google-genai
 pydantic==2.9.2
+Appium-Python-Client==4.5.0
+pytest>=8,<10

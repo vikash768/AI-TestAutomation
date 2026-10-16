@@ -27,3 +27,9 @@ Thumbs.db
 # Docker volumes
 prometheus_data/
 grafana_data/
+
+# Temporary root scratch files
+/*.png
+/*.jpg
+/*.jpeg
+/*.xml

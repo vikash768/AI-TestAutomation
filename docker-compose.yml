@@ -128,16 +128,20 @@ services:
     environment:
       - SELENIUM_REMOTE_URL=${SELENIUM_REMOTE_URL:-http://selenium:4444}
       - PUSHGATEWAY_URL=${PUSHGATEWAY_URL:-http://pushgateway:9091}
-      - BASE_URL=${BASE_URL:-https://trackpilot.pods365.com}
+      - TARGET_TYPE=${TARGET_TYPE:-web}
+      - BASE_URL=${BASE_URL:-}
       - BROWSER=${BROWSER:-chrome}
-      - PROJECT_NAME=${PROJECT_NAME:-trackpilot}
+      - PROJECT_NAME=${PROJECT_NAME:-}
+      - APP_REPO_URL=${APP_REPO_URL:-}
+      - APP_BUILD_PATH=${APP_BUILD_PATH:-}
       - VALID_USER_EMAIL=${VALID_USER_EMAIL:-}
       - VALID_USER_PASSWORD=${VALID_USER_PASSWORD:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - TEST_SUITE=${TEST_SUITE:-testsuites/trackpilot.testsuite.md}
+      - TEST_SUITE=${TEST_SUITE:-}
     volumes:
       - ./artifacts:/opt/testing/artifacts
       - ./testsuites:/opt/testing/testsuites:ro
+      - ./automation:/opt/testing/automation:ro
     networks:
       - testing-network
     depends_on:

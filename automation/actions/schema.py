@@ -16,8 +16,9 @@ from typing import Any
 
 
 class ActionType(enum.Enum):
-    """Deterministic browser action types."""
+    """Deterministic action types for browser and native app automation."""
 
+    # --- Common actions (Selenium + Appium) ---
     NAVIGATE = "NAVIGATE"
     CLICK = "CLICK"
     TYPE = "TYPE"
@@ -29,6 +30,7 @@ class ActionType(enum.Enum):
     WAIT_VISIBLE = "WAIT_VISIBLE"
     WAIT_NOT_VISIBLE = "WAIT_NOT_VISIBLE"
     WAIT_URL_CONTAINS = "WAIT_URL_CONTAINS"
+    WAIT_URL_NOT_CONTAINS = "WAIT_URL_NOT_CONTAINS"
     PRESS_KEY = "PRESS_KEY"
     VERIFY_TEXT = "VERIFY_TEXT"
     VERIFY_NOT_TEXT = "VERIFY_NOT_TEXT"
@@ -54,10 +56,22 @@ class ActionType(enum.Enum):
     SET_WINDOW_SIZE = "SET_WINDOW_SIZE"
     GET_CONSOLE_ERRORS = "GET_CONSOLE_ERRORS"
 
+    # --- Native app actions (Appium only) ---
+    TAP = "TAP"
+    SWIPE = "SWIPE"
+    SCROLL = "SCROLL"
+    LONG_PRESS = "LONG_PRESS"
+    LAUNCH_APP = "LAUNCH_APP"
+    CLOSE_APP = "CLOSE_APP"
+    ACTIVATE_APP = "ACTIVATE_APP"
+    BACKGROUND_APP = "BACKGROUND_APP"
+    HIDE_KEYBOARD = "HIDE_KEYBOARD"
+
 
 class LocatorStrategy(enum.Enum):
     """Locator strategies in priority order (per locator policy)."""
 
+    # --- Common strategies (Selenium + Appium) ---
     DATA_TESTID = "data-testid"
     ID = "id"
     NAME = "name"
@@ -66,6 +80,89 @@ class LocatorStrategy(enum.Enum):
     TEXT = "text"
     LINK_TEXT = "link_text"
     PARTIAL_LINK_TEXT = "partial_link_text"
+    TAG_NAME = "tag_name"
+    CLASS_NAME = "class_name"
+
+    # --- Appium-specific strategies ---
+    ACCESSIBILITY_ID = "accessibility_id"
+    ANDROID_UIAUTOMATOR = "android_uiautomator"
+    IOS_PREDICATE = "ios_predicate"
+
+    @classmethod
+    def from_str(cls, value: Any) -> "LocatorStrategy":
+        """Parse any strategy string or alias into a canonical LocatorStrategy."""
+        if isinstance(value, cls):
+            return value
+        raw = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+        aliases = {
+            "tag": cls.TAG_NAME,
+            "tag_name": cls.TAG_NAME,
+            "tagname": cls.TAG_NAME,
+            "class": cls.CLASS_NAME,
+            "class_name": cls.CLASS_NAME,
+            "classname": cls.CLASS_NAME,
+            "data_testid": cls.DATA_TESTID,
+            "datatestid": cls.DATA_TESTID,
+            "testid": cls.DATA_TESTID,
+            "data_test_id": cls.DATA_TESTID,
+            "css": cls.CSS,
+            "css_selector": cls.CSS,
+            "cssselector": cls.CSS,
+            "id": cls.ID,
+            "name": cls.NAME,
+            "xpath": cls.XPATH,
+            "text": cls.TEXT,
+            "link": cls.LINK_TEXT,
+            "link_text": cls.LINK_TEXT,
+            "linktext": cls.LINK_TEXT,
+            "partial_link": cls.PARTIAL_LINK_TEXT,
+            "partial_link_text": cls.PARTIAL_LINK_TEXT,
+            "partiallinktext": cls.PARTIAL_LINK_TEXT,
+            "accessibility_id": cls.ACCESSIBILITY_ID,
+            "accessibilityid": cls.ACCESSIBILITY_ID,
+            "android_uiautomator": cls.ANDROID_UIAUTOMATOR,
+            "uiautomator": cls.ANDROID_UIAUTOMATOR,
+            "ios_predicate": cls.IOS_PREDICATE,
+        }
+        if raw in aliases:
+            return aliases[raw]
+        for member in cls:
+            if member.value == raw or member.value.replace("-", "_") == raw:
+                return member
+        if raw.startswith(("//", "(")) or "xpath" in raw:
+            return cls.XPATH
+        return cls.CSS
+
+
+# Actions that only make sense in a web browser context
+WEB_ONLY_ACTIONS = frozenset({
+    ActionType.NAVIGATE,
+    ActionType.VERIFY_URL,
+    ActionType.VERIFY_URL_CONTAINS,
+    ActionType.VERIFY_URL_NOT_CONTAINS,
+    ActionType.WAIT_URL_CONTAINS,
+    ActionType.WAIT_URL_NOT_CONTAINS,
+    ActionType.RELOAD_PAGE,
+    ActionType.GO_BACK,
+    ActionType.EXECUTE_JS,
+    ActionType.GET_CONSOLE_ERRORS,
+    ActionType.OPEN_BROWSER,
+    ActionType.CLOSE_BROWSER,
+    ActionType.SET_WINDOW_SIZE,
+})
+
+# Actions that only make sense in a native app context
+NATIVE_ONLY_ACTIONS = frozenset({
+    ActionType.TAP,
+    ActionType.SWIPE,
+    ActionType.SCROLL,
+    ActionType.LONG_PRESS,
+    ActionType.LAUNCH_APP,
+    ActionType.CLOSE_APP,
+    ActionType.ACTIVATE_APP,
+    ActionType.BACKGROUND_APP,
+    ActionType.HIDE_KEYBOARD,
+})
 
 
 @dataclass
@@ -76,7 +173,10 @@ class Locator:
     value: str
 
     def to_selenium_locator(self) -> str:
-        """Convert to SeleniumLibrary-compatible locator string."""
+        """Convert to SeleniumLibrary-compatible locator string.
+
+        Appium-specific strategies return a simple 'strategy:value' fallback.
+        """
         strategy_map = {
             LocatorStrategy.DATA_TESTID: lambda v: f'css:[data-testid="{v}"]',
             LocatorStrategy.ID: lambda v: f"id:{v}",
@@ -86,8 +186,14 @@ class Locator:
             LocatorStrategy.TEXT: lambda v: f"xpath://*[contains(text(),'{v}')]",
             LocatorStrategy.LINK_TEXT: lambda v: f"link:{v}",
             LocatorStrategy.PARTIAL_LINK_TEXT: lambda v: f"partial link:{v}",
+            LocatorStrategy.TAG_NAME: lambda v: f"tag:{v}",
+            LocatorStrategy.CLASS_NAME: lambda v: f"class:{v}",
         }
-        return strategy_map[self.strategy](self.value)
+        converter = strategy_map.get(self.strategy)
+        if converter:
+            return converter(self.value)
+        # Fallback for Appium-specific strategies
+        return f"{self.strategy.value}:{self.value}"
 
 
 @dataclass
@@ -114,12 +220,62 @@ class Action:
                 "value": self.locator.value,
             }
         if self.value is not None:
-            result["value"] = self.value
+            locator_value = self.locator.value.lower() if self.locator else ""
+            is_password_input = (
+                self.action_type == ActionType.TYPE
+                and ("password" in self.description.lower() or "password" in locator_value)
+            )
+            result["value"] = "<redacted>" if is_password_input else self.value
         if self.timeout != 15.0:
             result["timeout"] = self.timeout
         if self.extra:
             result["extra"] = self.extra
         return result
+
+    def to_cache_dict(self) -> dict:
+        """Serialize action to dict for persistent test caching."""
+        return {
+            "action_type": self.action_type.value,
+            "description": self.description,
+            "locator": {
+                "strategy": self.locator.strategy.value,
+                "value": self.locator.value,
+            } if self.locator else None,
+            "fallback_locators": [
+                {"strategy": fl.strategy.value, "value": fl.value}
+                for fl in self.fallback_locators
+            ],
+            "value": self.value,
+            "timeout": self.timeout,
+            "extra": self.extra,
+        }
+
+    @classmethod
+    def from_cache_dict(cls, data: dict) -> "Action":
+        """Reconstruct action from cache dict."""
+        loc = None
+        if data.get("locator"):
+            loc = Locator(
+                strategy=LocatorStrategy.from_str(data["locator"].get("strategy")),
+                value=str(data["locator"].get("value", "")),
+            )
+        fallbacks = [
+            Locator(
+                strategy=LocatorStrategy.from_str(fl.get("strategy")),
+                value=str(fl.get("value", "")),
+            )
+            for fl in data.get("fallback_locators", [])
+            if fl and fl.get("strategy") and fl.get("value")
+        ]
+        return cls(
+            action_type=ActionType(data["action_type"]),
+            description=data.get("description", ""),
+            locator=loc,
+            fallback_locators=fallbacks,
+            value=data.get("value"),
+            timeout=float(data.get("timeout", 15.0)),
+            extra=data.get("extra", {}),
+        )
 
 
 class TestStatus(enum.Enum):
@@ -186,6 +342,41 @@ class TestCase:
             "test_type": self.test_type,
             "tags": self.tags,
         }
+
+    def to_cache_dict(self) -> dict:
+        """Serialize test case to dict for persistent test caching."""
+        return {
+            "test_id": self.test_id,
+            "test_name": self.test_name,
+            "page": self.page,
+            "functionality": self.functionality,
+            "scenario": self.scenario,
+            "preconditions": self.preconditions,
+            "test_data": self.test_data,
+            "steps": [s.to_cache_dict() for s in self.steps],
+            "expected_result": self.expected_result,
+            "priority": self.priority,
+            "test_type": self.test_type,
+            "tags": self.tags,
+        }
+
+    @classmethod
+    def from_cache_dict(cls, data: dict) -> "TestCase":
+        """Reconstruct TestCase from cache dict."""
+        return cls(
+            test_id=data["test_id"],
+            page=data["page"],
+            functionality=data["functionality"],
+            scenario=data["scenario"],
+            test_name=data.get("test_name", data["scenario"]),
+            preconditions=data.get("preconditions", []),
+            test_data=data.get("test_data", {}),
+            steps=[Action.from_cache_dict(s) for s in data.get("steps", [])],
+            expected_result=data.get("expected_result", ""),
+            priority=data.get("priority", "P1"),
+            test_type=data.get("test_type", "browser"),
+            tags=data.get("tags", []),
+        )
 
 
 @dataclass

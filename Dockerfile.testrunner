@@ -38,11 +38,12 @@ RUN mkdir -p /opt/testing/artifacts/robot \
 # Default environment variables (overridden by docker-compose / .env)
 ENV SELENIUM_REMOTE_URL=http://selenium:4444
 ENV PUSHGATEWAY_URL=http://pushgateway:9091
-ENV BASE_URL=https://trackpilot.pods365.com
+ENV TARGET_TYPE=web
+ENV BASE_URL=""
 ENV BROWSER=chrome
-ENV PROJECT_NAME=trackpilot
+ENV PROJECT_NAME=""
 ENV PYTHONPATH=/opt/testing
-ENV TEST_SUITE=testsuites/trackpilot.testsuite.md
+ENV TEST_SUITE=""
 
 # No fixed entrypoint — allows both robot and python commands
 # Usage:

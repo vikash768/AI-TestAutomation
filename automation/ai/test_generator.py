@@ -16,11 +16,56 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from pathlib import Path
+import re
+import sys
+import time
+from typing import Any
+
+# Ensure project root is in sys.path for direct execution
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+
+def _load_dotenv_if_present() -> None:
+    """Load key generator variables from .env if present and not already set in environment."""
+    env_file = _PROJECT_ROOT / ".env"
+    if env_file.exists():
+        try:
+            parsed: dict[str, str] = {}
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip("'\"")
+                # Handle ${VAR} substitutions within .env
+                for var_k, var_v in parsed.items():
+                    v = v.replace(f"${{{var_k}}}", var_v)
+                parsed[k] = v
+            # Set into os.environ only generator-relevant keys if not already defined
+            generator_keys = {
+                "GEMINI_API_KEY", "GEMINI_MODEL", "BASE_URL",
+                "VALID_USER_EMAIL", "VALID_USER_PASSWORD",
+                "WEB_VALID_USER_EMAIL", "WEB_VALID_USER_PASSWORD",
+                "MOBILE_VALID_USER_EMAIL", "MOBILE_VALID_USER_PASSWORD",
+                "DESKTOP_VALID_USER_EMAIL", "DESKTOP_VALID_USER_PASSWORD",
+                "AI_MAX_CATEGORIES", "AI_MAX_TESTS",
+            }
+            for k, v in parsed.items():
+                if k in generator_keys and k not in os.environ:
+                    os.environ[k] = v
+        except Exception:
+            pass
+
+
+_load_dotenv_if_present()
+
 from google import genai
 from google.genai import types
-import os
-import re
-from dataclasses import dataclass, field
 
 from automation.actions.schema import (
     Action,
@@ -28,12 +73,13 @@ from automation.actions.schema import (
     Locator,
     LocatorStrategy,
     TestCase,
+    WEB_ONLY_ACTIONS,
+    NATIVE_ONLY_ACTIONS,
 )
 from automation.ai.suite_parser import (
     PageContext,
     SuiteContext,
     TestCategory,
-    TestInstruction,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,6 +123,60 @@ def _first_locator(*locator_lists: list[Locator]) -> Locator:
     return Locator(LocatorStrategy.CSS, "body")
 
 
+def _sanitize_locator(loc: Locator | None) -> tuple[Locator | None, list[Locator]]:
+    """Sanitize locator, converting pseudo-selectors (:contains, :has-text, text=) to XPath."""
+    if loc is None or loc.strategy != LocatorStrategy.CSS:
+        return loc, []
+
+    val = loc.value.strip()
+    if not (":contains(" in val or ":has-text(" in val or "text=" in val):
+        return loc, []
+
+    parts = [p.strip() for p in re.split(r",\s*(?![^()]*\))", val) if p.strip()]
+    valid_css_parts: list[str] = []
+    xpath_fallbacks: list[Locator] = []
+
+    for part in parts:
+        m = re.search(r"^(.*?):(contains|has-text)\((['\"]?)(.*?)\3\)$", part)
+        if m:
+            tag = m.group(1).strip()
+            text = m.group(4).replace("'", "\\'")
+            tag_xpath = tag if tag and tag != "*" else "*"
+            xpath_fallbacks.append(
+                Locator(
+                    LocatorStrategy.XPATH,
+                    f"//{tag_xpath}[contains(text(), '{text}') or contains(., '{text}')]",
+                )
+            )
+        elif part.startswith("text="):
+            text = part[5:].strip().strip("'\"").replace("'", "\\'")
+            xpath_fallbacks.append(
+                Locator(
+                    LocatorStrategy.XPATH,
+                    f"//*[contains(text(), '{text}') or contains(., '{text}')]",
+                )
+            )
+        elif ":contains(" in part or ":has-text(" in part:
+            m_embed = re.search(r":(contains|has-text)\((['\"]?)(.*?)\2\)", part)
+            if m_embed:
+                text = m_embed.group(3).replace("'", "\\'")
+                xpath_fallbacks.append(
+                    Locator(
+                        LocatorStrategy.XPATH,
+                        f"//*[contains(text(), '{text}') or contains(., '{text}')]",
+                    )
+                )
+        else:
+            valid_css_parts.append(part)
+
+    if valid_css_parts:
+        primary = Locator(LocatorStrategy.CSS, ", ".join(valid_css_parts))
+        return primary, xpath_fallbacks
+    elif xpath_fallbacks:
+        return xpath_fallbacks[0], xpath_fallbacks[1:]
+    return Locator(LocatorStrategy.CSS, "body"), []
+
+
 class TestGenerator:
     """Generates concrete TestCase objects from parsed SuiteContext.
 
@@ -84,11 +184,74 @@ class TestGenerator:
     instructions and produces TestCase objects with structured Action steps.
     """
 
-    def __init__(self, base_url: str = "", email: str = "", password: str = ""):
-        self._base_url = base_url or os.environ.get("BASE_URL", "https://trackpilot.pods365.com")
-        self._email = email or os.environ.get("VALID_USER_EMAIL", "")
-        self._password = password or os.environ.get("VALID_USER_PASSWORD", "")
+    def __init__(
+        self,
+        base_url: str = "",
+        email: str = "",
+        password: str = "",
+        target_type: str = "web",
+        appium_platform: str = "",
+        codebase_context: dict[str, Any] | str = "",
+    ):
+        self._target_type = target_type.lower()
+        self._appium_platform = appium_platform.lower() if appium_platform else ""
+        self._codebase_context = (
+            codebase_context
+            if isinstance(codebase_context, dict)
+            else ({"summary_prompt": str(codebase_context)} if codebase_context else {})
+        )
+
+        # base_url is only required for web targets
+        if self._target_type == "web":
+            self._base_url = base_url or os.environ.get("BASE_URL", "")
+            target_email = os.environ.get("WEB_VALID_USER_EMAIL") or os.environ.get("VALID_USER_EMAIL", "")
+            target_password = os.environ.get("WEB_VALID_USER_PASSWORD") or os.environ.get("VALID_USER_PASSWORD", "")
+        elif self._target_type == "mobile":
+            self._base_url = ""
+            target_email = os.environ.get("MOBILE_VALID_USER_EMAIL") or os.environ.get("VALID_USER_EMAIL", "")
+            target_password = os.environ.get("MOBILE_VALID_USER_PASSWORD") or os.environ.get("VALID_USER_PASSWORD", "")
+        elif self._target_type == "desktop":
+            self._base_url = ""
+            target_email = os.environ.get("DESKTOP_VALID_USER_EMAIL") or os.environ.get("VALID_USER_EMAIL", "")
+            target_password = os.environ.get("DESKTOP_VALID_USER_PASSWORD") or os.environ.get("VALID_USER_PASSWORD", "")
+        else:
+            self._base_url = ""
+            target_email = os.environ.get("VALID_USER_EMAIL", "")
+            target_password = os.environ.get("VALID_USER_PASSWORD", "")
+
+        self._email = email or target_email
+        self._password = password or target_password
         self._test_id_counters: dict[str, int] = {}
+
+        max_categories = os.environ.get("AI_MAX_CATEGORIES", "").strip()
+        try:
+            self._max_categories = max(0, int(max_categories)) if max_categories else 0
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid AI_MAX_CATEGORIES=%r; generating the full suite.",
+                max_categories,
+            )
+            self._max_categories = 0
+
+        max_tests = os.environ.get("AI_MAX_TESTS", "").strip()
+        try:
+            self._max_tests = max(0, int(max_tests)) if max_tests else 0
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid AI_MAX_TESTS=%r; generating all tests.",
+                max_tests,
+            )
+            self._max_tests = 0
+
+        self._require_full_coverage = (
+            os.environ.get("REQUIRE_FULL_MD_COVERAGE", "false").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if self._require_full_coverage and (self._max_categories or self._max_tests):
+            raise ValueError(
+                "REQUIRE_FULL_MD_COVERAGE=true cannot be combined with "
+                "AI_MAX_CATEGORIES or AI_MAX_TESTS. Clear the demo limits for a full run."
+            )
         
         self.api_key = os.environ.get("GEMINI_API_KEY")
         if self.api_key:
@@ -96,6 +259,118 @@ class TestGenerator:
         else:
             self._client = None
             logger.warning("No GEMINI_API_KEY found, falling back to mock generators.")
+
+        self._cache_dir = Path("artifacts/cache")
+        suite_id = "trackpilot" if "trackpilot" in (self._base_url or "").lower() else (self._target_type or "suite")
+        self._cache_file = self._cache_dir / f"test_generator_{self._target_type}_{suite_id}.json"
+        self._cache: dict[str, Any] = self._load_cache()
+
+    def _load_cache(self) -> dict[str, Any]:
+        """Load previously generated test cases from disk cache."""
+        if os.environ.get("REGENERATE_TESTS", "").lower() in ("1", "true", "yes"):
+            return {}
+        if self._cache_file.exists():
+            try:
+                data = json.loads(self._cache_file.read_text(encoding="utf-8"))
+                logger.info("Loaded test generation cache from %s (%d categories)", self._cache_file, len(data))
+                return data
+            except Exception as exc:
+                logger.warning("Failed to load test generator cache %s: %s", self._cache_file, exc)
+        return {}
+
+    def _save_cache(self) -> None:
+        """Persist generated test cases to disk cache."""
+        try:
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+            self._cache_file.write_text(json.dumps(self._cache, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to write test generator cache: %s", exc)
+
+    def _sanitize_test_case(self, tc: TestCase) -> TestCase:
+        """Sanitize test case steps, locators, and credentials."""
+        for step in tc.steps:
+            # 1. Sanitize locators
+            if step.locator:
+                prim, extra_falls = _sanitize_locator(step.locator)
+                step.locator = prim
+                if extra_falls:
+                    step.fallback_locators.extend(extra_falls)
+
+            sanitized_fallbacks: list[Locator] = []
+            for fl in step.fallback_locators:
+                san_fl, more_fls = _sanitize_locator(fl)
+                if san_fl:
+                    sanitized_fallbacks.append(san_fl)
+                sanitized_fallbacks.extend(more_fls)
+            step.fallback_locators = sanitized_fallbacks
+
+            # 2. Value type coercion
+            if step.value is not None and not isinstance(step.value, str):
+                step.value = str(step.value)
+
+            # 3. Credential hallucination & placeholder normalization
+            if step.action_type == ActionType.TYPE:
+                desc = step.description.lower()
+                loc_val = (step.locator.value if step.locator else "").lower()
+                val = step.value or ""
+
+                # Password field handling
+                if "password" in desc or "password" in loc_val:
+                    is_valid_auth = any(
+                        k in desc
+                        for k in (
+                            "valid", "correct", "configured", "successful",
+                            "admin password", "test password",
+                        )
+                    ) or any(
+                        k in tc.scenario.lower()
+                        for k in (
+                            "valid", "correct credentials", "valid email format",
+                            "uppercase and lowercase", "valid login",
+                        )
+                    ) or val in (
+                        "${VALID_USER_PASSWORD}", "${PASSWORD}",
+                        f"{self._password}.com", f"{self._password}@pods365.com",
+                    ) or (bool(self._password) and val == self._email)
+
+                    if is_valid_auth and self._password:
+                        step.value = self._password
+                    elif val in ("${VALID_USER_PASSWORD}", "${PASSWORD}") and self._password:
+                        step.value = self._password
+                    elif self._password and val.endswith(".com") and not self._password.endswith(".com"):
+                        if val.startswith(self._password):
+                            step.value = self._password
+
+                # Email field handling
+                elif any(k in desc for k in ("email", "username")) or any(k in loc_val for k in ("email", "username")):
+                    is_valid_email = any(
+                        k in desc
+                        for k in (
+                            "valid test email", "valid email", "correct email",
+                            "admin email", "configured email",
+                        )
+                    ) or val in ("${VALID_USER_EMAIL}", "${EMAIL}")
+
+                    if is_valid_email and self._email:
+                        step.value = self._email
+                    elif val in ("${VALID_USER_EMAIL}", "${EMAIL}") and self._email:
+                        step.value = self._email
+
+        # Normalize test_data dictionary
+        if isinstance(tc.test_data, dict):
+            if "password" in tc.test_data and self._password:
+                pwd = str(tc.test_data["password"])
+                if pwd in (
+                    f"{self._password}.com", f"{self._password}@pods365.com",
+                    "${VALID_USER_PASSWORD}", "${PASSWORD}",
+                ) or (pwd.startswith(self._password) and pwd.endswith(".com")):
+                    tc.test_data["password"] = self._password
+            if "email" in tc.test_data and self._email:
+                em = str(tc.test_data["email"])
+                if em in ("${VALID_USER_EMAIL}", "${EMAIL}"):
+                    tc.test_data["email"] = self._email
+
+        return tc
 
     def generate(self, ctx: SuiteContext) -> list[TestCase]:
         """Generate all test cases from the parsed suite context.
@@ -105,14 +380,38 @@ class TestGenerator:
         """
         all_cases: list[TestCase] = []
 
+        generated_categories = 0
         for page in ctx.pages:
-            page_cases = self._generate_page_tests(page)
+            page_cases: list[TestCase] = []
+            for category in page.categories:
+                if self._max_categories and generated_categories >= self._max_categories:
+                    break
+                page_cases.extend(self._generate_category_tests(page, category))
+                generated_categories += 1
+
             all_cases.extend(page_cases)
+            if page_cases:
+                logger.info(
+                    "Generated %d tests for page: %s",
+                    len(page_cases),
+                    page.page_name,
+                )
+            if self._max_categories and generated_categories >= self._max_categories:
+                logger.info(
+                    "AI_MAX_CATEGORIES=%d reached; continuing with %d generated tests.",
+                    self._max_categories,
+                    len(all_cases),
+                )
+                break
+
+        if self._max_tests and len(all_cases) > self._max_tests:
             logger.info(
-                "Generated %d tests for page: %s",
-                len(page_cases),
-                page.page_name,
+                "AI_MAX_TESTS=%d reached; selecting the first %d of %d tests.",
+                self._max_tests,
+                self._max_tests,
+                len(all_cases),
             )
+            all_cases = all_cases[:self._max_tests]
 
         logger.info("Total test cases generated: %d", len(all_cases))
         return all_cases
@@ -133,14 +432,59 @@ class TestGenerator:
         """Generate tests for a single category within a page."""
         cases = []
 
+        # Check persistent cache first
+        cache_key = f"{page.page_name}::{category.category_id}::{len(category.instructions)}"
+        if cache_key in self._cache:
+            try:
+                cached_data = self._cache[cache_key]
+                if isinstance(cached_data, list) and len(cached_data) >= len(category.instructions):
+                    cached_cases = [self._sanitize_test_case(TestCase.from_cache_dict(d)) for d in cached_data]
+                    logger.info(
+                        "Using %d cached tests for %s - %s",
+                        len(cached_cases),
+                        page.page_name,
+                        category.category_name,
+                    )
+                    return self._ensure_category_coverage(page, category, cached_cases)
+            except Exception as exc:
+                logger.warning(
+                    "Cache restore error for %s - %s: %s; regenerating.",
+                    page.page_name,
+                    category.category_name,
+                    exc,
+                )
+
+        if self._require_full_coverage and not self._client:
+            raise RuntimeError(
+                "Full Markdown coverage requires GEMINI_API_KEY so every instruction "
+                "can be converted into a real executable verification."
+            )
+
         if self._client:
             try:
                 logger.info(f"Using AI to generate tests for {page.page_name} - {category.category_name}")
                 cases = self._generate_with_ai(page, category)
                 if cases:
+                    cases = [self._sanitize_test_case(c) for c in cases]
+                    cases = self._ensure_category_coverage(page, category, cases)
+                    self._cache[cache_key] = [tc.to_cache_dict() for tc in cases]
+                    self._save_cache()
                     return cases
             except Exception as e:
-                logger.error(f"AI Generation failed: {e}")
+                logger.warning(
+                    "AI Generation failed for %s / %s: %s. Falling back to deterministic instruction generator.",
+                    page.page_name,
+                    category.category_name,
+                    e,
+                )
+
+        # Generate deterministic tests from instructions as safety net
+        cases = self._gen_from_instructions(page, category)
+        if cases:
+            cases = self._ensure_category_coverage(page, category, cases)
+            self._cache[cache_key] = [tc.to_cache_dict() for tc in cases]
+            self._save_cache()
+            return cases
 
         # Map category names to specialized generators
         generators = {
@@ -164,34 +508,209 @@ class TestGenerator:
             "Real-time Elements": self._gen_realtime,
         }
 
-        # Try specialized generator first
-        gen_fn = generators.get(category.category_name)
-        if gen_fn:
-            cases = gen_fn(page, category)
-        else:
-            # Fall back to instruction-driven generation
-            cases = self._gen_from_instructions(page, category)
+        # Map category names to specialized generators (web targets only)
+        if self._target_type == "web":
+            gen_fn = generators.get(category.category_name)
+            if gen_fn:
+                cases = gen_fn(page, category)
+                return self._ensure_category_coverage(page, category, cases)
 
-        return cases
+        # Fall back to instruction-driven generation
+        cases = self._gen_from_instructions(page, category)
+        return self._ensure_category_coverage(page, category, cases)
 
+    def _ensure_category_coverage(
+        self,
+        page: PageContext,
+        category: TestCategory,
+        cases: list[TestCase],
+    ) -> list[TestCase]:
+        """Guarantee at least one executable test for every Markdown instruction."""
+        required = len(category.instructions)
+        if required == 0:
+            return cases
+
+        covered_cases = [
+            case for case in cases
+            if case.steps and any(
+                step.action_type not in {ActionType.NAVIGATE, ActionType.SLEEP}
+                for step in case.steps
+            )
+        ]
+        missing_start = min(len(covered_cases), required)
+        missing_instructions = category.instructions[missing_start:]
+
+        # One bounded repair request asks the model only for instructions it
+        # omitted from the original category response.
+        if missing_instructions and self._client:
+            repair_category = TestCategory(
+                category_id=category.category_id,
+                category_name=f"{category.category_name} — Remaining Coverage",
+                description=(
+                    "Generate one independent executable test for every instruction below. "
+                    "Do not combine or omit instructions."
+                ),
+                instructions=missing_instructions,
+            )
+            try:
+                repair_cases = self._generate_with_ai(page, repair_category)
+                covered_cases.extend(repair_cases[:len(missing_instructions)])
+            except Exception as exc:
+                logger.warning(
+                    "Coverage repair failed for %s / %s: %s",
+                    page.page_name,
+                    category.category_name,
+                    exc,
+                )
+
+        if len(covered_cases) < required and self._require_full_coverage:
+            raise RuntimeError(
+                f"Full Markdown coverage required for {page.page_name} / "
+                f"{category.category_name}, but only {len(covered_cases)} of "
+                f"{required} executable instruction tests were generated."
+            )
+
+        # Deterministic instruction cases are the final safety net. This keeps
+        # suite coverage complete even if the AI response is short or invalid.
+        if len(covered_cases) < required:
+            remaining = category.instructions[len(covered_cases):]
+            fallback_category = TestCategory(
+                category_id=category.category_id,
+                category_name=category.category_name,
+                description=category.description,
+                instructions=remaining,
+            )
+            covered_cases.extend(self._gen_from_instructions(page, fallback_category))
+
+        slug = re.sub(
+            r"[^A-Z0-9]+",
+            "-",
+            f"{page.page_name}-{category.category_id}".upper(),
+        ).strip("-")
+        for index, case in enumerate(covered_cases, 1):
+            case.test_id = f"TC-{self._target_type.upper()}-{slug}-{index:03d}"
+            if index <= required:
+                instruction = category.instructions[index - 1].instruction
+                case.test_data["source_instruction_index"] = str(index)
+                case.test_data["source_instruction"] = instruction
+                if "md-coverage" not in case.tags:
+                    case.tags.append("md-coverage")
+
+        if len(covered_cases) < required:
+            raise RuntimeError(
+                f"Coverage invariant failed for {page.page_name} / {category.category_name}: "
+                f"{len(covered_cases)} tests for {required} instructions"
+            )
+
+        # The contract is one test per Markdown instruction. Models sometimes
+        # return bonus/duplicate cases even when asked for an exact count; do
+        # not let those make a full run larger or less deterministic.
+        if len(covered_cases) > required:
+            logger.warning(
+                "Ignoring %d extra generated test(s) for %s / %s; "
+                "the Markdown defines exactly %d instruction(s).",
+                len(covered_cases) - required,
+                page.page_name,
+                category.category_name,
+                required,
+            )
+            covered_cases = covered_cases[:required]
+
+        logger.info(
+            "Coverage: %s / %s — %d/%d instructions have executable tests",
+            page.page_name,
+            category.category_name,
+            required,
+            required,
+        )
+        return covered_cases
 
     def _generate_with_ai(self, page: PageContext, category: TestCategory) -> list[TestCase]:
+        # Build target-type-aware context for the AI prompt
+        if self._target_type == "web":
+            target_context = f"""Target Platform: Web Browser
+Application Base URL: {self._base_url}
+Use browser-based actions: NAVIGATE, VERIFY_URL, EXECUTE_JS, CLICK, TYPE, CLEAR, VERIFY_TEXT, VERIFY_VISIBLE, WAIT_VISIBLE, WAIT_URL_CONTAINS, etc.
+TrackPilot Admin Web Application details:
+- Base routes: /login, /dashboard, /users, /live, /history, /screenshots, /projects, /reports, /settings, /audit, /profile
+- Login page: email input id="email", password input id="password", submit button css="button[type='submit']"
+- Main Navigation: sidebar items with text "Dashboard", "Users", "Live Activity", "Time History", "Screenshots", "Projects & Tasks", "Reports", "Settings", "Audit Logs", "Profile", "Log out"
+- For locators, prefer id, css, xpath, name, text, tag_name, or class_name.
+"""
+            available_actions = ", ".join(
+                at.value for at in ActionType
+                if at not in NATIVE_ONLY_ACTIONS
+            )
+        elif self._target_type == "mobile":
+            platform_label = self._appium_platform or self._target_type
+            target_context = f"""Target Platform: {platform_label.capitalize()} (native app via Appium)
+IMPORTANT: This is a NATIVE application. Do NOT generate NAVIGATE, VERIFY_URL, EXECUTE_JS, RELOAD_PAGE, GO_BACK, GET_CONSOLE_ERRORS, OPEN_BROWSER, CLOSE_BROWSER, or SET_WINDOW_SIZE actions.
+Use native-compatible actions: CLICK, TAP, TYPE, CLEAR, VERIFY_TEXT, VERIFY_VISIBLE, WAIT_VISIBLE, SWIPE, SCROLL, PRESS_KEY, SLEEP.
+For locators on native mobile apps:
+- For the "Sign In" submit button at the bottom: Use xpath "(//android.view.ViewGroup[@content-desc='Sign In'])[last()]"
+- For the "Sign In" navigation tab at the top: Use xpath "(//android.view.ViewGroup[@content-desc='Sign In'])[1]"
+- For the "Sign Up" tab at the top: Use accessibility_id "Sign Up" or xpath "//*[@content-desc='Sign Up']"
+- For bottom navigation tabs (Home, Search, Messages, Profile): Use accessibility_id "Home", "Search", "Messages", "Profile" or xpath "//*[@content-desc='Home']" etc.
+- For the center "+" create button in bottom nav: Use xpath "//android.view.ViewGroup[contains(@bounds, '1392') and @clickable='true']"
+- For dismissing modals or going back: Use PRESS_KEY with value "BACK"
+- For input fields: Use xpath "//android.widget.EditText[1]" for email, and "//android.widget.EditText[2]" for password.
+- Use the credentials: Email "{self._email}", Password "{self._password}".
+- On Android, styled text headers are split into separate TextViews; always verify individual words or child options like "General Account" or "Regular Post", not long multi-word headers.
+Do NOT assume a URL exists or use web URLs. The app is already launched and active on screen.
+"""
+            available_actions = ", ".join(
+                at.value for at in ActionType
+                if at not in WEB_ONLY_ACTIONS
+            )
+        else:
+            platform_label = self._appium_platform or "desktop"
+            target_context = f"""Target Platform: {platform_label.capitalize()} desktop application via Appium
+IMPORTANT: This is a NATIVE DESKTOP application. Do NOT generate NAVIGATE, VERIFY_URL, EXECUTE_JS, RELOAD_PAGE, GO_BACK, GET_CONSOLE_ERRORS, OPEN_BROWSER, CLOSE_BROWSER, SWIPE, or HIDE_KEYBOARD actions.
+Use native desktop actions such as CLICK, TYPE, CLEAR, VERIFY_TEXT, VERIFY_VISIBLE, WAIT_VISIBLE, PRESS_KEY, SLEEP, LAUNCH_APP, CLOSE_APP, and ACTIVATE_APP.
+Prefer accessibility_id and name locators. Use class_name or a platform-appropriate XPath only when the accessibility tree has no stable identifier.
+For macOS Mac2, locate controls by accessibility identifier/name/label. For Windows, locate controls by accessibility id/name/class.
+Do not emit Android class names, content-desc attributes, Android UiAutomator selectors, iOS predicates, mobile coordinates, or browser URLs.
+The desktop app is already launched by the Appium session.
+"""
+            available_actions = ", ".join(
+                at.value for at in ActionType
+                if at not in WEB_ONLY_ACTIONS
+                and at not in {ActionType.SWIPE, ActionType.HIDE_KEYBOARD}
+            )
+
+        repo_snippet = ""
+        summary_prompt = self._codebase_context.get("summary_prompt", "")
+        repo_url = self._codebase_context.get("repo_url", "")
+        if summary_prompt:
+            repo_label = f"from {repo_url}" if repo_url else "from repository"
+            repo_snippet = f"""
+Discovered Codebase Elements ({repo_label}):
+{summary_prompt}
+Use the actual element labels, testIDs, placeholders, and route paths found in the codebase where appropriate.
+"""
+
         prompt = f"""
 You are an expert QA Automation Architect. Generate a JSON array of test cases based on the provided instructions.
-Application Base URL: {self._base_url}
-Admin Email: {self._email}
-Admin Password: {self._password}
+{target_context}
+{repo_snippet}
+Configured Test Email: {self._email}
+Configured Test Password: {self._password}
 
 Page: {page.page_name}
 Category: {category.category_name}
 
 Instructions:
-{chr(10).join(f"- {i.instruction}" for i in category.instructions)}
+{chr(10).join(f"{index}. {instruction.instruction}" for index, instruction in enumerate(category.instructions, 1))}
 
 Context/Description:
 {category.description}
 
 Return ONLY a valid JSON array of objects representing test cases. Do not include markdown formatting like ```json.
+Coverage contract:
+- Return exactly {len(category.instructions)} test-case objects: one object per numbered instruction, in the same order.
+- Do not combine instructions and do not omit an instruction.
+- Each test must execute and verify the behavior named by its instruction; navigation plus SLEEP alone is not a valid test.
+- In each object's test_data, include "source_instruction_index" and "source_instruction" for the matching numbered instruction.
 Each object must have exactly these keys:
 - "test_id": string (use format TC-TP-{page.page_name.upper().replace(' ', '')}-{category.category_name.upper().replace(' ', '')[:4]}-00X)
 - "test_name": string (a concise name for the test)
@@ -202,67 +721,219 @@ Each object must have exactly these keys:
 - "test_data": dictionary of string key-value pairs
 - "expected_result": string (what to verify)
 - "priority": string (e.g. "P0", "P1")
-- "test_type": string (e.g. "browser", "api")
+- "test_type": string (e.g. "{self._target_type}")
 - "tags": array of strings (e.g. ["smoke", "positive"])
 - "steps": array of Action objects. 
 
 Action objects must have:
-- "action_type": string (Must be one of: NAVIGATE, CLICK, TYPE, CLEAR, SELECT, CHECK, UNCHECK, WAIT, WAIT_VISIBLE, WAIT_NOT_VISIBLE, WAIT_URL_CONTAINS, PRESS_KEY, VERIFY_TEXT, VERIFY_NOT_TEXT, VERIFY_VISIBLE, VERIFY_NOT_VISIBLE, VERIFY_URL, VERIFY_URL_CONTAINS, VERIFY_URL_NOT_CONTAINS, VERIFY_VALUE, VERIFY_ENABLED, VERIFY_DISABLED, VERIFY_TITLE, VERIFY_TITLE_CONTAINS, VERIFY_ELEMENT_ATTRIBUTE, VERIFY_ELEMENT_COUNT, CAPTURE_SCREENSHOT, EXECUTE_JS, RELOAD_PAGE, GO_BACK, SLEEP, CLOSE_BROWSER, OPEN_BROWSER, SET_WINDOW_SIZE, GET_CONSOLE_ERRORS)
+- "action_type": string (Must be one of: {available_actions})
 - "description": string
-- "locator": object OR null. If object, must have "strategy" (one of: data-testid, id, name, css, xpath, text, link_text, partial_link_text) and "value" (string).
+- "locator": object OR null. If object, must have "strategy" (one of: data-testid, id, name, css, xpath, text, link_text, partial_link_text, tag_name, class_name, accessibility_id, android_uiautomator, ios_predicate) and "value" (string).
 - "value": string OR null.
 - "timeout": float (default 15.0)
 - "extra": dictionary of extra properties
 
 Guidelines:
-- First step is usually NAVIGATE or logging in if the page is protected.
-- To login, navigate to /login, type email, type password, click submit button.
-- Make tests robust. Use CSS or XPath locators if IDs are unknown.
+- For web targets: First step is usually NAVIGATE or logging in if the page is protected.
+- For native app targets: Do NOT use NAVIGATE. Use LAUNCH_APP or assume the app is already open.
+- To login on web, navigate to /login, type email, type password, click submit button.
+- Make tests robust. Use appropriate locators for the target platform.
+- IMPORTANT LOCATOR SYNTAX: Use strictly standard W3C CSS selectors. NEVER use jQuery or Playwright pseudo-selectors like :contains(), :has-text(), or text= in CSS selectors. Use XPath for text matching (e.g. "//button[contains(., 'Save')]").
+- FOR AUTHENTICATION: Always use the exact Configured Test Password "{self._password}" for positive authentication. Do NOT add ".com" or alter the password.
 """
-        response = self._client.models.generate_content(
-            model='gemini-1.5-pro',
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        data = json.loads(response.text)
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+        raw_text = ""
+        last_api_err = None
+        for attempt in range(3):
+            try:
+                response = self._client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(response_mime_type="application/json")
+                )
+                raw_text = response.text.strip()
+                break
+            except Exception as api_err:
+                last_api_err = api_err
+                if attempt < 2:
+                    logger.warning(
+                        "Gemini API attempt %d failed for %s / %s: %s. Retrying in %ds...",
+                        attempt + 1,
+                        page.page_name,
+                        category.category_name,
+                        api_err,
+                        (attempt + 1) * 2,
+                    )
+                    time.sleep((attempt + 1) * 2)
+                else:
+                    raise last_api_err
+
+        if raw_text.startswith("```"):
+            lines = raw_text.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            raw_text = "\n".join(lines).strip()
+        data = json.loads(raw_text)
+        if isinstance(data, dict):
+            for k in ("test_cases", "tests", "cases", "data", "items"):
+                if k in data and isinstance(data[k], list):
+                    data = data[k]
+                    break
+            else:
+                data = [data]
+        elif not isinstance(data, list):
+            data = []
         
         parsed_cases = []
         for item in data:
+            if not isinstance(item, dict):
+                continue
             steps = []
             for s in item.get("steps", []):
+                if not isinstance(s, dict):
+                    continue
                 loc = None
-                if s.get("locator"):
-                    loc = Locator(
-                        strategy=LocatorStrategy(s["locator"]["strategy"]),
-                        value=s["locator"]["value"]
+                if s.get("locator") and isinstance(s["locator"], dict):
+                    loc_val = str(s["locator"].get("value", "") or "")
+                    if loc_val:
+                        loc_strat = LocatorStrategy.from_str(s["locator"].get("strategy", "css"))
+                        loc = Locator(strategy=loc_strat, value=loc_val)
+                raw_action_type = str(s.get("action_type", "")).strip().upper()
+                action_aliases = {
+                    "INPUT": "TYPE",
+                    "INPUT_TEXT": "TYPE",
+                    "ENTER_TEXT": "TYPE",
+                    "SEND_KEYS": "TYPE",
+                    "FILL": "TYPE",
+                    "CLICK_ELEMENT": "CLICK",
+                    "TAP_ELEMENT": "TAP",
+                    "VERIFY_ELEMENT_VISIBLE": "VERIFY_VISIBLE",
+                    "ASSERT_VISIBLE": "VERIFY_VISIBLE",
+                    "WAIT_FOR_VISIBLE": "WAIT_VISIBLE",
+                    "WAIT_FOR_ELEMENT": "WAIT_VISIBLE",
+                    "WAIT_FOR_URL": "WAIT_URL_CONTAINS",
+                    "WAIT_URL": "WAIT_URL_CONTAINS",
+                    "URL_CONTAINS": "VERIFY_URL_CONTAINS",
+                    "ASSERT_URL": "VERIFY_URL",
+                    "CHECK_URL": "VERIFY_URL",
+                    "VERIFY_CONTAINS": "VERIFY_TEXT",
+                    "VERIFY_NOT_CONTAINS": "VERIFY_NOT_TEXT",
+                    "ASSERT_TEXT": "VERIFY_TEXT",
+                    "WAIT": "SLEEP",
+                    "WAIT_FOR": "SLEEP",
+                    "PAUSE": "SLEEP",
+                    "PRESS": "PRESS_KEY",
+                    "SCREENSHOT": "TAKE_SCREENSHOT",
+                }
+                raw_action_type = action_aliases.get(raw_action_type, raw_action_type)
+                try:
+                    action_type = ActionType(raw_action_type)
+                except ValueError:
+                    logger.warning(
+                        "Skipping unsupported AI action %r in test %s",
+                        raw_action_type,
+                        item.get("test_id", "(unknown)"),
                     )
+                    continue
+
+                sanitized_loc, extra_falls = _sanitize_locator(loc)
+                fallback_locators = self._ai_fallback_locators(s, sanitized_loc)
+                if extra_falls:
+                    fallback_locators.extend(extra_falls)
+
+                s_val = s.get("value")
+                if s_val is not None and not isinstance(s_val, str):
+                    s_val = str(s_val)
+
                 action = Action(
-                    action_type=ActionType(s["action_type"]),
+                    action_type=action_type,
                     description=s.get("description", ""),
-                    locator=loc,
-                    value=s.get("value"),
+                    locator=sanitized_loc,
+                    fallback_locators=fallback_locators,
+                    value=s_val,
                     timeout=float(s.get("timeout", 15.0)),
                     extra=s.get("extra", {})
                 )
                 steps.append(action)
                 
             tc = TestCase(
-                test_id=item["test_id"],
-                test_name=item["test_name"],
-                page=item["page"],
-                functionality=item["functionality"],
-                scenario=item["scenario"],
+                test_id=item.get("test_id", self._next_id("TEST")),
+                test_name=item.get("test_name", item.get("scenario", "Generated Test")),
+                page=item.get("page", page.page_name),
+                functionality=item.get("functionality", category.category_name),
+                scenario=item.get("scenario", ""),
                 preconditions=item.get("preconditions", []),
                 test_data=item.get("test_data", {}),
                 steps=steps,
                 expected_result=item.get("expected_result", ""),
                 priority=item.get("priority", "P1"),
-                test_type=item.get("test_type", "browser"),
-                tags=item.get("tags", [])
+                test_type=item.get("test_type", self._target_type),
+                tags=item.get("tags", []),
             )
-            parsed_cases.append(tc)
-            
+            parsed_cases.append(self._sanitize_test_case(tc))
+
+        # Sanitize for native targets: reject any web-only actions
+        if self._target_type != "web":
+            sanitized = []
+            for tc in parsed_cases:
+                tc.steps = [s for s in tc.steps if s.action_type not in WEB_ONLY_ACTIONS]
+                if tc.steps:
+                    sanitized.append(tc)
+            return sanitized
+
         return parsed_cases
+
+    def _ai_fallback_locators(self, step: dict, primary: Locator | None) -> list[Locator]:
+        """Attach stable fallbacks when an AI-selected web locator is too narrow."""
+        if self._target_type != "web" or primary is None:
+            return []
+
+        description = str(step.get("description", "")).lower()
+        locator_value = primary.value.lower()
+        candidates: list[Locator] = []
+
+        if "email" in description or "email" in locator_value or "username" in locator_value:
+            candidates = EMAIL_LOCATORS
+        elif "password" in description or "password" in locator_value:
+            candidates = PASSWORD_LOCATORS
+        elif any(token in description for token in ("login", "log in", "sign in", "submit")) \
+                or "submit" in locator_value:
+            candidates = LOGIN_BUTTON_LOCATORS
+        elif any(token in description for token in ("save", "update", "create", "add")) \
+                or any(token in locator_value for token in ("save", "update", "create", "add")):
+            candidates = [
+                Locator(LocatorStrategy.CSS, "button[type='submit']"),
+                Locator(LocatorStrategy.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'save') or contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'submit') or contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'update')]"),
+                Locator(LocatorStrategy.CSS, "button.save-btn, button.btn-primary"),
+            ]
+        elif "refresh" in description or "refresh" in locator_value:
+            candidates = [
+                Locator(LocatorStrategy.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'refresh')]"),
+                Locator(LocatorStrategy.CSS, "button[title*='Refresh' i], .refresh-btn, [aria-label*='Refresh' i]"),
+            ]
+        elif any(token in description for token in ("table", "list", "grid")) \
+                or any(token in locator_value for token in ("table", "list", "grid")):
+            candidates = [
+                Locator(LocatorStrategy.CSS, "table"),
+                Locator(LocatorStrategy.CSS, "tbody tr"),
+                Locator(LocatorStrategy.CSS, "[role='table'], div[class*='table']"),
+            ]
+        elif "search" in description or "search" in locator_value:
+            candidates = [
+                Locator(LocatorStrategy.CSS, "input[type='search'], input[type='text'], input[placeholder*='Search' i]"),
+                Locator(LocatorStrategy.XPATH, "//input[contains(@placeholder,'Search') or contains(@placeholder,'search')]"),
+            ]
+        elif any(token in description for token in ("logout", "log out", "sign out")) \
+                or any(token in locator_value for token in ("logout", "log out", "sign out")):
+            candidates = [
+                Locator(LocatorStrategy.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'logout') or contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'log out') or contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'sign out')]"),
+                Locator(LocatorStrategy.PARTIAL_LINK_TEXT, "Log out"),
+                Locator(LocatorStrategy.PARTIAL_LINK_TEXT, "Logout"),
+            ]
+
+        return [locator for locator in candidates if locator != primary]
 
     def _next_id(self, prefix: str) -> str:
         """Generate the next test ID for a given prefix."""
@@ -272,6 +943,8 @@ Guidelines:
 
     def _login_steps(self, email: str = "", password: str = "") -> list[Action]:
         """Generate standard login action steps."""
+        if self._target_type in ("mobile", "desktop"):
+            return []
         email = email or self._email
         password = password or self._password
         return [
@@ -895,19 +1568,226 @@ Guidelines:
     def _gen_realtime(self, page: PageContext, cat: TestCategory) -> list[TestCase]:
         return []  # Real-time testing requires specialized infrastructure
 
+    def _instruction_to_native_actions(self, text: str) -> list[Action]:
+        """Convert a natural-language instruction into native Appium actions."""
+        quotes = re.findall(r'"([^"]*)"', text)
+        lower = text.lower().strip()
+        actions = []
+
+        is_verify = bool(re.search(r'\b(verify|assert|is visible|is displayed|are visible|remains?)\b', lower))
+        is_tap = bool(re.search(r'\b(tap|click|press|select)\b', lower)) and not is_verify
+        is_type = bool(re.search(r'\b(enter|type)\b', lower)) and not is_verify
+
+        if is_verify:
+            target = self._resolve_instruction_value(quotes[0]) if quotes else ""
+            if target:
+                if "which account" in target.lower() or "want to create" in target.lower():
+                    loc = Locator(
+                        LocatorStrategy.XPATH,
+                        "//*[contains(@content-desc, 'Which Account') or contains(@text, 'Which Account') or contains(@text, 'Want To Create') or contains(@content-desc, 'Want To Create')]"
+                    )
+                elif "what type" in target.lower() or "post you want to create" in target.lower():
+                    loc = Locator(
+                        LocatorStrategy.XPATH,
+                        "//*[contains(@content-desc, 'What Type') or contains(@text, 'What Type') or contains(@text, 'Post You Want') or contains(@content-desc, 'Post You Want')]"
+                    )
+                elif "search here" in target.lower():
+                    loc = Locator(
+                        LocatorStrategy.XPATH,
+                        "//android.widget.EditText[contains(@text, 'Search') or contains(@content-desc, 'Search') or @text='Search Here'] | //android.widget.EditText"
+                    )
+                elif "sign in" in target.lower() and "button" in lower:
+                    loc = Locator(LocatorStrategy.XPATH, "(//android.view.ViewGroup[@content-desc='Sign In'])[last()]")
+                elif "justpaid" in target.lower():
+                    loc = Locator(
+                        LocatorStrategy.XPATH,
+                        "//*[contains(@text, 'justpaid') or contains(@content-desc, 'justpaid') or contains(@text, 'ljustpaid') or contains(@text, 'Ijustpaid')]"
+                    )
+                elif target in ("Home", "Search", "Messages", "Profile") and ("tab" in lower or "nav" in lower or "bar" in lower):
+                    loc = Locator(
+                        LocatorStrategy.XPATH,
+                        f"//android.view.ViewGroup[@content-desc='{target}'] | //android.widget.TextView[@text='{target}']"
+                    )
+                else:
+                    loc = Locator(
+                        LocatorStrategy.XPATH,
+                        f"//*[@content-desc='{target}' or @text='{target}' or contains(@text, '{target}') or contains(@content-desc, '{target}')]"
+                    )
+                actions.append(Action(ActionType.VERIFY_VISIBLE, f"Verify {target} visible", locator=loc))
+            elif "email" in lower:
+                loc = Locator(LocatorStrategy.XPATH, "//android.widget.EditText[contains(@text, 'email') or contains(@content-desc, 'email')] | //android.widget.EditText[1]")
+                actions.append(Action(ActionType.VERIFY_VISIBLE, "Verify Email field visible", locator=loc))
+            elif "password" in lower:
+                loc = Locator(LocatorStrategy.XPATH, "//android.widget.EditText[@password='true'] | //android.widget.EditText[2]")
+                actions.append(Action(ActionType.VERIFY_VISIBLE, "Verify Password field visible", locator=loc))
+            elif "continue with" in lower:
+                loc = Locator(LocatorStrategy.XPATH, "//*[contains(@text, 'Continue With') or contains(@content-desc, 'Continue With')]")
+                actions.append(Action(ActionType.VERIFY_VISIBLE, "Verify Continue With visible", locator=loc))
+            elif "remain" in lower and "sign in" in lower:
+                loc = Locator(LocatorStrategy.XPATH, "(//android.view.ViewGroup[@content-desc='Sign In'])[1]")
+                actions.append(Action(ActionType.VERIFY_VISIBLE, "Verify Sign In tab visible", locator=loc))
+            else:
+                actions.append(Action(ActionType.SLEEP, f"Verify condition: {text}", value="2"))
+
+        elif is_tap:
+            target = self._resolve_instruction_value(quotes[0]) if quotes else ""
+            if "back" in lower or "dismiss" in lower:
+                actions.append(Action(ActionType.PRESS_KEY, "Press Back", value="BACK"))
+            elif "+" in lower or "+" in quotes or "create button" in lower:
+                loc = Locator(
+                    LocatorStrategy.XPATH,
+                    "//android.view.ViewGroup[contains(@bounds, '1392') and @clickable='true']"
+                )
+                actions.append(Action(ActionType.CLICK, "Tap Center + Button", locator=loc))
+            elif target in ("Home", "Search", "Messages", "Profile"):
+                loc = Locator(
+                    LocatorStrategy.XPATH,
+                    f"//android.view.ViewGroup[@content-desc='{target}'] | //android.widget.TextView[@text='{target}']"
+                )
+                actions.append(Action(ActionType.CLICK, f"Tap {target}", locator=loc))
+            elif target:
+                if "sign in" in target.lower():
+                    if "button" in lower:
+                        loc = Locator(LocatorStrategy.XPATH, "(//android.view.ViewGroup[@content-desc='Sign In'])[last()]")
+                    else:
+                        loc = Locator(LocatorStrategy.XPATH, "(//android.view.ViewGroup[@content-desc='Sign In'])[1]")
+                else:
+                    loc = Locator(
+                        LocatorStrategy.XPATH,
+                        f"//*[@content-desc='{target}' or @text='{target}' or contains(@text, '{target}') or contains(@content-desc, '{target}')]"
+                    )
+                actions.append(Action(ActionType.CLICK, f"Tap {target}", locator=loc))
+            else:
+                if "sign in" in lower:
+                    if "button" in lower:
+                        loc = Locator(LocatorStrategy.XPATH, "(//android.view.ViewGroup[@content-desc='Sign In'])[last()]")
+                    else:
+                        loc = Locator(LocatorStrategy.XPATH, "(//android.view.ViewGroup[@content-desc='Sign In'])[1]")
+                    actions.append(Action(ActionType.CLICK, "Tap Sign In", locator=loc))
+                elif "sign up" in lower:
+                    loc = Locator(LocatorStrategy.XPATH, "//*[@content-desc='Sign Up' or @text='Sign Up']")
+                    actions.append(Action(ActionType.CLICK, "Tap Sign Up", locator=loc))
+                elif "remember" in lower:
+                    loc = Locator(LocatorStrategy.XPATH, "//*[@content-desc='Remember Me' or @text='Remember Me']")
+                    actions.append(Action(ActionType.CLICK, "Tap Remember Me", locator=loc))
+                elif "visibility" in lower or "toggle" in lower:
+                    loc = Locator(LocatorStrategy.XPATH, "//android.widget.EditText[@password='true']/..//com.horcrux.svg.SvgView | //*[@content-desc='eye' or contains(@content-desc, 'password')]")
+                    actions.append(Action(ActionType.CLICK, "Toggle Password Visibility", locator=loc))
+                else:
+                    actions.append(Action(ActionType.SLEEP, f"Process: {text}", value="2"))
+
+        elif is_type:
+            val = self._resolve_instruction_value(quotes[0]) if quotes else ""
+            if "email" in lower:
+                loc = Locator(
+                    LocatorStrategy.XPATH,
+                    "//android.widget.EditText[contains(@text, 'email') or contains(@content-desc, 'email')] | //android.widget.EditText[1]"
+                )
+                actions.append(Action(ActionType.CLEAR, "Clear email field", locator=loc))
+                actions.append(Action(ActionType.TYPE, f"Enter email: {val}", locator=loc, value=val))
+            elif "password" in lower:
+                loc = Locator(
+                    LocatorStrategy.XPATH,
+                    "//android.widget.EditText[@password='true'] | //android.widget.EditText[2]"
+                )
+                actions.append(Action(ActionType.CLEAR, "Clear password field", locator=loc))
+                actions.append(Action(ActionType.TYPE, "Enter password", locator=loc, value=val))
+            else:
+                loc = Locator(LocatorStrategy.XPATH, "//android.widget.EditText")
+                actions.append(Action(ActionType.TYPE, f"Enter text: {val}", locator=loc, value=val))
+
+        else:
+            actions.append(Action(ActionType.SLEEP, f"Execute: {text}", value="2"))
+
+        return actions
+
+    def _resolve_instruction_value(self, value: str) -> str:
+        """Resolve credential placeholders without storing secrets in suite files."""
+        return {
+            "${VALID_USER_EMAIL}": self._email,
+            "${VALID_USER_PASSWORD}": self._password,
+        }.get(value, value)
+
+    def _instruction_to_desktop_actions(self, text: str) -> list[Action]:
+        """Convert instructions to platform-neutral native desktop actions."""
+        quotes = re.findall(r'"([^"]*)"', text)
+        lower = text.lower().strip()
+        target = self._resolve_instruction_value(quotes[0]) if quotes else ""
+
+        if re.search(r'\b(verify|assert|is visible|is displayed|are visible)\b', lower):
+            if target:
+                return [Action(
+                    ActionType.VERIFY_VISIBLE,
+                    f"Verify {target} visible",
+                    locator=Locator(LocatorStrategy.ACCESSIBILITY_ID, target),
+                    fallback_locators=[
+                        Locator(LocatorStrategy.NAME, target),
+                        Locator(LocatorStrategy.XPATH, f"//*[@name='{target}' or @label='{target}' or @title='{target}']"),
+                    ],
+                )]
+            return [Action(ActionType.SLEEP, f"Verify condition: {text}", value="2")]
+
+        if re.search(r'\b(tap|click|press|select)\b', lower):
+            if "back" in lower or "dismiss" in lower:
+                return [Action(ActionType.PRESS_KEY, "Dismiss dialog", value="ESCAPE")]
+            if target:
+                return [Action(
+                    ActionType.CLICK,
+                    f"Click {target}",
+                    locator=Locator(LocatorStrategy.ACCESSIBILITY_ID, target),
+                    fallback_locators=[
+                        Locator(LocatorStrategy.NAME, target),
+                        Locator(LocatorStrategy.XPATH, f"//*[@name='{target}' or @label='{target}' or @title='{target}']"),
+                    ],
+                )]
+
+        if re.search(r'\b(enter|type)\b', lower):
+            value = target
+            field_name = "Password" if "password" in lower else "Email" if "email" in lower else "Text Field"
+            locator = Locator(LocatorStrategy.ACCESSIBILITY_ID, field_name)
+            fallbacks = [
+                Locator(LocatorStrategy.NAME, field_name),
+                Locator(LocatorStrategy.XPATH, f"//*[@name='{field_name}' or @label='{field_name}']"),
+            ]
+            return [
+                Action(ActionType.CLEAR, f"Clear {field_name}", locator=locator, fallback_locators=fallbacks),
+                Action(ActionType.TYPE, f"Enter {field_name}", locator=locator, fallback_locators=fallbacks, value=value),
+            ]
+
+        return [Action(ActionType.SLEEP, f"Execute: {text}", value="2")]
+
     def _gen_from_instructions(self, page: PageContext, cat: TestCategory) -> list[TestCase]:
-        """Fallback: generate basic page load test from category instructions."""
+        """Fallback: generate test cases directly from category instructions."""
         page_key = page.page_name.upper().replace(" ", "-")
         prefix = f"{page_key}-{cat.category_id.replace('.', '-')}"
-        
+        cases = []
+
+        if self._target_type in {"mobile", "desktop"}:
+            for instr in cat.instructions:
+                steps = (
+                    self._instruction_to_native_actions(instr.instruction)
+                    if self._target_type == "mobile"
+                    else self._instruction_to_desktop_actions(instr.instruction)
+                )
+                cases.append(TestCase(
+                    test_id=self._next_id(prefix),
+                    page=page.page_name,
+                    functionality=cat.category_name,
+                    scenario=instr.instruction,
+                    steps=steps,
+                    expected_result=f"Verified: {instr.instruction}",
+                    priority="P2",
+                    test_type=self._target_type,
+                    tags=["generated", cat.category_name.lower().replace(" ", "_")],
+                ))
+            return cases
+
         url_path = page.url_pattern.replace("${BASE_URL}", "").strip()
         if not url_path:
             url_path = f"/{page.page_name.lower().replace(' ', '-')}"
 
-        cases = []
-
         for instr in cat.instructions:
-            cases.append(TestCase(
+            cases.append(self._sanitize_test_case(TestCase(
                 test_id=self._next_id(prefix),
                 page=page.page_name,
                 functionality=cat.category_name,
@@ -915,10 +1795,47 @@ Guidelines:
                 steps=self._valid_login_steps() + [
                     Action(ActionType.NAVIGATE, f"Navigate to {page.page_name}", value=f"{self._base_url}{url_path}"),
                     Action(ActionType.SLEEP, "Wait for page", value="3"),
+                    Action(ActionType.VERIFY_URL_CONTAINS, f"Verify on {page.page_name}", value=url_path),
                 ],
                 expected_result=f"Verified: {instr.instruction}",
                 priority="P2",
+                test_type="web",
                 tags=["generated", cat.category_name.lower().replace(" ", "_")],
-            ))
+            )))
 
         return cases
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="AI Test Case Generator")
+    parser.add_argument("--suite", default="testsuites/trackpilot.testsuite.md", help="Path to test suite markdown file")
+    parser.add_argument("--base-url", default="", help="Application base URL")
+    parser.add_argument("--target", default="web", choices=["web", "mobile", "desktop"], help="Target platform type")
+    parser.add_argument("--appium-platform", default="", help="Appium platform (android, ios, macos, windows)")
+    parser.add_argument("--regenerate", action="store_true", help="Force regenerate tests without cache")
+    args = parser.parse_args()
+
+    if args.regenerate:
+        os.environ["REGENERATE_TESTS"] = "1"
+
+    suite_path = Path(args.suite)
+    if not suite_path.exists():
+        print(f"Suite file not found: {suite_path}")
+        sys.exit(1)
+
+    from automation.ai.suite_parser import SuiteParser
+
+    suite_parser = SuiteParser()
+    ctx = suite_parser.parse(suite_path)
+    total_categories = sum(len(p.categories) for p in ctx.pages)
+    print(f"Parsed {suite_path}: {len(ctx.pages)} pages, {total_categories} categories")
+
+    generator = TestGenerator(
+        base_url=args.base_url,
+        target_type=args.target,
+        appium_platform=args.appium_platform,
+    )
+    tests = generator.generate(ctx)
+    print(f"Generated {len(tests)} test cases successfully.")
