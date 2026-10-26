@@ -2,28 +2,17 @@
 .env
 *.pyc
 __pycache__/
-*.pyo
 .venv/
 venv/
-env/
+.pytest_cache/
 
-# Artifacts (generated at runtime)
-artifacts/robot/
-artifacts/screenshots/
-artifacts/logs/
+# Artifacts (generated at runtime; contain screenshots and cloned repos)
 artifacts/runs/
+artifacts/repos/
+artifacts/cache/
 
-# IDE
+# IDE / OS
 .idea/
 .vscode/
 *.swp
-*.swo
-*~
-
-# OS
 .DS_Store
-Thumbs.db
-
-# Docker volumes
-prometheus_data/
-grafana_data/

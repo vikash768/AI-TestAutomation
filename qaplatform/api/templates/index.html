@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Test an application</h1>
+<div class="card">
+<form method="post" action="/runs">
+<div class="grid">
+<div><label for="repo_url">Codebase URL (git) or local path</label><input type="text" id="repo_url" name="repo_url" required value="{{ defaults.repo_url }}" placeholder="https://github.com/org/frontend.git"></div>
+<div><label for="live_url">Live URL</label><input type="url" id="live_url" name="live_url" required value="{{ defaults.live_url }}" placeholder="https://app.example.com"></div>
+<div><label for="project">Project name</label><input type="text" id="project" name="project" value="{{ defaults.project }}"></div>
+<div><label for="branch">Branch (optional)</label><input type="text" id="branch" name="branch" placeholder="main"></div>
+<div><label for="email">Test account email</label><input type="email" id="email" name="email" value="{{ defaults.email }}"></div>
+<div><label for="password">Test account password</label><input type="password" id="password" name="password"></div>
+<div><label for="github_token">Git token for private repos (optional)</label><input type="password" id="github_token" name="github_token"></div>
+<div><label for="max_pages">Max pages to explore</label><input type="number" id="max_pages" name="max_pages" value="60" min="1" max="500"></div>
+</div>
+<label><input type="checkbox" name="llm_intent" value="true" checked> Summarise page intent with the LLM (source code only; credentials never leave this machine)</label>
+<label><input type="checkbox" name="phase2" value="true" checked> Interaction tests: open menus, drawers and tabs; forms, validation, persistence, timers, failure handling</label>
+<button type="submit">Start run</button>
+<p><small>Every write the browser tries to make (POST, PUT, PATCH, DELETE) is intercepted and never reaches the server; only sign-in, token refresh and the logout test go through. Destructive actions only have their confirmation opened and cancelled. Credentials are encrypted at rest and wiped when the run finishes.</small></p>
+</form>
+</div>
+
+<h2>Recent runs</h2>
+<div class="card">
+<table>
+<thead><tr><th>Run</th><th>Project</th><th>Live URL</th><th>Status</th><th>Stage</th><th>Result</th><th>Created</th></tr></thead>
+<tbody>
+{% for r in runs %}
+<tr><td><a href="/runs/{{ r.id }}">{{ r.id }}</a></td><td>{{ r.project }}</td><td>{{ r.live_url }}</td><td><span class="pill {{ r.status }}">{{ r.status }}</span></td><td>{{ r.stage }} {{ r.progress }}%</td><td>{{ r.message }}</td><td><small>{{ r.created_at.strftime('%Y-%m-%d %H:%M') if r.created_at else '' }}</small></td></tr>
+{% else %}
+<tr><td colspan="7">No runs yet.</td></tr>
+{% endfor %}
+</tbody></table>
+</div>
+{% endblock %}

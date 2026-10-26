@@ -1,0 +1,23 @@
+apiVersion: 1
+datasources:
+  - name: QA Postgres
+    uid: qa-postgres
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: postgres:5432
+    user: $QA_PG_USER
+    jsonData:
+      database: $QA_PG_DB
+      sslmode: disable
+      postgresVersion: 1700
+      timescaledb: false
+    secureJsonData:
+      password: $QA_PG_PASSWORD
+    isDefault: true
+    editable: false
+  - name: Prometheus
+    uid: qa-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    editable: false

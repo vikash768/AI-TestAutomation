@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Run {{ run.id }}{% endblock %}
+{% block body %}
+<h1>Run {{ run.id }} <span class="pill {{ run.status }}" id="status">{{ run.status }}</span></h1>
+<div class="card">
+<p>{{ run.live_url }} · {{ run.repo_url }}{% if run.commit_sha %} @ {{ run.commit_sha[:10] }}{% endif %}{% if run.framework %} · {{ run.framework }}{% endif %}</p>
+<div class="bar"><i id="bar" style="width:{{ run.progress }}%"></i></div>
+<p id="message"><b id="stage">{{ run.stage }}</b> · {{ run.message }}</p>
+{% if run.error %}<pre>{{ run.error }}</pre>{% endif %}
+<p>
+{% if report_exists %}<a href="/runs/{{ run.id }}/report" target="_blank">Open HTML report</a> · {% endif %}
+<a href="{{ grafana_url }}/d/qa-findings/qa-findings?var-run={{ run.id }}" target="_blank" rel="noopener">Findings in Grafana</a> ·
+<a href="/api/runs/{{ run.id }}">JSON</a>
+</p>
+{% if run.stats %}
+<div class="grid">
+<div><b>{{ run.stats.get('code_interactive', 0) }}</b><br><small>components in code</small></div>
+<div><b>{{ run.stats.get('matched', 0) }}</b><br><small>found on the live app</small></div>
+<div><b>{{ '%.0f' % (run.stats.get('coverage_interaction', run.stats.get('coverage', 0)) * 100) }}%</b><br><small>code components found (at rest {{ '%.0f' % (run.stats.get('coverage', 0) * 100) }}%)</small></div>
+<div><b>{{ '%.0f' % (run.stats.get('tested_ratio', 0) * 100) }}%</b><br><small>of found components tested</small></div>
+<div><b>{{ run.stats.get('tests', 0) }}</b><br><small>tests</small></div>
+<div><b>{{ run.stats.get('findings_total', 0) }}</b><br><small>findings ({{ run.stats.get('findings_needs_review', 0) }} need review)</small></div>
+<div><b>{{ run.stats.get('duration_seconds', 0) }}s</b><br><small>duration</small></div>
+</div>
+{% endif %}
+</div>
+
+{% if findings %}
+<h2>Findings</h2>
+<div class="card"><table>
+<thead><tr><th>Severity</th><th>Status</th><th>Category</th><th>Route</th><th>Finding</th><th>Standard</th><th>Confidence</th><th>Review</th></tr></thead>
+<tbody>
+{% for f in findings %}
+<tr><td><span class="pill {{ f.severity }}">{{ f.severity }}</span></td><td>{{ f.status }}</td><td>{{ f.category }}</td><td>{{ f.route }}{% if f.viewport %} <small>@{{ f.viewport }}</small>{% endif %}</td>
+<td><b>{{ f.title }}</b><br><small>Expected: {{ f.expected }}<br>Observed: {{ f.observed }}</small></td><td><small>{{ f.standard_ref }}</small></td><td>{{ '%.2f' % f.confidence }} ({{ f.reproduced_n }}/{{ f.reproduced_m }})</td>
+<td><form method="post" action="/api/findings/{{ f.id }}/label" style="display:flex;gap:4px"><button name="verdict" value="true_positive" style="margin:0;padding:4px 8px;background:var(--ok)">real</button><button name="verdict" value="false_positive" style="margin:0;padding:4px 8px;background:var(--crit)">not a bug</button></form></td></tr>
+{% endfor %}
+</tbody></table></div>
+{% endif %}
+
+<h2>Log</h2>
+<div class="card"><pre id="log">{% for e in events %}{{ e.ts.strftime('%H:%M:%S') }} [{{ e.stage }}] {{ e.message }}
+{% endfor %}</pre></div>
+<script>
+(function(){
+  const status = "{{ run.status }}";
+  if (status === "completed" || status === "failed") return;
+  async function tick(){
+    try {
+      const r = await fetch("/api/runs/{{ run.id }}"); const j = await r.json();
+      document.getElementById("bar").style.width = j.progress + "%";
+      document.getElementById("stage").textContent = j.stage;
+      document.getElementById("message").innerHTML = "<b>" + j.stage + "</b> · " + (j.message || "");
+      const ev = await fetch("/api/runs/{{ run.id }}/events"); const events = await ev.json();
+      document.getElementById("log").textContent = events.map(e => e.ts.slice(11,19) + " [" + e.stage + "] " + e.message).join("\n");
+      if (j.status === "completed" || j.status === "failed") { location.reload(); return; }
+    } catch (e) {}
+    setTimeout(tick, 4000);
+  }
+  setTimeout(tick, 4000);
+})();
+</script>
+{% endblock %}

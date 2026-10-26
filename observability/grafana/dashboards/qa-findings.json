@@ -1,0 +1,573 @@
+{
+ "uid": "qa-findings",
+ "title": "QA Findings",
+ "tags": [
+  "qa"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "version": 1,
+ "refresh": "",
+ "time": {
+  "from": "now-30d",
+  "to": "now"
+ },
+ "templating": {
+  "list": [
+   {
+    "name": "run",
+    "label": "Run",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "qa-postgres"
+    },
+    "query": "SELECT id AS __value, id || ' \u00b7 ' || project || ' \u00b7 ' || to_char(created_at, 'YYYY-MM-DD HH24:MI') AS __text FROM runs WHERE status = 'completed' ORDER BY created_at DESC",
+    "refresh": 2,
+    "multi": false,
+    "includeAll": false,
+    "sort": 0,
+    "definition": "SELECT id AS __value, id || ' \u00b7 ' || project || ' \u00b7 ' || to_char(created_at, 'YYYY-MM-DD HH24:MI') AS __text FROM runs WHERE status = 'completed' ORDER BY created_at DESC"
+   },
+   {
+    "name": "severity",
+    "label": "Severity",
+    "type": "custom",
+    "query": "critical,high,medium,low,info",
+    "multi": true,
+    "includeAll": true,
+    "options": [
+     {
+      "text": "All",
+      "value": "$__all",
+      "selected": true
+     },
+     {
+      "text": "critical",
+      "value": "critical",
+      "selected": false
+     },
+     {
+      "text": "high",
+      "value": "high",
+      "selected": false
+     },
+     {
+      "text": "medium",
+      "value": "medium",
+      "selected": false
+     },
+     {
+      "text": "low",
+      "value": "low",
+      "selected": false
+     },
+     {
+      "text": "info",
+      "value": "info",
+      "selected": false
+     }
+    ],
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    }
+   },
+   {
+    "name": "category",
+    "label": "Category",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "qa-postgres"
+    },
+    "query": "SELECT DISTINCT category FROM findings ORDER BY 1",
+    "definition": "SELECT DISTINCT category FROM findings ORDER BY 1",
+    "refresh": 2,
+    "multi": true,
+    "includeAll": true,
+    "allValue": null,
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    },
+    "sort": 1
+   },
+   {
+    "name": "status",
+    "label": "Status",
+    "type": "custom",
+    "query": "reported,needs_review,confirmed,rejected",
+    "multi": true,
+    "includeAll": true,
+    "options": [
+     {
+      "text": "All",
+      "value": "$__all",
+      "selected": true
+     },
+     {
+      "text": "reported",
+      "value": "reported",
+      "selected": false
+     },
+     {
+      "text": "needs_review",
+      "value": "needs_review",
+      "selected": false
+     },
+     {
+      "text": "confirmed",
+      "value": "confirmed",
+      "selected": false
+     },
+     {
+      "text": "rejected",
+      "value": "rejected",
+      "selected": false
+     }
+    ],
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    }
+   },
+   {
+    "name": "api_url",
+    "label": "API URL (for evidence links)",
+    "type": "textbox",
+    "query": "http://localhost:8000",
+    "current": {
+     "text": "http://localhost:8000",
+     "value": "http://localhost:8000"
+    },
+    "options": [
+     {
+      "text": "http://localhost:8000",
+      "value": "http://localhost:8000",
+      "selected": true
+     }
+    ]
+   }
+  ]
+ },
+ "panels": [
+  {
+   "id": 1,
+   "title": "Findings by severity (reported + confirmed)",
+   "type": "bargauge",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "rawSql": "SELECT severity, count(*) AS findings FROM findings WHERE run_id = '${run}' AND status IN ('reported','confirmed') GROUP BY severity ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END",
+     "refId": "A",
+     "editorMode": "code"
+    }
+   ],
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 8,
+    "h": 6
+   },
+   "options": {
+    "orientation": "horizontal",
+    "displayMode": "gradient",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": true
+    }
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "critical"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "dark-red"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "high"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "orange"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "medium"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "yellow"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "low"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "blue"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "info"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "green"
+        }
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": 2,
+   "title": "Findings by category",
+   "type": "piechart",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "rawSql": "SELECT category, count(*) AS findings FROM findings WHERE run_id = '${run}' AND status IN ('reported','confirmed') GROUP BY category",
+     "refId": "A",
+     "editorMode": "code"
+    }
+   ],
+   "gridPos": {
+    "x": 8,
+    "y": 0,
+    "w": 8,
+    "h": 6
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": true
+    },
+    "legend": {
+     "displayMode": "list",
+     "placement": "right"
+    }
+   }
+  },
+  {
+   "id": 3,
+   "title": "Run summary",
+   "type": "stat",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "rawSql": "SELECT coalesce((stats->>'coverage_interaction')::float, (stats->>'coverage')::float) * 100 AS \"components found %\", (stats->>'tested_ratio')::float * 100 AS \"tested %\", (stats->>'findings_total')::int AS findings, (stats->>'findings_needs_review')::int AS \"needs review\", (stats->>'tests')::int AS tests, (stats->>'pages')::int AS pages FROM runs WHERE id = '${run}'",
+     "refId": "A",
+     "editorMode": "code"
+    }
+   ],
+   "gridPos": {
+    "x": 16,
+    "y": 0,
+    "w": 8,
+    "h": 6
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "none"
+   }
+  },
+  {
+   "id": 4,
+   "title": "Findings",
+   "type": "table",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "rawSql": "SELECT\n  severity, status, category, route, viewport, title, expected, observed, standard_ref AS standard,\n  round(confidence::numeric, 2) AS confidence, reproduced_n || '/' || reproduced_m AS reproduced,\n  regexp_replace((SELECT e->>'path' FROM jsonb_array_elements(evidence::jsonb) e WHERE e->>'type' = 'screenshot' LIMIT 1), '^.*artifacts/', '${api_url}/artifacts/') AS evidence_url,\n  description, id\nFROM findings\nWHERE run_id = '${run}' AND severity IN (${severity:sqlstring}) AND category IN (${category:sqlstring}) AND status IN (${status:sqlstring})\nORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, route",
+     "refId": "A",
+     "editorMode": "code"
+    }
+   ],
+   "gridPos": {
+    "x": 0,
+    "y": 6,
+    "w": 24,
+    "h": 18
+   },
+   "options": {
+    "cellHeight": "sm",
+    "showHeader": true,
+    "sortBy": []
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true,
+      "wrapText": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "evidence_url"
+      },
+      "properties": [
+       {
+        "id": "links",
+        "value": [
+         {
+          "title": "Open evidence",
+          "url": "${__data.fields.evidence_url}",
+          "targetBlank": true
+         }
+        ]
+       },
+       {
+        "id": "custom.width",
+        "value": 120
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "severity"
+      },
+      "properties": [
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "critical": {
+            "color": "dark-red",
+            "index": 0
+           },
+           "high": {
+            "color": "orange",
+            "index": 1
+           },
+           "medium": {
+            "color": "yellow",
+            "index": 2
+           },
+           "low": {
+            "color": "blue",
+            "index": 3
+           },
+           "info": {
+            "color": "green",
+            "index": 4
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "custom.width",
+        "value": 90
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "description"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 260
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "id"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 50
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": 5,
+   "title": "Findings per route",
+   "type": "barchart",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "rawSql": "SELECT route, count(*) FILTER (WHERE severity IN ('critical','high')) AS \"critical+high\", count(*) FILTER (WHERE severity = 'medium') AS medium, count(*) FILTER (WHERE severity IN ('low','info')) AS \"low+info\" FROM findings WHERE run_id = '${run}' AND status IN ('reported','confirmed') GROUP BY route ORDER BY 2 DESC, 3 DESC LIMIT 25",
+     "refId": "A",
+     "editorMode": "code"
+    }
+   ],
+   "gridPos": {
+    "x": 0,
+    "y": 24,
+    "w": 24,
+    "h": 9
+   },
+   "options": {
+    "orientation": "horizontal",
+    "stacking": "normal",
+    "xField": "route",
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    }
+   }
+  },
+  {
+   "id": 6,
+   "title": "Tests by technique",
+   "type": "table",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 33,
+    "w": 24,
+    "h": 10
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "refId": "A",
+     "rawSql": "SELECT technique, count(*) FILTER (WHERE status='pass') AS pass, count(*) FILTER (WHERE status='fail') AS fail, count(*) FILTER (WHERE status='flaky') AS flaky, count(*) FILTER (WHERE status='blocked') AS blocked, count(*) AS total FROM tests WHERE run_id = '${run}' GROUP BY technique ORDER BY total DESC"
+    }
+   ],
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true
+     }
+    },
+    "overrides": []
+   }
+  }
+ ]
+}

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}AI-TestAutomation{% endblock %}</title>
+<style>
+:root{--bg:#f5f7f5;--surface:#fff;--fg:#1b2220;--muted:#5a6663;--line:#d3dad6;--accent:#0f7a69;--crit:#b3362c;--warn:#a86a12;--ok:#2e7a4d}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{background:#17133f;color:#fff;padding:14px 24px;display:flex;gap:18px;align-items:center}
+header a{color:#d9d5f2;text-decoration:none;font-weight:600}
+main{max-width:1100px;margin:0 auto;padding:24px 16px}
+h1{font-size:24px;margin:0 0 12px}h2{font-size:18px;margin:24px 0 8px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:16px 18px;margin-bottom:16px}
+label{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-top:10px}
+input[type=text],input[type=url],input[type=email],input[type=password],input[type=number]{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--line);border-radius:6px;font-size:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+button{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:10px 16px;font-weight:700;cursor:pointer;margin-top:14px}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-top:1px solid var(--line);padding:7px 8px;text-align:left;vertical-align:top}th{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600}
+.queued,.claimed{background:#eee}.running{background:#e8f0ee;color:var(--accent)}.completed{background:#dff0e4;color:var(--ok)}.failed{background:#f9e4e1;color:var(--crit)}
+.critical{background:#f9e4e1;color:var(--crit)}.high{background:#fbeed5;color:var(--warn)}.medium{background:#e8f0ee;color:var(--accent)}.low,.info{background:#eee;color:var(--muted)}
+.bar{height:10px;background:#e3e8e5;border-radius:999px;overflow:hidden}.bar i{display:block;height:100%;background:var(--accent)}
+pre{font-size:12px;white-space:pre-wrap;background:#f0f3f1;padding:10px;border-radius:6px;max-height:320px;overflow:auto}
+small{color:var(--muted)}
+</style>
+</head>
+<body>
+<header><a href="/">AI-TestAutomation</a><a href="{{ grafana_url }}" target="_blank" rel="noopener">Grafana</a><a href="/metrics">Metrics</a></header>
+<main>{% block body %}{% endblock %}</main>
+</body>
+</html>
