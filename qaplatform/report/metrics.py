@@ -19,6 +19,9 @@ class RunCollector:
         coverage_u = GaugeMetricFamily("qa_latest_coverage_unconditional_ratio", "Coverage counting only always-rendered components", labels=["project"])
         coverage_i = GaugeMetricFamily("qa_latest_coverage_interaction_ratio", "Code components found after opening menus, drawers and tabs", labels=["project"])
         tested = GaugeMetricFamily("qa_latest_tested_ratio", "Share of found components that a test exercised", labels=["project"])
+        cat_tests = GaugeMetricFamily("qa_latest_category_tests", "Tests in the latest run by checklist category and status", labels=["project", "category", "status"])
+        cat_findings = GaugeMetricFamily("qa_latest_category_findings", "Findings in the latest run by checklist category", labels=["project", "category"])
+        cat_ran = GaugeMetricFamily("qa_latest_category_ran", "1 if the checklist category ran in the latest run", labels=["project", "category"])
         findings = GaugeMetricFamily("qa_latest_findings", "Findings in the latest completed run", labels=["project", "severity", "status"])
         comps = GaugeMetricFamily("qa_latest_components", "Components in the latest completed run by status", labels=["project", "status"])
         duration = GaugeMetricFamily("qa_latest_run_duration_seconds", "Duration of the latest completed run", labels=["project"])
@@ -40,6 +43,11 @@ class RunCollector:
                     coverage_u.add_metric([project], float(stats.get("coverage_unconditional", 0.0)))
                     coverage_i.add_metric([project], float(stats.get("coverage_interaction", stats.get("coverage", 0.0))))
                     tested.add_metric([project], float(stats.get("tested_ratio", 0.0)))
+                    for cat, d in (stats.get("categories") or {}).items():
+                        cat_ran.add_metric([project, cat], 1.0 if d.get("ran") else 0.0)
+                        cat_findings.add_metric([project, cat], float(d.get("findings", 0)))
+                        for st in ("pass", "fail", "blocked"):
+                            cat_tests.add_metric([project, cat, st], float(d.get(st, 0)))
                     if run.started_at and run.finished_at:
                         duration.add_metric([project], (run.finished_at - run.started_at).total_seconds())
                     if run.finished_at:
@@ -60,6 +68,9 @@ class RunCollector:
         yield coverage_u
         yield coverage_i
         yield tested
+        yield cat_tests
+        yield cat_findings
+        yield cat_ran
         yield findings
         yield comps
         yield duration

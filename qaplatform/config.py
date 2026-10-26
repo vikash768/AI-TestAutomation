@@ -51,6 +51,9 @@ class Settings:
     settle_ms: int = 1200
     worker_poll_seconds: float = 2.0
     secret_key: str = "change-me"
+    load_max_concurrency: int = 10
+    load_max_requests: int = 300
+    load_max_seconds: int = 25
     public_base_url: str = "http://localhost:8000"
     viewports: list[tuple[str, int, int]] = field(default_factory=lambda: list(DEFAULT_VIEWPORTS))
 
@@ -72,5 +75,8 @@ class Settings:
             settle_ms=_int("SETTLE_MS", 1200),
             worker_poll_seconds=float(os.environ.get("WORKER_POLL_SECONDS") or 2.0),
             secret_key=os.environ.get("QA_SECRET_KEY") or "change-me",
+            load_max_concurrency=min(_int("LOAD_MAX_CONCURRENCY", 10), 50),
+            load_max_requests=min(_int("LOAD_MAX_REQUESTS", 300), 2000),
+            load_max_seconds=min(_int("LOAD_MAX_SECONDS", 25), 120),
             public_base_url=(os.environ.get("PUBLIC_BASE_URL") or "http://localhost:8000").rstrip("/"),
         )

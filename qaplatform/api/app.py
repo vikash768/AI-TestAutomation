@@ -51,20 +51,20 @@ def metrics():
 def index(request: Request, db: Session = Depends(db_session)):
     runs = db.execute(select(Run).order_by(Run.created_at.desc()).limit(25)).scalars().all()
     return templates.TemplateResponse(request, "index.html", {"runs": runs, "grafana_url": GRAFANA_URL, "defaults": {
-        "repo_url": os.environ.get("TARGET_REPO_URL", ""), "live_url": os.environ.get("TARGET_LIVE_URL", os.environ.get("BASE_URL", "")),
-        "email": os.environ.get("VALID_USER_EMAIL", ""), "project": os.environ.get("PROJECT_NAME", "default")}})
+        "repo_url": os.environ.get("TARGET_REPO_URL", ""), "live_url": os.environ.get("TARGET_LIVE_URL", ""),
+        "email": os.environ.get("VALID_USER_EMAIL", ""), "project": os.environ.get("PROJECT_NAME", "")}})
 
 
 @app.post("/runs")
 def create_run(
     project: str = Form("default"), repo_url: str = Form(...), live_url: str = Form(...), email: str = Form(""), password: str = Form(""),
-    github_token: str = Form(""), max_pages: int = Form(60), llm_intent: bool = Form(False), phase2: bool = Form(False), branch: str = Form(""),
+    github_token: str = Form(""), max_pages: int = Form(60), llm_intent: bool = Form(False), phase2: bool = Form(False), load: bool = Form(False), unit: bool = Form(False), branch: str = Form(""),
     db: Session = Depends(db_session),
 ):
     if not repo_url.strip() or not live_url.strip():
         raise HTTPException(400, "repo_url and live_url are required")
     run = Run(project=project.strip() or "default", repo_url=repo_url.strip(), live_url=live_url.strip(), status="queued", stage="queued",
-              options={"max_pages": max_pages, "llm_intent": llm_intent, "phase2": phase2, "branch": branch.strip()},
+              options={"max_pages": max_pages, "llm_intent": llm_intent, "phase2": phase2, "load": load, "unit": unit, "branch": branch.strip()},
               secrets=encrypt_secrets(settings.secret_key, {"email": email, "password": password, "github_token": github_token}))
     db.add(run)
     db.commit()

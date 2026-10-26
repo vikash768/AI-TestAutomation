@@ -14,7 +14,9 @@
 <div><label for="max_pages">Max pages to explore</label><input type="number" id="max_pages" name="max_pages" value="60" min="1" max="500"></div>
 </div>
 <label><input type="checkbox" name="llm_intent" value="true" checked> Summarise page intent with the LLM (source code only; credentials never leave this machine)</label>
-<label><input type="checkbox" name="phase2" value="true" checked> Interaction tests: open menus, drawers and tabs; forms, validation, persistence, timers, failure handling</label>
+<label><input type="checkbox" name="phase2" value="true" checked> Interaction tests: menus, drawers, tabs, forms, validation, persistence, timers, failure handling</label>
+<label><input type="checkbox" name="unit" value="true"> Run the codebase's own unit tests (executes repo test command)</label>
+<label><input type="checkbox" name="load" value="true"> Bounded load probe (read-only, hard-capped; only for targets you are authorised to load-test)</label>
 <button type="submit">Start run</button>
 <p><small>Every write the browser tries to make (POST, PUT, PATCH, DELETE) is intercepted and never reaches the server; only sign-in, token refresh and the logout test go through. Destructive actions only have their confirmation opened and cancelled. Credentials are encrypted at rest and wiped when the run finishes.</small></p>
 </form>

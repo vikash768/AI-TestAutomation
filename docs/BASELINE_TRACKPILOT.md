@@ -89,3 +89,34 @@ Run `e7d652888739`, same commit and target, all seven Phase 2 modules, write gua
 2. Shared components were tested once per page (a date picker on eight pages, every calendar day): 19 minutes for reveal. Now tested once and marked "equivalent" elsewhere; reveal takes 7.5 minutes.
 3. A path pattern dropped a trailing `${memberId}` and called a correct endpoint "not found in code".
 4. The configured `GITHUB_TOKEN` cannot read the private repository; local runs only worked through the Mac's keychain. The clone error now says so.
+
+---
+
+# New targets and test categories, 2026-10-26
+
+## Defaults
+No target is baked in any more. A run's codebase, live URL, project and credentials are given per run (web form or CLI). `.env` carries only secrets and limits. Earlier, `BASE_URL` + `PROJECT_NAME=trackpilot` in `.env` prefilled the form and CLI, which is why TrackPilot ran by default.
+
+## Test categories (the checklist), shown in Grafana "QA Categories"
+Each test and finding maps to a checklist bucket: Functional (code-derived), UI & resize / accessibility, Security / penetration (non-destructive), Load / performance, Unit (codebase), Stability & UX. The dashboard shows, per bucket, whether it ran, pass/fail/blocked counts and findings.
+
+| Category | Module | Default | Notes |
+|---|---|---|---|
+| Security | `execute/security.py` | on | Read-only, OWASP WSTG-aligned: HTTPS/HSTS, CSP and other headers, cookie flags, CORS reflection, version disclosure, info leakage, and anonymous access to code-gated API reads. No active exploitation, no brute force. |
+| Load | `execute/load.py` | off (opt-in) | Bounded read-only concurrency probe, hard-capped (≤50 conc / ≤2000 req / ≤120 s), aborts on error spike. Never run against a target without authorisation; kept off for the live medical host. |
+| Unit | `execute/unit.py` | off (opt-in) | Runs the repo's own test command inside the isolated worker. Executes repository code (supply-chain risk), so it is opt-in and sandboxed; degrades to "blocked" when the toolchain or a required service is absent. |
+| UI / Functional / Stability | existing phase 1+2 modules | on | As before. |
+
+A target with only a URL (+ code) and no account now runs the public surface + security + unit and records the rest as "not run", instead of failing at login.
+
+## Life Sadx (second target)
+- Admin (frontend): `mangesh-gautam/Life_Sadx_Admin` — React + Vite, **tab-based SPA, no router**. Reachable in code via the `MdZaidZeya` collaborator account (already `GITHUB_TOKEN`); the separate fine-grained `GITHUB_TOKEN_LIFE_SADX` was not granted these repos.
+- Backend: `mangesh-gautam/Life_Sadx_BE` — Express 5 + PostgreSQL + JWT, real `npm test` suite. The live admin and API share the origin `https://lifesadx.pashupatashastra.in` + `/api`.
+- First run (no credentials, `f065551b3c9d`): Security 9 tests / 6 findings (missing CSP, HSTS, X-Content-Type-Options, X-Frame-Options, Referrer-Policy on the nginx-served admin; nginx version disclosed), UI 1 finding (horizontal overflow on `/` at 360 px), Unit blocked (admin is lint-only), Stability 3 passed. Functional/Load did not run.
+
+### What a full Life Sadx assessment still needs
+1. A live **admin account** (email + password) — without it the authenticated screens (users, results, firmware, dashboard) can't be exercised. The backend's dev seed login (in its `.env.example`) is development-only and not assumed to work on the live host.
+2. **Tab-SPA handling**: the admin has no routes, so route-based crawl/reconcile is thin; authenticated per-button/per-function coverage needs the tabs treated as navigation (Phase 3).
+3. **Wrapper-aware API extraction**: the admin calls the API through a `request(path, {method})` helper, so the parser currently extracts almost no concrete API paths; following the wrapper would restore the security-authz and functional-API oracles.
+4. **Backend as its own target**: run `Life_Sadx_BE` for unit tests (needs Node in the worker + a Postgres) and live API security/authz/load from its real routes — both require your explicit go-ahead because they execute repo code and probe a medical service.
+5. **Load / active security** against the live host stays off until you authorise it.

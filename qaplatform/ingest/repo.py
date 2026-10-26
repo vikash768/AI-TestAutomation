@@ -46,8 +46,13 @@ def fetch_repo(url_or_path: str, dest: Path, token: str | None = None, branch: s
     base_cmd = ["git", "clone", "--depth", "1"]
     if branch:
         base_cmd += ["--branch", branch]
-    # Public repositories clone anonymously; the token is only sent when that fails.
-    attempts = [url_or_path] + ([_with_token(url_or_path, token)] if token and url_or_path.startswith("https://") else [])
+    # Public repositories clone anonymously; tokens are only sent when that fails.
+    # Candidates: the run's token, GITHUB_TOKEN, then any GITHUB_TOKEN_* (one per target is common).
+    candidates: list[str] = []
+    for t in [token, os.environ.get("GITHUB_TOKEN")] + [v for k, v in sorted(os.environ.items()) if k.startswith("GITHUB_TOKEN_") and k != "GITHUB_TOKEN_PREVIOUS"]:
+        if t and t not in candidates:
+            candidates.append(t)
+    attempts = [url_or_path] + ([_with_token(url_or_path, t) for t in candidates] if url_or_path.startswith("https://") else [])
     last_err = ""
     for candidate in attempts:
         if dest.exists():

@@ -1,0 +1,353 @@
+{
+ "uid": "qa-categories",
+ "title": "QA Categories",
+ "tags": [
+  "qa"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "version": 1,
+ "refresh": "",
+ "time": {
+  "from": "now-30d",
+  "to": "now"
+ },
+ "templating": {
+  "list": [
+   {
+    "name": "run",
+    "label": "Run",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "qa-postgres"
+    },
+    "refresh": 2,
+    "multi": false,
+    "includeAll": false,
+    "sort": 0,
+    "query": "SELECT id AS __value, id || ' \u00b7 ' || project || ' \u00b7 ' || to_char(created_at,'YYYY-MM-DD HH24:MI') AS __text FROM runs WHERE status='completed' ORDER BY created_at DESC",
+    "definition": "SELECT id AS __value, id || ' \u00b7 ' || project || ' \u00b7 ' || to_char(created_at,'YYYY-MM-DD HH24:MI') AS __text FROM runs WHERE status='completed' ORDER BY created_at DESC"
+   }
+  ]
+ },
+ "panels": [
+  {
+   "id": 1,
+   "title": "Checklist coverage (did each test type run?)",
+   "type": "table",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "refId": "A",
+     "rawSql": "SELECT c.label AS \"test type\", CASE WHEN x.ran THEN 'yes' ELSE 'no' END AS ran, coalesce(x.tests,0) AS tests, coalesce(x.passed,0) AS passed, coalesce(x.failed,0) AS failed, coalesce(x.findings,0) AS findings FROM (VALUES ('functional','Functional (code-derived)'),('ui','UI & resize / accessibility'),('security','Security / penetration (non-destructive)'),('load','Load / performance'),('unit','Unit tests (codebase)'),('stability','Stability & UX')) AS c(key,label) LEFT JOIN (SELECT key AS category, (value->>'ran')::boolean AS ran, coalesce((value->>'tests')::int,0) AS tests, coalesce((value->>'pass')::int,0) AS passed, coalesce((value->>'fail')::int,0) AS failed, coalesce((value->>'blocked')::int,0) AS blocked, coalesce((value->>'findings')::int,0) AS findings FROM runs r, jsonb_each(coalesce(r.stats::jsonb->'categories','{}'::jsonb)) WHERE r.id = '${run}') x ON x.category=c.key ORDER BY c.label"
+    }
+   ],
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true,
+      "wrapText": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "ran"
+      },
+      "properties": [
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "yes": {
+            "color": "green",
+            "index": 0
+           },
+           "no": {
+            "color": "red",
+            "index": 1
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "failed"
+      },
+      "properties": [
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "transparent",
+           "value": null
+          },
+          {
+           "color": "red",
+           "value": 1
+          }
+         ]
+        }
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": 2,
+   "title": "Tests per category",
+   "type": "barchart",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 8,
+    "w": 14,
+    "h": 9
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "refId": "A",
+     "rawSql": "SELECT c.label AS category, coalesce(x.passed,0) AS passed, coalesce(x.failed,0) AS failed, coalesce(x.blocked,0) AS blocked FROM (VALUES ('functional','Functional (code-derived)'),('ui','UI & resize / accessibility'),('security','Security / penetration (non-destructive)'),('load','Load / performance'),('unit','Unit tests (codebase)'),('stability','Stability & UX')) AS c(key,label) LEFT JOIN (SELECT key AS category, (value->>'ran')::boolean AS ran, coalesce((value->>'tests')::int,0) AS tests, coalesce((value->>'pass')::int,0) AS passed, coalesce((value->>'fail')::int,0) AS failed, coalesce((value->>'blocked')::int,0) AS blocked, coalesce((value->>'findings')::int,0) AS findings FROM runs r, jsonb_each(coalesce(r.stats::jsonb->'categories','{}'::jsonb)) WHERE r.id = '${run}') x ON x.category=c.key ORDER BY c.label"
+    }
+   ],
+   "options": {
+    "orientation": "horizontal",
+    "stacking": "normal",
+    "xField": "category",
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    }
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "passed"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "green"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "failed"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "red"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "blocked"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "yellow"
+        }
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": 3,
+   "title": "Findings per category",
+   "type": "piechart",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "gridPos": {
+    "x": 14,
+    "y": 8,
+    "w": 10,
+    "h": 9
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "refId": "A",
+     "rawSql": "SELECT category, findings FROM (SELECT key AS category, (value->>'ran')::boolean AS ran, coalesce((value->>'tests')::int,0) AS tests, coalesce((value->>'pass')::int,0) AS passed, coalesce((value->>'fail')::int,0) AS failed, coalesce((value->>'blocked')::int,0) AS blocked, coalesce((value->>'findings')::int,0) AS findings FROM runs r, jsonb_each(coalesce(r.stats::jsonb->'categories','{}'::jsonb)) WHERE r.id = '${run}') x WHERE findings > 0"
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": true
+    },
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "values": [
+      "value"
+     ]
+    }
+   }
+  },
+  {
+   "id": 4,
+   "title": "Findings in this run (every category)",
+   "type": "table",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 17,
+    "w": 24,
+    "h": 12
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "refId": "A",
+     "rawSql": "SELECT category, severity, status, route, title, standard_ref AS standard, round(confidence::numeric,2) AS confidence FROM findings WHERE run_id='${run}' ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, category"
+    }
+   ],
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true,
+      "wrapText": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "severity"
+      },
+      "properties": [
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "critical": {
+            "color": "dark-red",
+            "index": 0
+           },
+           "high": {
+            "color": "orange",
+            "index": 1
+           },
+           "medium": {
+            "color": "yellow",
+            "index": 2
+           },
+           "low": {
+            "color": "blue",
+            "index": 3
+           }
+          }
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}

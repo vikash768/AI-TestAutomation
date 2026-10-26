@@ -86,7 +86,7 @@ def outcome(tmp_path_factory):
         protected = [r.path for r in inv.routes if r.protected]
         rec = reconcile(inv.elements, ex.pages, protected, ex.origin)
         components = build_components(rec, intents)
-        tests, findings, stats = execute_all(settings, ORIGIN, {"email": EMAIL, "password": PASSWORD}, run_dir, inv, ex, components, protected, {}, events, tag="bench")
+        tests, findings, stats = execute_all(settings, ORIGIN, {"email": EMAIL, "password": PASSWORD}, run_dir, inv, ex, components, protected, {"modules": ["reveal", "destructive", "forms", "auth", "state", "lifecycle", "faults"]}, events, tag="bench")
         yield {"tests": tests, "findings": findings, "stats": stats, "components": components, "server": server}
     finally:
         browser_mod.CONTEXT_HOOKS.remove(server.install)

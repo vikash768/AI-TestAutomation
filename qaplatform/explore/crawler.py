@@ -198,17 +198,21 @@ def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: s
                 ))
             except Exception as exc:
                 result.warnings.append(f"guard check {r.path}: {type(exc).__name__}: {str(exc)[:120]}")
-        # public pages, unauthenticated
-        for r in public_routes:
-            url = base + r.path
+        # public pages, unauthenticated — always include the live root (covers route-less / tab SPAs)
+        public_targets = list(dict.fromkeys([r.path for r in public_routes] + ["/"]))
+        for rp in public_targets:
+            url = base + rp
             try:
-                observed = _capture_page(page, url, r.path, settings, shots_dir, mon, protected=False)
+                observed = _capture_page(page, url, rp, settings, shots_dir, mon, protected=False)
                 result.pages.append(observed)
             except Exception as exc:
-                result.warnings.append(f"public page {r.path}: {type(exc).__name__}: {str(exc)[:120]}")
+                result.warnings.append(f"public page {rp}: {type(exc).__name__}: {str(exc)[:120]}")
         ctx.close()
 
-        # pass 2: login
+        # pass 2: login (only if credentials were supplied)
+        if not email:
+            result.warnings.append("no test account supplied — only the public surface, security and unit checks run")
+            return result
         events("explore", "Logging in with the test account", 30)
         ctx = session.new_context()
         result.login = login(ctx, base, email, password, settings, run_dir)

@@ -95,16 +95,53 @@ def coverage_after(components: list[ComponentRecord]) -> dict:
 
 
 PHASE2_MODULES = ("reveal", "destructive", "forms", "auth", "state", "lifecycle", "faults")
+# Checklist buckets the user asked Grafana to show, mapped from the fine-grained category of each test/finding.
+CHECKLIST = {
+    "functional": [("functional", None), ("navigation", None), ("persistence", None), ("lifecycle", None), ("validation", None)],
+    "ui": [("ui-responsive", None), ("accessibility", None)],
+    "security": [("security", None)],
+    "load": [("performance", "load"), ("performance", None)],
+    "unit": [("unit", None)],
+    "stability": [("stability", None), ("ux", None)],
+}
+CHECKLIST_LABEL = {"functional": "Functional (code-derived)", "ui": "UI & resize / accessibility", "security": "Security / penetration (non-destructive)",
+                   "load": "Load / performance", "unit": "Unit tests (codebase)", "stability": "Stability & UX"}
+
+
+def _category_of_bucket(cat: str, technique: str) -> str:
+    for bucket, rules in CHECKLIST.items():
+        for rc, rt in rules:
+            if cat == rc and (rt is None or rt == technique):
+                return bucket
+    return "stability"
+
+
+def finalize_categories(stats: dict, tests: list, findings: list) -> dict:
+    buckets: dict[str, dict] = {b: {"tests": 0, "pass": 0, "fail": 0, "blocked": 0, "findings": 0, "ran": False} for b in CHECKLIST}
+    for t in tests:
+        b = _category_of_bucket(t.category, t.technique)
+        d = buckets.setdefault(b, {"tests": 0, "pass": 0, "fail": 0, "blocked": 0, "findings": 0, "ran": False})
+        d["tests"] += 1
+        d["ran"] = True
+        d[t.status] = d.get(t.status, 0) + 1
+    for f in findings:
+        b = _category_of_bucket(f.category, "")
+        buckets.setdefault(b, {"tests": 0, "pass": 0, "fail": 0, "blocked": 0, "findings": 0, "ran": True})["findings"] += 1
+    stats["categories"] = buckets
+    return stats
 
 
 def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path, inv, ex, components: list[ComponentRecord], protected_routes: list[str],
-                options: dict, events, tag: str = "run") -> tuple[list, list, dict]:
+                options: dict, events, tag: str = "run", repo_path: "Path | None" = None) -> tuple[list, list, dict]:
     """Phase 1 checks and smoke clicks, then the Phase 2 modules. A module that fails is recorded, not fatal."""
     from qaplatform.execute.destructive import run_destructive
     from qaplatform.execute.faults import run_faults
     from qaplatform.execute.forms import FormTester, auth_tests
     from qaplatform.execute.lifecycle import run_lifecycle
     from qaplatform.execute.reveal import Revealer
+    from qaplatform.execute.security import detect_api_base, run_security
+    from qaplatform.execute.load import run_load
+    from qaplatform.execute.unit import run_unit
     from qaplatform.execute.smoke import TestRecord
     from qaplatform.execute.state import run_state
 
@@ -113,17 +150,49 @@ def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path,
     tests += t2
     findings += f2
     stats: dict = {"modules": {}}
-    events("execute", f"{len(tests)} page-level checks done; starting smoke clicks", 60)
+    api_base = detect_api_base(inv, live_url)
+    default_enabled = set(PHASE2_MODULES) | {"security"}
+    if options.get("load"):
+        default_enabled.add("load")
+    if options.get("unit"):
+        default_enabled.add("unit")
+    enabled = set(options.get("modules") or default_enabled) if options.get("phase2", True) else set()
+    if not options.get("phase2", True):
+        enabled = set()
+
+    def _run(name, fn):
+        if name not in enabled:
+            return
+        import time as _t
+        t0 = _t.time()
+        try:
+            out = fn()
+            mt, mf = out[0], out[1]
+            if len(out) > 2 and out[2]:
+                stats[name] = out[2]
+            tests.extend(mt)
+            findings.extend(mf)
+            stats["modules"][name] = {"tests": len(mt), "findings": len(mf), "seconds": round(_t.time() - t0, 1)}
+            events(name, f"{name}: {len(mt)} tests, {len(mf)} findings in {_t.time() - t0:.0f}s")
+        except Exception as exc:
+            logger.exception("module %s failed", name)
+            stats["modules"][name] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+            events(name, f"{name} module failed: {type(exc).__name__}: {str(exc)[:200]}", None, level="warn")
+            tests.append(TestRecord(test_key=f"module|{name}", name=f"{name} module", technique=name, category="platform", route="", expected="Module completes",
+                                    observed=f"{type(exc).__name__}: {str(exc)[:300]}", status="blocked"))
+
+    # Creds-independent: security assessment and the codebase's own unit tests run with or without a login.
+    _run("security", lambda: run_security(settings, live_url, inv, ex.pages, api_base, events))
+    if repo_path is not None:
+        _run("unit", lambda: run_unit(repo_path, tag, events, env={"DATABASE_URL": settings.database_url.replace("+psycopg", "").replace("@localhost", "@postgres")} if options.get("unit_db") else None))
+
+    events("execute", f"{len(tests)} checks done; starting smoke clicks", 60)
     if not (ex.storage_state_path or secrets.get("email")):
-        return tests, findings, stats
+        return tests, findings, finalize_categories(stats, tests, findings)
     runner = SmokeRunner(settings, live_url, ex.storage_state_path, run_dir, secrets, events)
     t3, f3 = runner.run(components, ex.pages, protected_routes)
     tests += t3
     findings += f3
-    if not options.get("phase2", True):
-        return tests, findings, stats
-
-    enabled = set(options.get("modules") or PHASE2_MODULES)
     code_by_key = {e.key: e for e in inv.elements}
     write_paths: dict[str, list[str]] = {}
     for c in components:
@@ -144,27 +213,11 @@ def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path,
         ("state", lambda: run_state(runner, ex.pages, components, protected_routes, storage_keys, events)),
         ("lifecycle", lambda: run_lifecycle(runner, inv, ex.pages, components, events)),
         ("faults", lambda: run_faults(runner, ex.pages, components, inv.elements, events)),
+        ("load", lambda: run_load(settings, live_url, ex.pages, api_base, None, events)),
     ]
     for name, fn in plan:
-        if name not in enabled:
-            continue
-        t_start = time.time()
-        try:
-            out = fn()
-            mt, mf = out[0], out[1]
-            if len(out) > 2:
-                stats[name] = out[2]
-            tests += mt
-            findings += mf
-            stats["modules"][name] = {"tests": len(mt), "findings": len(mf), "seconds": round(time.time() - t_start, 1)}
-            events(name, f"{name}: {len(mt)} tests, {len(mf)} findings in {time.time() - t_start:.0f}s")
-        except Exception as exc:
-            logger.exception("module %s failed", name)
-            stats["modules"][name] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
-            events(name, f"{name} module failed: {type(exc).__name__}: {str(exc)[:200]}", None, level="warn")
-            tests.append(TestRecord(test_key=f"module|{name}", name=f"{name} module", technique=name, category="platform", route="", expected="Module completes",
-                                    observed=f"{type(exc).__name__}: {str(exc)[:300]}", status="blocked"))
-    return tests, findings, stats
+        _run(name, fn)
+    return tests, findings, finalize_categories(stats, tests, findings)
 
 
 class RunContext:
@@ -232,8 +285,10 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
         ex = explore(settings_local, live_url, inv.routes, secrets.get("email", ""), secrets.get("password", ""), run_dir, ctx.event)
         for w in ex.warnings:
             ctx.event("explore", w, None, level="warn")
-        if ex.login is not None and not ex.login.success:
+        if secrets.get("email") and ex.login is not None and not ex.login.success:
             raise RuntimeError(f"Could not sign in to {live_url}: {ex.login.error}")
+        if not secrets.get("email"):
+            ctx.event("explore", "No test account given; running public surface, security and unit only (authenticated pages skipped)", None, level="warn")
         (run_dir / "explore.json").write_text(json.dumps({"pages": [p.to_dict() for p in ex.pages], "guards": [asdict(g) for g in ex.guards], "warnings": ex.warnings}, indent=1, default=str), encoding="utf-8")
         ctx.event("explore", f"Explored {len(ex.pages)} pages, {sum(len(p.elements) for p in ex.pages)} controls observed", 56)
 
@@ -245,7 +300,7 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
 
         # 4-5. execute + judge --------------------------------------------------
         try:
-            tests, findings, phase_stats = execute_all(settings, live_url, secrets, run_dir, inv, ex, components, protected_routes, options, ctx.event, tag=run_id)
+            tests, findings, phase_stats = execute_all(settings, live_url, secrets, run_dir, inv, ex, components, protected_routes, options, ctx.event, tag=run_id, repo_path=repo.path)
         finally:
             state_file = Path(ex.storage_state_path) if ex.storage_state_path else None
             if state_file and state_file.exists():
