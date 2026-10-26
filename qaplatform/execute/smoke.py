@@ -125,6 +125,13 @@ def _same_name(loc, expected: str) -> bool:
     return a == e or (len(e) >= 3 and (e in a or a in e))
 
 
+def _try_visible(loc) -> bool:
+    try:
+        return loc.count() > 0 and loc.is_visible()
+    except Exception:
+        return False
+
+
 def fingerprint(*parts: str) -> str:
     return hashlib.sha1("|".join(p or "" for p in parts).encode("utf-8")).hexdigest()[:20]
 
@@ -291,15 +298,15 @@ class SmokeRunner:
     def session(self, clock: bool = False):
         """A fresh signed-in context with the write guard installed. Optionally with a controllable clock."""
         with BrowserSession(self.settings) as bs:
-            ctx = bs.new_context()
+            # Reuse the one session saved by the explore stage so we don't log in per
+            # module — that would pile up logins and trip a login rate-limiter. Only if
+            # the saved session is missing or rejected do we sign in afresh.
+            have_state = bool(self.storage_state and Path(self.storage_state).exists())
+            ctx = bs.new_context(storage_state=self.storage_state if have_state else None)
             guard = NetworkGuard(ctx).install()
             self.ctx, self.guard = ctx, guard
-            ok = self._relogin(ctx) if self.secrets.get("email") else False
-            if not ok and self.storage_state and Path(self.storage_state).exists():
-                ctx.close()
-                ctx = bs.new_context(storage_state=self.storage_state)
-                guard = NetworkGuard(ctx).install()
-                self.ctx, self.guard = ctx, guard
+            if not have_state and self.secrets.get("email"):
+                self._relogin(ctx)
             if clock:
                 ctx.clock.install()
             self.page = ctx.new_page()
@@ -320,9 +327,14 @@ class SmokeRunner:
         self._dirty = True
 
     def _relogin(self, ctx) -> bool:
+        # Save the refreshed storage state so subsequent modules reuse it instead of
+        # logging in again (fewer logins = less chance of hitting a rate limit).
+        save = bool(self.storage_state)
         cm = self.guard.suspended() if self.guard else contextlib.nullcontext()
         with cm:
-            res = login(ctx, self.live_url, self.secrets.get("email", ""), self.secrets.get("password", ""), self.settings, self.run_dir, save_state=False)
+            res = login(ctx, self.live_url, self.secrets.get("email", ""), self.secrets.get("password", ""), self.settings, self.run_dir, save_state=save)
+        if res.success and save and res.storage_state_path:
+            self.storage_state = res.storage_state_path
         return res.success
 
     # -- helpers -----------------------------------------------------------
@@ -655,6 +667,31 @@ class SmokeRunner:
                 findings.extend(f)
         return tests, findings
 
+    def _open_profile_then_find_logout(self):
+        import re as _re
+        page = self.page
+        openers = []
+        with contextlib.suppress(Exception):
+            openers = page.evaluate("""() => { const out=[]; for (const el of document.querySelectorAll('button,[role=button],[aria-haspopup],img,[class*=avatar i],[class*=profile i],[class*=account i]')) { const r=el.getBoundingClientRect(); if(r.width>0&&r.height>0){ const t=(el.innerText||el.getAttribute('aria-label')||'').trim(); if(t.length<=24) out.push({sel:(el.id?('#'+CSS.escape(el.id)):''), text:t}); } } return out.slice(0,30); }""")
+        for o in openers:
+            cand = None
+            with contextlib.suppress(Exception):
+                if o.get("sel"):
+                    cand = page.locator(o["sel"]).first
+                elif o.get("text"):
+                    cand = page.get_by_role("button", name=o["text"], exact=True).first
+            if cand is None or cand.count() == 0:
+                continue
+            with contextlib.suppress(Exception):
+                cand.click(timeout=1500)
+                page.wait_for_timeout(500)
+                lo = page.get_by_role("button", name=_re.compile(r"log ?out|sign ?out", _re.I)).first
+                if lo.count() == 0:
+                    lo = page.get_by_role("menuitem", name=_re.compile(r"log ?out|sign ?out", _re.I)).first
+                if lo.count() and lo.is_visible():
+                    return lo
+        return None
+
     def logout_test(self, comp: ComponentRecord, protected_routes: list[str]) -> tuple[TestRecord, list[FindingRecord]]:
         """Real logout (the guard lets it through): the session must end and protected routes must redirect."""
         self.events("execute", f"Testing session end via '{comp.label or comp.name}'", 73)
@@ -663,10 +700,13 @@ class SmokeRunner:
         with self.guard.suspended():
             ok, why = self.prepare(comp.page_url)
             loc = self.locate(comp.selector, comp.role, comp.name or comp.label) if ok else None
+            if loc is None or (loc is not None and not _try_visible(loc)):
+                # Logout is often tucked inside a profile/avatar menu — open it and look again.
+                loc = self._open_profile_then_find_logout() or loc
             if loc is None:
                 comp.status = "blocked"
                 return TestRecord(test_key=f"logout|{comp.key}", name="Log out ends the session", technique="session", category="security", route=comp.route,
-                                  expected="Logout returns to /login", observed=why or "logout control not found", status="blocked", component_key=comp.key), findings
+                                  expected="Logout ends the session", observed=(why + "; " if why else "") + "logout control not found (not in the page or a profile menu)", status="blocked", component_key=comp.key), findings
             try:
                 loc.click(timeout=self.settings.action_timeout_ms)
                 self.page.wait_for_timeout(self.settings.settle_ms * 2)
@@ -675,18 +715,28 @@ class SmokeRunner:
                 return TestRecord(test_key=f"logout|{comp.key}", name="Log out ends the session", technique="session", category="security", route=comp.route,
                                   expected="Logout returns to /login", observed=comp.notes, status="blocked", component_key=comp.key), findings
             after_logout = _path(self.page.url)
+            login_shown = False
+            with contextlib.suppress(Exception):
+                login_shown = bool(self.page.evaluate("() => !!document.querySelector('input[type=password]')"))
+            with contextlib.suppress(Exception):
+                storage_cleared = self.page.evaluate("() => Object.keys(localStorage).filter(k => /token|session|auth|jwt/i.test(k) && (localStorage.getItem(k)||'').length > 8).length === 0")
             probe = next((r for r in protected_routes if r not in ("(layout)",)), None)
-            probe_path, storage_cleared = None, None
+            probe_path, probe_login = None, None
             if probe:
                 goto(self.page, self.live_url + probe, self.settings)
                 probe_path = _path(self.page.url)
                 with contextlib.suppress(Exception):
-                    storage_cleared = self.page.evaluate("() => Object.keys(localStorage).filter(k => /token|session|auth/i.test(k)).length === 0")
-        ok = "/login" in after_logout and (probe_path is None or "/login" in probe_path)
+                    probe_login = bool(self.page.evaluate("() => !!document.querySelector('input[type=password]')"))
+        # Logged out if: the URL went to /login, OR (router-less SPA) the login form is back
+        # and the auth token was cleared. A protected probe, if any, must also show login.
+        url_ok = "/login" in after_logout or "/signin" in after_logout
+        spa_ok = (login_shown or storage_cleared) and bool(storage_cleared)
+        probe_ok = probe is None or "/login" in (probe_path or "") or bool(probe_login)
+        ok = (url_ok or spa_ok) and probe_ok
         test = TestRecord(test_key=f"logout|{comp.key}", name="Log out ends the session", technique="session", category="security", route=comp.route,
                           steps=[{"type": "NAVIGATE", "value": comp.page_url}, {"type": "CLICK", "target": step_of(comp)}, {"type": "EXPECT_URL_CONTAINS", "value": "/login"}, {"type": "NAVIGATE", "value": self.live_url + (probe or "")}, {"type": "EXPECT_URL_CONTAINS", "value": "/login"}],
-                          expected="After logout the app shows /login and a protected route redirects to /login",
-                          observed=f"after logout: {after_logout}; protected probe {probe}: {probe_path}; auth keys cleared: {storage_cleared}",
+                          expected="After logout the login screen is shown, the auth token is cleared, and protected content is not reachable",
+                          observed=f"after logout: path {after_logout}, login form shown={login_shown}, auth token cleared={storage_cleared}; protected probe {probe}: path {probe_path}, login={probe_login}",
                           status="pass" if ok else "fail", duration_ms=int((time.time() - t0) * 1000), reproduced_n=1, reproduced_m=1, component_key=comp.key)
         comp.status = "pass" if ok else "fail"
         if not ok:

@@ -16,7 +16,7 @@ from urllib.parse import urljoin, urlparse
 
 from qaplatform.config import Settings
 from qaplatform.explore.browser import BrowserSession, LoginResult, attach_monitor, goto, login, same_origin
-from qaplatform.explore.scripts import COLLECT_INTERACTIVE_JS, LAYOUT_CHECK_JS, PAGE_STATE_JS
+from qaplatform.explore.scripts import COLLECT_INTERACTIVE_JS, LAYOUT_CHECK_JS, NAV_CONTROLS_JS, PAGE_STATE_JS
 from qaplatform.ingest.js_parser import CodeRoute
 
 logger = logging.getLogger(__name__)
@@ -127,6 +127,10 @@ def _capture_page(page, url: str, route: str, settings: Settings, shots_dir: Pat
     t0 = time.time()
     resp = goto(page, url, settings)
     load_ms = int((time.time() - t0) * 1000)
+    return _capture_current(page, url, route, settings, shots_dir, mon, protected, status_code=resp.status if resp else None, load_ms=load_ms)
+
+
+def _capture_current(page, url: str, route: str, settings: Settings, shots_dir: Path, mon, protected: bool | None, status_code=None, load_ms=0) -> ObservedPage:
     state = page.evaluate(PAGE_STATE_JS)
     elements_raw = page.evaluate(COLLECT_INTERACTIVE_JS, settings.max_elements_per_page)
     elements = [ObservedElement(**{k: v for k, v in e.items() if k in ObservedElement.__dataclass_fields__}) for e in elements_raw]
@@ -141,7 +145,7 @@ def _capture_page(page, url: str, route: str, settings: Settings, shots_dir: Pat
         url=url,
         final_url=page.url,
         title=state.get("title", ""),
-        status_code=resp.status if resp else None,
+        status_code=status_code,
         load_ms=load_ms,
         protected=protected,
         elements=elements,
@@ -170,7 +174,7 @@ def _capture_page(page, url: str, route: str, settings: Settings, shots_dir: Pat
     return observed
 
 
-def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: str, password: str, run_dir: Path, events: EventCb) -> ExploreResult:
+def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: str, password: str, run_dir: Path, events: EventCb, routeless: bool = False) -> ExploreResult:
     result = ExploreResult(origin=f"{urlparse(live_url).scheme}://{urlparse(live_url).netloc}")
     shots_dir = run_dir / "screenshots"
     shots_dir.mkdir(parents=True, exist_ok=True)
@@ -225,7 +229,10 @@ def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: s
         mon = attach_monitor(page)
 
         queue: list[str] = []
-        seen_paths: set[str] = set(_norm_path(p.url) for p in result.pages)
+        # Authenticated pass: do not treat public (unauthenticated) captures as "seen" —
+        # the same URL shows different content once logged in (crucial for SPAs where
+        # everything lives at "/").
+        seen_paths: set[str] = set()
         for r in protected_routes:
             queue.append(base + r.path)
         queue.append(base + "/")
@@ -241,14 +248,15 @@ def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: s
             count += 1
             events("explore", f"Exploring {path} ({len(result.pages) + 1}/{min(settings.max_pages, len(queue) + len(result.pages) + 1)})", min(30 + count * 2, 55))
             try:
-                observed = _capture_page(page, url, route, settings, shots_dir, mon, protected=route_for(path, routes) is not None and any(r.path == route and r.protected for r in routes))
+                # Pass 2 runs after a successful login, so everything it reaches is behind auth.
+                observed = _capture_page(page, url, route, settings, shots_dir, mon, protected=True)
             except Exception as exc:
                 result.warnings.append(f"page {path}: {type(exc).__name__}: {str(exc)[:120]}")
                 continue
             if _norm_path(observed.final_url) in ("/login", "/signin") and path not in ("/login", "/signin"):
                 result.warnings.append(f"{path} redirected to login while authenticated")
             final = _norm_path(observed.final_url)
-            if final != path and (final in visited or final in seen_paths or any(_norm_path(p.final_url) == final for p in result.pages)):
+            if final != path and (final in visited or final in seen_paths or any(_norm_path(pg.final_url) == final for pg in result.pages if pg.protected)):
                 continue  # a redirect to a page that is (or will be) captured under its own route
             result.pages.append(observed)
             for el in observed.elements:
@@ -256,5 +264,40 @@ def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: s
                     p = _norm_path(el.href)
                     if p not in visited and p not in seen_paths and not re.search(r"logout|signout|\.(png|jpg|pdf|zip|dmg|exe)$", p, re.I):
                         queue.append(urljoin(base + "/", p.lstrip("/")))
+
+        # Router-less SPA: the nav is buttons that swap screens in place (no URL change),
+        # so the link-following crawl above sees only the first screen. Click each nav
+        # control and capture the screen it reveals.
+        if routeless:
+            try:
+                _sweep_tabs(page, base, settings, shots_dir, mon, result, events)
+            except Exception as exc:
+                result.warnings.append(f"tab sweep: {type(exc).__name__}: {str(exc)[:160]}")
         ctx.close()
     return result
+
+
+def _sweep_tabs(page, base: str, settings: Settings, shots_dir: Path, mon, result: ExploreResult, events: EventCb) -> None:
+    goto(page, base + "/", settings)
+    controls = page.evaluate(NAV_CONTROLS_JS)
+    seen_hashes = {p.state.get("domHash") for p in result.pages}
+    events("explore", f"Router-less app: sweeping {len(controls)} navigation controls", 52)
+    for i, ctl in enumerate(controls):
+        label = ctl.get("label") or f"tab{i}"
+        route = "#" + _slug(label)
+        if any(p.route == route for p in result.pages) or len(result.pages) >= settings.max_pages:
+            continue
+        try:
+            loc = page.locator(ctl["selector"]).first
+            if loc.count() == 0 or not loc.is_visible():
+                continue
+            loc.click(timeout=settings.action_timeout_ms)
+            page.wait_for_timeout(settings.settle_ms)
+        except Exception as exc:
+            result.warnings.append(f"nav '{label}': {type(exc).__name__}")
+            continue
+        observed = _capture_current(page, base + "/#" + _slug(label), route, settings, shots_dir, mon, protected=True, status_code=200)
+        if observed.state.get("domHash") in seen_hashes and len(observed.elements) <= 3:
+            continue  # clicking it changed nothing meaningful
+        seen_hashes.add(observed.state.get("domHash"))
+        result.pages.append(observed)

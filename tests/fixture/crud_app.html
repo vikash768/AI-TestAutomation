@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>CRUD Fixture</title>
+<style>body{font:14px system-ui;margin:0}main{padding:16px}table{border-collapse:collapse;margin-top:10px}td,th{border:1px solid #ccc;padding:6px 10px}input{display:block;margin:4px 0;padding:6px}.row-actions button{margin-right:6px}.modal{position:fixed;inset:0;background:rgba(0,0,0,.3);display:grid;place-items:center}.card{background:#fff;padding:16px;border-radius:8px}</style>
+</head><body><div id="root"></div>
+<script>
+// A CRUD admin: a Team screen with a seeded REAL member that must never be touched,
+// an Add-member form (create), and per-row Delete (destructive) + Disable (data-dependent).
+const TOKEN='crud.token';
+const api=async(m,p,b)=>{const r=await fetch(p,{method:m,headers:{'Content-Type':'application/json',Authorization:'Bearer '+(localStorage.getItem(TOKEN)||'')},body:b?JSON.stringify(b):undefined});const t=await r.text();const j=t?JSON.parse(t):null;if(!r.ok)throw new Error(j&&j.message||'err');return j;};
+const root=document.getElementById('root');
+let confirm=null;
+const authed=()=>!!localStorage.getItem(TOKEN);
+async function render(){
+  if(!authed()){root.innerHTML=`<main><h1>Sign in</h1><form id="lf"><input id="em" type="email" placeholder="Email" required><input id="pw" type="password" placeholder="Password" required><button type="submit">Sign In</button></form></main>`;
+    document.getElementById('lf').onsubmit=async e=>{e.preventDefault();try{const j=await api('POST','/api/login',{email:em.value,password:pw.value});localStorage.setItem(TOKEN,j.token);render();}catch(x){}};return;}
+  let members=[];try{members=(await api('GET','/api/members')).members;}catch(e){}
+  root.innerHTML=`<main><h1>Team</h1><button id="logout">Log out</button>
+    <form id="addf"><h3>Add member</h3><input id="uname" placeholder="Username" required><input id="fname" placeholder="Full name" required><button type="submit">Add member</button></form>
+    <table><thead><tr><th>Username</th><th>Name</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+    ${members.map(m=>`<tr data-user="${m.username}"><td>${m.username}</td><td>${m.name}</td><td>${m.status}</td>
+      <td class="row-actions"><button class="dis" data-u="${m.username}">${m.status==='active'?'Disable':'Enable'}</button><button class="del" data-u="${m.username}">Delete</button></td></tr>`).join('')}
+    </tbody></table>
+    ${confirm?`<div class="modal"><div class="card"><p>Delete ${confirm}?</p><button id="cok">Delete</button><button id="ccancel">Cancel</button></div></div>`:''}
+    </main>`;
+  document.getElementById('logout').onclick=()=>{localStorage.removeItem(TOKEN);render();};
+  document.getElementById('addf').onsubmit=async e=>{e.preventDefault();try{await api('POST','/api/members',{username:uname.value.trim(),name:fname.value.trim()});render();}catch(x){}};
+  root.querySelectorAll('.dis').forEach(b=>b.onclick=async()=>{try{await api('POST','/api/members/'+encodeURIComponent(b.dataset.u)+'/toggle');render();}catch(x){}});
+  root.querySelectorAll('.del').forEach(b=>b.onclick=()=>{confirm=b.dataset.u;render();});
+  const ok=document.getElementById('cok');if(ok)ok.onclick=async()=>{const u=confirm;confirm=null;try{await api('DELETE','/api/members/'+encodeURIComponent(u));}catch(x){}render();};
+  const cc=document.getElementById('ccancel');if(cc)cc.onclick=()=>{confirm=null;render();};
+}
+render();
+</script></body></html>

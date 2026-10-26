@@ -142,6 +142,7 @@ def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path,
     from qaplatform.execute.security import detect_api_base, run_security
     from qaplatform.execute.load import run_load
     from qaplatform.execute.unit import run_unit
+    from qaplatform.execute.provision import run_provision
     from qaplatform.execute.smoke import TestRecord
     from qaplatform.execute.state import run_state
 
@@ -156,6 +157,8 @@ def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path,
         default_enabled.add("load")
     if options.get("unit"):
         default_enabled.add("unit")
+    if options.get("provision"):
+        default_enabled.add("provision")
     enabled = set(options.get("modules") or default_enabled) if options.get("phase2", True) else set()
     if not options.get("phase2", True):
         enabled = set()
@@ -214,6 +217,7 @@ def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path,
         ("lifecycle", lambda: run_lifecycle(runner, inv, ex.pages, components, events)),
         ("faults", lambda: run_faults(runner, ex.pages, components, inv.elements, events)),
         ("load", lambda: run_load(settings, live_url, ex.pages, api_base, None, events)),
+        ("provision", lambda: run_provision(runner, components, ex.pages, protected_routes, login_path, events, tag)),
     ]
     for name, fn in plan:
         _run(name, fn)
@@ -239,6 +243,42 @@ class RunContext:
             db.commit()
 
 
+
+def _short_repo_name(url: str) -> str:
+    base = url.rstrip("/").split("/")[-1]
+    return base[:-4] if base.endswith(".git") else base or "repo"
+
+
+def merge_inventories(invs: list) -> "CodeInventory":
+    """Combine several repos' inventories into one. Each element/call keeps its
+    repo as a prefix on its file path, so provenance and keys stay unique when a
+    frontend and a backend are tested together."""
+    from qaplatform.ingest.js_parser import CodeInventory
+    merged = CodeInventory(framework="+".join(sorted({i.framework for i, _ in invs})) or "unknown")
+    for inv, name in invs:
+        for el in inv.elements:
+            el.file = f"{name}/{el.file}"
+            el.key = f"{name}::{el.key}"
+            merged.elements.append(el)
+        for r in inv.routes:
+            r.file = f"{name}/{r.file}"
+            merged.routes.append(r)
+        for a in inv.api_calls:
+            a.file = f"{name}/{a.file}"
+            merged.api_calls.append(a)
+        for coll in ("timers", "storage", "navigates"):
+            for item in getattr(inv, coll):
+                item.file = f"{name}/{item.file}"
+                getattr(merged, coll).append(item)
+        merged.wrappers.update(inv.wrappers)
+        for route, pf in inv.page_files.items():
+            merged.page_files[route] = f"{name}/{pf}"
+        merged.files_parsed += inv.files_parsed
+        merged.warnings.extend(f"[{name}] {w}" for w in inv.warnings)
+    merged.routeless = any(i.routeless for i, _ in invs) or not merged.routes
+    return merged
+
+
 def run_pipeline(run_id: str, settings: Settings) -> None:
     ctx = RunContext(settings, run_id)
     with session(settings.database_url) as db:
@@ -256,33 +296,43 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     try:
-        # 1. ingest ---------------------------------------------------------
-        ctx.event("ingest", f"Fetching codebase {repo_url}", 3)
-        repo = fetch_repo(repo_url, settings.artifacts_dir / "repos" / run_id, token=settings.github_token or secrets.get("github_token"), branch=options.get("branch") or None)
-        ctx.event("ingest", f"Detected {repo.framework} ({repo.router or 'no router'}) at {repo.commit_sha[:10]}; parsing source", 6)
-        inv = build_inventory(repo.path, repo.framework)
+        # 1. ingest (one or more repos) -------------------------------------
+        repo_urls = [u for u in (options.get("repos") or [repo_url]) if u]
+        token = settings.github_token or secrets.get("github_token")
+        repos = []
+        for i, url in enumerate(repo_urls):
+            name = _short_repo_name(url)
+            ctx.event("ingest", f"Fetching codebase {i + 1}/{len(repo_urls)}: {name}", 3)
+            info = fetch_repo(url, settings.artifacts_dir / "repos" / run_id / name, token=token, branch=options.get("branch") or None)
+            one = build_inventory(info.path, info.framework)
+            ctx.event("ingest", f"{name}: {info.framework} ({info.router or 'no router'}) @ {info.commit_sha[:10]} — {one.files_parsed} files, {len(one.routes)} routes, {len([e for e in one.elements if e.kind in INTERACTIVE_KINDS])} components, {len(one.api_calls)} API calls", 6)
+            repos.append({"url": url, "name": name, "info": info, "inv": one})
+        primary = repos[0]["info"]
+        inv = repos[0]["inv"] if len(repos) == 1 else merge_inventories([(r["inv"], r["name"]) for r in repos])
+        primary_path = repos[0]["info"].path
         api_index = _api_index(inv)
         intents = {el.key: build_intent(el, inv, api_index) for el in inv.elements}
         interactive = [e for e in inv.elements if e.kind in INTERACTIVE_KINDS]
-        ctx.event("ingest", f"Parsed {inv.files_parsed} files: {len(inv.routes)} routes, {len(interactive)} interactive components, {len(inv.api_calls)} API calls", 12)
+        ctx.event("ingest", f"Parsed {len(repos)} repo(s): {inv.files_parsed} files, {len(inv.routes)} routes, {len(interactive)} interactive components, {len(inv.api_calls)} API calls", 12)
         if settings.llm_intent and settings.gemini_api_key and options.get("llm_intent", True):
             ctx.event("ingest", f"Summarising page intent with {settings.gemini_model}", 14)
-            enrichment = enrich_with_llm(inv, repo.path, settings.artifacts_dir / "cache" / "intent", settings.gemini_api_key, settings.gemini_model, fallback_model=settings.gemini_fallback_model)
-            apply_enrichment(inv.elements, intents, enrichment)
-            failed = enrichment.pop("__failures__", None)
-            ctx.event("ingest", f"Intent summaries for {len(enrichment)} files" + (f"; {failed['count']} files failed (quota or outage): {failed['first'][0][:120]}" if failed else ""), 18, level="warn" if failed else "info")
-        (run_dir / "inventory.json").write_text(json.dumps({**inv.to_dict(), "intents": intents}, indent=1, default=str), encoding="utf-8")
+            for r in repos:
+                enrichment = enrich_with_llm(r["inv"], r["info"].path, settings.artifacts_dir / "cache" / "intent", settings.gemini_api_key, settings.gemini_model, fallback_model=settings.gemini_fallback_model)
+                enrichment.pop("__failures__", None)
+                apply_enrichment([e for e in inv.elements if e.file.startswith(r["name"] + "/")], intents, {f"{r['name']}/{k}": v for k, v in enrichment.items()})
+        (run_dir / "inventory.json").write_text(json.dumps({**inv.to_dict(), "intents": intents, "repos": [r["url"] for r in repos]}, indent=1, default=str), encoding="utf-8")
         with session(settings.database_url) as db:
             r = db.get(Run, run_id)
-            r.commit_sha = repo.commit_sha
-            r.framework = repo.framework
+            r.commit_sha = primary.commit_sha
+            r.framework = inv.framework
             db.commit()
+        repo = primary
 
         # 2. explore --------------------------------------------------------
         ctx.event("explore", f"Opening {live_url}", 20)
         max_pages = int(options.get("max_pages") or settings.max_pages)
         settings_local = Settings(**{**asdict(settings), "max_pages": max_pages})
-        ex = explore(settings_local, live_url, inv.routes, secrets.get("email", ""), secrets.get("password", ""), run_dir, ctx.event)
+        ex = explore(settings_local, live_url, inv.routes, secrets.get("email", ""), secrets.get("password", ""), run_dir, ctx.event, routeless=getattr(inv, "routeless", False))
         for w in ex.warnings:
             ctx.event("explore", w, None, level="warn")
         if secrets.get("email") and ex.login is not None and not ex.login.success:
@@ -300,7 +350,7 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
 
         # 4-5. execute + judge --------------------------------------------------
         try:
-            tests, findings, phase_stats = execute_all(settings, live_url, secrets, run_dir, inv, ex, components, protected_routes, options, ctx.event, tag=run_id, repo_path=repo.path)
+            tests, findings, phase_stats = execute_all(settings, live_url, secrets, run_dir, inv, ex, components, protected_routes, options, ctx.event, tag=run_id, repo_path=primary_path)
         finally:
             state_file = Path(ex.storage_state_path) if ex.storage_state_path else None
             if state_file and state_file.exists():

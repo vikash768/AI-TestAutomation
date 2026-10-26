@@ -421,3 +421,42 @@ CANCEL_IN_LAYER_JS = "(layerSel) => {" + _VIS + r"""
 }"""
 
 STORAGE_KEYS_JS = r"""() => { const out = {}; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); out[k] = (localStorage.getItem(k) || '').length; } } catch (e) {} return out; }"""
+
+# Nav/tab controls of a router-less SPA: visible items in a nav/sidebar/tablist that switch screens.
+NAV_CONTROLS_JS = "() => {" + _VIS + r"""
+  const SKIP = /^(log\s?out|sign\s?out|logout|dark|light|theme|toggle theme|profile|account|menu|notifications?|close|back)$/i;
+  const containers = Array.from(document.querySelectorAll('nav, aside, header, [role=navigation], [role=tablist], [class*="sidebar" i], [class*="navbar" i], [class*="tabs" i]'));
+  const seen = new Set();
+  const out = [];
+  const consider = (el) => {
+    if (!vis(el) || seen.has(el)) return;
+    seen.add(el);
+    const label = clean(el.innerText || el.getAttribute('aria-label') || el.getAttribute('title'));
+    if (!label || label.length > 40 || SKIP.test(label)) return;
+    out.push({ selector: selectorFor(el), label, role: el.getAttribute('role') || el.tagName.toLowerCase() });
+  };
+  for (const c of containers)
+    for (const el of c.querySelectorAll('button, a[href], [role=tab], [role=menuitem], [role=button]')) consider(el);
+  for (const el of document.querySelectorAll('[role=tab]')) consider(el);
+  return out.slice(0, 20);
+}"""
+
+# Find record containers whose visible text includes our unique marker, and the controls inside them.
+# Used only by the provision module, which acts exclusively on records it created.
+FIND_MARKED_JS = "(marker) => {" + _VIS + r"""
+  const mk = (marker || '').toLowerCase();
+  if (!mk) return [];
+  const all = Array.from(document.querySelectorAll('tr, li, [role=row], [role=listitem], [class*="card" i], [class*="row" i], [class*="item" i], div'));
+  const hits = all.filter((el) => vis(el) && (el.innerText || '').toLowerCase().includes(mk));
+  hits.sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
+  const chosen = [];
+  for (const el of hits) {
+    if (chosen.some((c) => c.contains(el) || el.contains(c))) continue;
+    if (el.querySelectorAll('button, a[href], [role=button], [role=menuitem]').length) chosen.push(el);
+  }
+  return chosen.slice(0, 5).map((el) => ({
+    selector: selectorFor(el),
+    text: clean(el.innerText).slice(0, 100),
+    controls: Array.from(el.querySelectorAll('button, a[href], [role=button], [role=menuitem]')).filter(vis).map((b) => ({ selector: selectorFor(b), label: clean(b.innerText || b.getAttribute('aria-label')) })),
+  }));
+}"""

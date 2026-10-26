@@ -22,6 +22,25 @@
 <div><b>{{ run.stats.get('findings_total', 0) }}</b><br><small>findings ({{ run.stats.get('findings_needs_review', 0) }} need review)</small></div>
 <div><b>{{ run.stats.get('duration_seconds', 0) }}s</b><br><small>duration</small></div>
 </div>
+{% if run.stats.get('categories') %}
+{% set labels = {'functional':'Functional (code-derived)','ui':'UI & resize / accessibility','security':'Security / penetration','load':'Load / performance','unit':'Unit tests (codebase)','stability':'Stability & UX'} %}
+<h2>Results by category</h2>
+<table>
+<thead><tr><th>Test type</th><th>Ran</th><th>Tests</th><th>Passed</th><th>Failed</th><th>Blocked</th><th>Findings</th></tr></thead>
+<tbody>
+{% for key, label in labels.items() %}{% set c = run.stats.categories.get(key, {}) %}
+<tr>
+<td>{{ label }}</td>
+<td>{% if c.get('ran') %}<span class="pill completed">yes</span>{% else %}<span class="pill failed">no</span>{% endif %}</td>
+<td>{{ c.get('tests', 0) }}</td><td>{{ c.get('pass', 0) }}</td>
+<td{% if c.get('fail', 0) %} style="color:var(--crit);font-weight:700"{% endif %}>{{ c.get('fail', 0) }}</td>
+<td>{{ c.get('blocked', 0) }}</td><td>{{ c.get('findings', 0) }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+<p><small>A category showing <b>no</b> did not run this time — usually because it is opt-in (load, unit) or needs something the run lacked (e.g. a login for authenticated functional tests).</small></p>
+{% endif %}
 {% endif %}
 </div>
 

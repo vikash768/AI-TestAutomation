@@ -21,7 +21,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="qaplatform")
     sub = parser.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="create a run and execute it now")
-    r.add_argument("--repo", default=os.environ.get("TARGET_REPO_URL", ""))
+    r.add_argument("--repo", action="append", default=[], help="codebase repo URL; repeat for multiple repos (frontend + backend)")
     r.add_argument("--live", default=os.environ.get("TARGET_LIVE_URL", ""))
     r.add_argument("--project", default=os.environ.get("PROJECT_NAME", "default"))
     r.add_argument("--email", default=os.environ.get("VALID_USER_EMAIL", ""))
@@ -33,6 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--load", action="store_true", help="bounded, read-only load probe (authorised targets only)")
     r.add_argument("--unit", action="store_true", help="run the codebase's own test suite")
     r.add_argument("--unit-db", action="store_true", help="give the unit suite the platform DATABASE_URL (for backends that need one)")
+    r.add_argument("--provision", action="store_true", help="create disposable demo records and test destructive/data-dependent controls on them (REAL writes; authorised disposable-data targets only)")
     r.add_argument("--branch", default="")
     sub.add_parser("initdb", help="create tables")
     args = parser.parse_args(argv)
@@ -42,13 +43,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "initdb":
         print("tables ready at", settings.database_url.split("@")[-1])
         return 0
-    if not args.repo or not args.live:
-        print("--repo and --live are required (or TARGET_REPO_URL / TARGET_LIVE_URL)", file=sys.stderr)
+    repos = args.repo or ([os.environ["TARGET_REPO_URL"]] if os.environ.get("TARGET_REPO_URL") else [])
+    if not repos or not args.live:
+        print("--repo (one or more) and --live are required", file=sys.stderr)
         return 2
     with session(settings.database_url) as db:
-        run = Run(project=args.project, repo_url=args.repo, live_url=args.live, status="claimed", stage="claimed",
-                  options={"max_pages": args.max_pages or settings.max_pages, "llm_intent": not args.no_llm, "phase2": not args.no_phase2,
-                           "modules": [m.strip() for m in args.modules.split(",") if m.strip()] or None, "load": args.load, "unit": args.unit, "unit_db": args.unit_db, "branch": args.branch},
+        run = Run(project=args.project, repo_url=repos[0], live_url=args.live, status="claimed", stage="claimed",
+                  options={"repos": repos, "max_pages": args.max_pages or settings.max_pages, "llm_intent": not args.no_llm, "phase2": not args.no_phase2,
+                           "modules": [m.strip() for m in args.modules.split(",") if m.strip()] or None, "load": args.load, "unit": args.unit, "unit_db": args.unit_db, "provision": args.provision, "branch": args.branch},
                   secrets=encrypt_secrets(settings.secret_key, {"email": args.email, "password": args.password}))
         db.add(run)
         db.commit()

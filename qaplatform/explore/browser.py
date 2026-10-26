@@ -191,6 +191,8 @@ def login(context: BrowserContext, live_url: str, email: str, password: str, set
         email_box = page.locator(email_sel).first
         pass_box = page.locator(pass_sel).first
         email_box.wait_for(state="visible", timeout=settings.nav_timeout_ms)
+        rate_limited = {"hit": False}
+        page.on("response", lambda r: rate_limited.__setitem__("hit", True) if r.status == 429 and "login" in r.url.lower() else None)
         email_box.fill(email)
         pass_box.fill(password)
         submit = page.locator("button[type=submit], input[type=submit]").first
@@ -202,13 +204,35 @@ def login(context: BrowserContext, live_url: str, email: str, password: str, set
                 btn.click()
             else:
                 pass_box.press("Enter")
-        try:
-            page.wait_for_url(lambda u: "/login" not in urlparse(u).path, timeout=settings.nav_timeout_ms)
-        except PWTimeout:
+        # Success shows up in one of several ways. A classic app changes the URL away
+        # from /login; a router-less SPA keeps the URL but drops the password field and
+        # usually stores an auth token. Treat any of these as signed in.
+        def _signed_in() -> bool:
+            if "/login" not in urlparse(page.url).path and "/signin" not in urlparse(page.url).path:
+                return True
+            try:
+                if page.locator(pass_sel).count() == 0 or not page.locator(pass_sel).first.is_visible():
+                    return True
+            except Exception:
+                pass
+            try:
+                return bool(page.evaluate("() => { try { return Object.keys(localStorage).some(k => /token|session|auth|jwt/i.test(k) && (localStorage.getItem(k) || '').length > 10); } catch (e) { return false; } }"))
+            except Exception:
+                return False
+        ok = False
+        for _ in range(int(settings.nav_timeout_ms / 500) + 1):
+            if _signed_in():
+                ok = True
+                break
+            page.wait_for_timeout(500)
+        if not ok:
+            if rate_limited["hit"]:
+                page.close()
+                return LoginResult(False, login_url, "login rate-limited by the server (HTTP 429, 'too many attempts'). The app enforces a login cooldown; wait and retry.", login_url=login_url)
             alert = page.locator("[role=alert]").first
-            msg = alert.inner_text()[:200] if alert.count() else "still on login page after submit"
+            msg = alert.inner_text()[:200] if alert.count() and alert.is_visible() else "no sign of a session after submit (URL unchanged, password field still shown, no token stored)"
             page.close()
-            return LoginResult(False, page.url if not page.is_closed() else login_url, f"login failed: {msg}", login_url=login_url)
+            return LoginResult(False, login_url, f"login failed: {msg}", login_url=login_url)
         try:
             page.wait_for_load_state("networkidle", timeout=8000)
         except PWTimeout:

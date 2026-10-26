@@ -4,7 +4,7 @@
 <div class="card">
 <form method="post" action="/runs">
 <div class="grid">
-<div><label for="repo_url">Codebase URL (git) or local path</label><input type="text" id="repo_url" name="repo_url" required value="{{ defaults.repo_url }}" placeholder="https://github.com/org/frontend.git"></div>
+<div style="grid-column:1/-1"><label for="repo_url">Codebase repo URL(s) — one per line (e.g. frontend and backend)</label><textarea id="repo_url" name="repo_url" required rows="2" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--line);border-radius:6px;font-size:14px;font-family:ui-monospace,monospace" placeholder="https://github.com/org/frontend.git&#10;https://github.com/org/backend.git">{{ defaults.repo_url }}</textarea></div>
 <div><label for="live_url">Live URL</label><input type="url" id="live_url" name="live_url" required value="{{ defaults.live_url }}" placeholder="https://app.example.com"></div>
 <div><label for="project">Project name</label><input type="text" id="project" name="project" value="{{ defaults.project }}"></div>
 <div><label for="branch">Branch (optional)</label><input type="text" id="branch" name="branch" placeholder="main"></div>
@@ -17,6 +17,27 @@
 <label><input type="checkbox" name="phase2" value="true" checked> Interaction tests: menus, drawers, tabs, forms, validation, persistence, timers, failure handling</label>
 <label><input type="checkbox" name="unit" value="true"> Run the codebase's own unit tests (executes repo test command)</label>
 <label><input type="checkbox" name="load" value="true"> Bounded load probe (read-only, hard-capped; only for targets you are authorised to load-test)</label>
+<label><input type="checkbox" name="provision" value="true"> Create demo records and test delete / disable / reset on them (performs REAL creates and deletes on disposable data it makes, then cleans up — only for targets you authorise)</label>
+<details style="margin-top:12px">
+<summary style="cursor:pointer;font-weight:600;color:var(--accent)">How to create a read-only GitHub token for a private repo</summary>
+<div style="font-size:13px;color:var(--muted);margin-top:8px;line-height:1.6">
+<b>One repository (fine-grained, least privilege):</b>
+<ol style="margin:4px 0 8px;padding-left:20px">
+<li>GitHub → your avatar → <b>Settings</b> → <b>Developer settings</b> → <b>Personal access tokens</b> → <b>Fine-grained tokens</b> → <b>Generate new token</b>.</li>
+<li><b>Resource owner</b>: the account or org that owns the repo.</li>
+<li><b>Repository access</b> → <b>Only select repositories</b> → pick the repo.</li>
+<li><b>Permissions</b> → <b>Repository permissions</b> → <b>Contents: Read-only</b> (Metadata read is added automatically).</li>
+<li>Generate, copy the token (starts <code>github_pat_</code>), paste it in the token field above.</li>
+</ol>
+<b>Multiple repositories (frontend + backend):</b> same steps, but at <b>Repository access → Only select repositories</b> choose <b>all</b> the repos you entered above (the token must list every one). One token with all repos selected is enough; paste it once.
+<ul style="margin:4px 0 8px;padding-left:20px">
+<li>If the repos are under <b>different owners/orgs</b>, GitHub can't cover them with one fine-grained token — create one token per owner and run those repos as separate projects, or use a classic token with the <code>repo</code> scope (broader access).</li>
+<li>For an <b>organization</b> repo, the org may require the token to be <b>approved</b> (Org → Settings → Third-party access → Personal access tokens).</li>
+</ul>
+<b>Classic token (works across owners, broader):</b> Settings → Developer settings → Personal access tokens → <b>Tokens (classic)</b> → Generate → scope <b>repo</b> → if the org uses SSO, click <b>Configure SSO</b> → Authorize.
+<p style="margin-top:6px">A public repo needs no token. The token is used only to clone, encrypted at rest, and wiped when the run finishes.</p>
+</div>
+</details>
 <button type="submit">Start run</button>
 <p><small>Every write the browser tries to make (POST, PUT, PATCH, DELETE) is intercepted and never reaches the server; only sign-in, token refresh and the logout test go through. Destructive actions only have their confirmation opened and cancelled. Credentials are encrypted at rest and wiped when the run finishes.</small></p>
 </form>

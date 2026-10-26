@@ -145,6 +145,7 @@ class CodeInventory:
     navigates: list[NavigateFact] = field(default_factory=list)
     wrappers: dict = field(default_factory=dict)
     files_parsed: int = 0
+    routeless: bool = False
     warnings: list[str] = field(default_factory=list)
     page_files: dict = field(default_factory=dict)  # route -> file
 
@@ -1252,6 +1253,24 @@ def build_inventory(repo_root: Path, framework: str = "react") -> CodeInventory:
                     t = _resolve_import(rf_path, rf.imports[lay], repo_root)
                     if t:
                         layout_files.add(t)
+    # Router-less SPA (no <Route> anywhere): treat screen/page components as pseudo-pages
+    # so their buttons and forms are still inventoried. The crawler explores the single
+    # live page and clicks tabs; reconcile matches these against it (see matcher).
+    if not page_file_for_route:
+        inv.routeless = True
+        entry = next((c for c in ("src/main.jsx", "src/main.tsx", "src/index.jsx", "src/main.js", "src/App.jsx", "src/app.jsx") if c in files), None)
+        screen_files = sorted(rel for rel in files if re.search(r"(^|/)(screens|pages|views|tabs)/[^/]+\.(jsx|tsx|js)$", rel))
+        if screen_files:
+            for sf in screen_files:
+                page_file_for_route["#" + Path(sf).stem] = sf
+            for rel in files:
+                if re.search(r"(^|/)(components|layout|ui|widgets)/", rel) or rel == entry or Path(rel).name in ("App.jsx", "App.tsx"):
+                    layout_files.add(rel)
+        else:
+            root = entry or (sorted(files)[0] if files else None)
+            if root:
+                page_file_for_route["/"] = root
+        inv.warnings.append(f"router-less app: {len(screen_files)} screen pseudo-pages, entry={entry}")
     inv.page_files = page_file_for_route
 
     # transitive local JSX imports per page file (depth-limited)

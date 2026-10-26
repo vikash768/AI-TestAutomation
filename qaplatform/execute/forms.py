@@ -443,12 +443,16 @@ def auth_tests(settings: Settings, live_url: str, login_url: str, email: str, pa
         if sent:
             finding("empty", "low", "validation", "Sign-in sends a request with empty credentials", t, "WCAG 2.2 3.3.1 Error Identification")
 
+        rl = {"hit": False}
+        page.on("response", lambda r: rl.__setitem__("hit", True) if r.status == 429 else None)
+
         def attempt(e: str, p: str) -> dict:
             goto(page, login_url, settings)
             page.locator("input[type=email], input[name*=email i], input[id*=email i], input[autocomplete=username]").first.fill(e)
             page.locator("input[type=password]").first.fill(p)
             fb0 = page.evaluate(FEEDBACK_JS)
             mon.reset()
+            rl["hit"] = False
             page.locator("button[type=submit], input[type=submit]").first.click()
             with contextlib.suppress(Exception):
                 page.wait_for_load_state("networkidle", timeout=6000)
@@ -456,9 +460,14 @@ def auth_tests(settings: Settings, live_url: str, login_url: str, email: str, pa
             fb1 = page.evaluate(FEEDBACK_JS)
             old = set(fb0["alerts"]) | set(fb0["errors"])
             msg = next((x for x in fb1["alerts"] + fb1["errors"] if x and x not in old), "")
-            return {"path": urlparse(page.url).path, "message": msg, "errors": mon.snapshot()["page_errors"]}
+            return {"path": urlparse(page.url).path, "message": msg, "errors": mon.snapshot()["page_errors"], "rate_limited": rl["hit"]}
 
         unknown = attempt(f"qa.probe.unknown+{tag}@example.com", "Wrong#Pass-2026")
+        if unknown["rate_limited"]:
+            # The login is rate-limited (often by our own prior attempts); negative-auth
+            # results would be unreliable, so record and stop rather than emit false findings.
+            rec("ratelimited", "Negative sign-in checks", "Run negative login tests", "login endpoint returned 429 (rate limited); negative-auth checks skipped to avoid false results and deepening the lockout", "blocked", cat="security")
+            return tests, findings
         stayed = route in unknown["path"] or "/login" in unknown["path"]
         t = rec("unknown", "Unknown account is refused with a message", "Stays on sign-in and explains the failure", f"path {unknown['path']}; message {unknown['message']!r}",
                 "pass" if stayed and unknown["message"] else "fail", cat="functional")
@@ -489,8 +498,11 @@ def auth_tests(settings: Settings, live_url: str, login_url: str, email: str, pa
             with contextlib.suppress(Exception):
                 page.wait_for_url(lambda u: "/login" not in urlparse(u).path, timeout=settings.nav_timeout_ms)
             ok = "/login" not in urlparse(page.url).path
-            t = rec("enter", "Pressing Enter in the password field signs in", "Enter submits the form and reaches the app", f"path after Enter: {urlparse(page.url).path}", "pass" if ok else "fail", cat="functional")
-            if not ok:
-                finding("enter", "low", "functional", "Enter key does not submit the sign-in form", t, "WCAG 2.2 2.1.1 Keyboard")
+            if rl["hit"]:
+                rec("enter", "Pressing Enter in the password field signs in", "Enter submits the form", "skipped: login rate-limited (429)", "blocked", cat="functional")
+            else:
+                t = rec("enter", "Pressing Enter in the password field signs in", "Enter submits the form and reaches the app", f"path after Enter: {urlparse(page.url).path}", "pass" if ok else "fail", cat="functional")
+                if not ok:
+                    finding("enter", "low", "functional", "Enter key does not submit the sign-in form", t, "WCAG 2.2 2.1.1 Keyboard")
         ctx.close()
     return tests, findings

@@ -58,13 +58,15 @@ def index(request: Request, db: Session = Depends(db_session)):
 @app.post("/runs")
 def create_run(
     project: str = Form("default"), repo_url: str = Form(...), live_url: str = Form(...), email: str = Form(""), password: str = Form(""),
-    github_token: str = Form(""), max_pages: int = Form(60), llm_intent: bool = Form(False), phase2: bool = Form(False), load: bool = Form(False), unit: bool = Form(False), branch: str = Form(""),
+    github_token: str = Form(""), max_pages: int = Form(60), llm_intent: bool = Form(False), phase2: bool = Form(False), load: bool = Form(False), unit: bool = Form(False), provision: bool = Form(False), branch: str = Form(""),
     db: Session = Depends(db_session),
 ):
-    if not repo_url.strip() or not live_url.strip():
-        raise HTTPException(400, "repo_url and live_url are required")
-    run = Run(project=project.strip() or "default", repo_url=repo_url.strip(), live_url=live_url.strip(), status="queued", stage="queued",
-              options={"max_pages": max_pages, "llm_intent": llm_intent, "phase2": phase2, "load": load, "unit": unit, "branch": branch.strip()},
+    import re as _re
+    repos = [u.strip() for u in _re.split(r"[\s,]+", repo_url.strip()) if u.strip()]
+    if not repos or not live_url.strip():
+        raise HTTPException(400, "at least one repo URL and a live URL are required")
+    run = Run(project=project.strip() or "default", repo_url=repos[0], live_url=live_url.strip(), status="queued", stage="queued",
+              options={"repos": repos, "max_pages": max_pages, "llm_intent": llm_intent, "phase2": phase2, "load": load, "unit": unit, "provision": provision, "branch": branch.strip()},
               secrets=encrypt_secrets(settings.secret_key, {"email": email, "password": password, "github_token": github_token}))
     db.add(run)
     db.commit()

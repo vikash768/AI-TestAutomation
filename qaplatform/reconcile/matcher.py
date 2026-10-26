@@ -121,7 +121,12 @@ def reconcile(code_elements: list[CodeElement], pages: list[ObservedPage], prote
     for code in code_elements:
         if code.kind not in INTERACTIVE_KINDS:
             continue
-        candidates: list[ObservedPage] = by_route.get(code.route, []) if code.route != "(layout)" else protected_pages
+        # A pseudo-page (#Screen from a router-less SPA) or the shared layout is matched
+        # against every authenticated page, since the live app shows them all on one URL.
+        if code.route == "(layout)" or (code.route or "").startswith("#"):
+            candidates: list[ObservedPage] = protected_pages or pages
+        else:
+            candidates = by_route.get(code.route, [])
         best: Match | None = None
         for page in candidates:
             for idx, obs in enumerate(page.elements):
