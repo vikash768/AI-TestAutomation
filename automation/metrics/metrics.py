@@ -25,7 +25,7 @@ def create_metrics(registry: CollectorRegistry) -> dict:
     Returns a dict keyed by metric name for easy access.
 
     Labels used across all suite-level metrics:
-        project  - project identifier (e.g. 'poc', 'ijp', 'ecommerce')
+        project  - project identifier (e.g. 'poc', 'trackpilot', 'ecommerce')
         suite    - test suite name (e.g. 'smoke', 'regression')
         browser  - browser name (e.g. 'chrome', 'firefox')
         test_type - type of testing (e.g. 'browser', 'api', 'accessibility')
@@ -91,6 +91,26 @@ def create_metrics(registry: CollectorRegistry) -> dict:
             "qa_test_case_duration_seconds",
             "Individual test case duration in seconds",
             labelnames=case_labels,
+            registry=registry,
+        ),
+
+        # --- Bug categorization metrics ---
+        "qa_bug_category_count": Gauge(
+            "qa_bug_category_count",
+            "Count of failures by bug category (UI_BUG, FUNCTIONAL_BUG, API_BUG, etc.)",
+            labelnames=suite_labels + ["bug_category"],
+            registry=registry,
+        ),
+
+        # --- Failure detail metrics (1 per failed test for Grafana tables) ---
+        "qa_failure_detail": Gauge(
+            "qa_failure_detail",
+            "Detailed failure info: 1=active failure. Labels carry debugging context.",
+            labelnames=[
+                "project", "suite", "test_type", "test_id",
+                "bug_category", "failed_step", "expected", "actual",
+                "screenshot_url", "suite_block",
+            ],
             registry=registry,
         ),
     }

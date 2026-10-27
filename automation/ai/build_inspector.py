@@ -5,13 +5,15 @@ from __future__ import annotations
 import hashlib
 import plistlib
 import re
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 from typing import Any
 
 
 class BuildInspector:
-    """Extract safe, deterministic metadata from APK, IPA, app, and EXE builds."""
+    """Extract safe, deterministic metadata from APK, IPA, DMG, app, and EXE builds."""
 
     def __init__(self, build_path: str):
         self._build_path = Path(build_path).expanduser()
@@ -40,9 +42,16 @@ class BuildInspector:
                 result.update(self._inspect_ipa(path))
             elif artifact_type == "macos_app":
                 result.update(self._inspect_app(path))
+            elif artifact_type == "macos_dmg":
+                app_path = self.resolve_macos_app(path)
+                result["launch_path"] = str(app_path)
+                result.update(self._inspect_app(app_path))
 
             result["summary_prompt"] = self._summary(result)
-        except (OSError, zipfile.BadZipFile, plistlib.InvalidFileException) as exc:
+        except (
+            OSError, RuntimeError, ValueError, subprocess.SubprocessError,
+            zipfile.BadZipFile, plistlib.InvalidFileException,
+        ) as exc:
             result["error"] = f"Unable to inspect build artifact: {exc}"
         return result
 
@@ -53,8 +62,65 @@ class BuildInspector:
             ".apk": "apk",
             ".ipa": "ipa",
             ".app": "macos_app",
+            ".dmg": "macos_dmg",
             ".exe": "windows_exe",
         }.get(suffix, "unknown")
+
+    @staticmethod
+    def resolve_macos_app(build_path: str | Path) -> Path:
+        """Resolve a launchable .app from a bundle or a read-only mounted DMG."""
+        path = Path(build_path).expanduser().resolve()
+        if path.suffix.lower() == ".app":
+            app_path = path
+        elif path.suffix.lower() == ".dmg":
+            if sys.platform != "darwin":
+                raise RuntimeError("DMG builds can only be mounted on macOS")
+            if not path.is_file():
+                raise FileNotFoundError(f"DMG build does not exist: {path}")
+
+            info = subprocess.run(
+                ["hdiutil", "info", "-plist"],
+                capture_output=True,
+                timeout=20,
+                check=True,
+            )
+            volumes = []
+            for image in plistlib.loads(info.stdout).get("images", []):
+                if Path(image.get("image-path", "")).expanduser().resolve() == path:
+                    volumes.extend(
+                        Path(entity["mount-point"])
+                        for entity in image.get("system-entities", [])
+                        if entity.get("mount-point")
+                    )
+            if not volumes:
+                attached = subprocess.run(
+                    ["hdiutil", "attach", "-readonly", "-nobrowse", "-plist", str(path)],
+                    capture_output=True,
+                    timeout=90,
+                    check=True,
+                )
+                volumes = [
+                    Path(entity["mount-point"])
+                    for entity in plistlib.loads(attached.stdout).get("system-entities", [])
+                    if entity.get("mount-point")
+                ]
+            apps = sorted(
+                candidate
+                for volume in volumes
+                for candidate in volume.glob("*.app")
+                if candidate.is_dir()
+            )
+            if len(apps) != 1:
+                raise RuntimeError(
+                    f"Expected exactly one .app in DMG {path.name}; found {len(apps)}"
+                )
+            app_path = apps[0]
+        else:
+            raise ValueError(f"macOS build must be a .app bundle or .dmg file: {path}")
+
+        if not (app_path / "Contents" / "Info.plist").is_file():
+            raise RuntimeError(f"Invalid macOS app bundle (Info.plist missing): {app_path}")
+        return app_path
 
     @staticmethod
     def _sha256(path: Path) -> str:
@@ -129,6 +195,7 @@ class BuildInspector:
         if result.get("sha256"):
             lines.append(f"Build SHA-256: {result['sha256']}")
         for key, label in (
+            ("launch_path", "Launchable app"),
             ("bundle_id", "Bundle ID"),
             ("bundle_name", "Bundle name"),
             ("version", "Version"),
@@ -142,3 +209,15 @@ class BuildInspector:
                 rendered = ", ".join(value[:30]) if isinstance(value, list) else str(value)
                 lines.append(f"{label}: {rendered}")
         return "\n".join(f"- {line}" for line in lines)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Resolve a macOS .app from a .app or .dmg build")
+    parser.add_argument("--resolve-macos-app", required=True)
+    args = parser.parse_args()
+    try:
+        print(BuildInspector.resolve_macos_app(args.resolve_macos_app))
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        parser.exit(2, f"ERROR: {exc}\n")

@@ -7,7 +7,7 @@ echo "Running Android/Appium preflight..."
 if [ "${REQUIRE_BUILD_CONTEXT:-false}" = "true" ]; then
     if [ -z "${APP_BUILD_PATH:-}" ] || [ ! -f "$APP_BUILD_PATH" ]; then
         echo "ERROR: Mobile build is required but not found: ${APP_BUILD_PATH:-not set}"
-        echo "Set MOBILE_APP_BUILD_PATH to the IJustPaid APK path."
+        echo "Set MOBILE_APP_BUILD_PATH to the application APK path."
         exit 1
     fi
 fi

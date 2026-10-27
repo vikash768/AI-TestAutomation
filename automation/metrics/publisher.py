@@ -73,6 +73,38 @@ class MetricsPublisher(abc.ABC):
         ...
 
     @abc.abstractmethod
+    def publish_bug_category(
+        self,
+        *,
+        project: str,
+        suite: str,
+        browser: str,
+        test_type: str,
+        bug_category: str,
+        count: int,
+    ) -> None:
+        """Publish bug category breakdown counts."""
+        ...
+
+    @abc.abstractmethod
+    def publish_failure_detail(
+        self,
+        *,
+        project: str,
+        suite: str,
+        test_type: str,
+        test_id: str,
+        bug_category: str,
+        failed_step: str,
+        expected: str,
+        actual: str,
+        screenshot_url: str,
+        suite_block: str,
+    ) -> None:
+        """Publish per-failure detail for Grafana debugging tables."""
+        ...
+
+    @abc.abstractmethod
     def flush(self) -> None:
         """Push / finalize all buffered metrics to the backend."""
         ...
@@ -198,6 +230,61 @@ class PrometheusPushgatewayPublisher(MetricsPublisher):
             duration_seconds,
         )
 
+    def publish_bug_category(
+        self,
+        *,
+        project: str,
+        suite: str,
+        browser: str,
+        test_type: str,
+        bug_category: str,
+        count: int,
+    ) -> None:
+        labels = sanitize_data({
+            "project": project,
+            "suite": suite,
+            "browser": browser,
+            "test_type": test_type,
+            "bug_category": bug_category,
+        })
+        self._metrics["qa_bug_category_count"].labels(**labels).set(count)
+        logger.info(
+            "Recorded bug category: %s = %d", bug_category, count,
+        )
+
+    def publish_failure_detail(
+        self,
+        *,
+        project: str,
+        suite: str,
+        test_type: str,
+        test_id: str,
+        bug_category: str,
+        failed_step: str,
+        expected: str,
+        actual: str,
+        screenshot_url: str,
+        suite_block: str,
+    ) -> None:
+        # Truncate label values to keep Prometheus happy (max ~128 chars)
+        labels = sanitize_data({
+            "project": project,
+            "suite": suite,
+            "test_type": test_type,
+            "test_id": test_id,
+            "bug_category": bug_category,
+            "failed_step": failed_step[:120],
+            "expected": expected[:120],
+            "actual": actual[:120],
+            "screenshot_url": screenshot_url[:200],
+            "suite_block": suite_block[:120],
+        })
+        self._metrics["qa_failure_detail"].labels(**labels).set(1)
+        logger.info(
+            "Recorded failure detail: %s [%s] %s",
+            test_id, bug_category, failed_step[:60],
+        )
+
     def flush(self) -> None:
         """Push all collected metrics to Pushgateway."""
         try:
@@ -235,6 +322,12 @@ class NoOpPublisher(MetricsPublisher):
 
     def publish_suite_result(self, **kwargs: Any) -> None:
         logger.info("NoOp — suite result: %s", sanitize_data(kwargs))
+
+    def publish_bug_category(self, **kwargs: Any) -> None:
+        logger.info("NoOp — bug category: %s", sanitize_data(kwargs))
+
+    def publish_failure_detail(self, **kwargs: Any) -> None:
+        logger.info("NoOp — failure detail: %s", sanitize_data(kwargs))
 
     def flush(self) -> None:
         logger.info("NoOp — flush (nothing to send)")

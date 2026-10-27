@@ -13,7 +13,9 @@ Verifies that:
 """
 
 import os
+import plistlib
 import pytest
+import subprocess
 import sys
 import zipfile
 
@@ -33,9 +35,17 @@ from automation.actions.schema import (
     NATIVE_ONLY_ACTIONS,
 )
 from automation.actions.executor import ActionExecutionError, SeleniumExecutor
+from automation.actions.appium_executor import AppiumExecutor
 from automation.ai.test_generator import TestGenerator
+from automation.ai.build_inspector import BuildInspector
+from automation.ai.repo_reader import RepoReader
 from automation.ai.suite_parser import PageContext, TestCategory, TestInstruction
-from automation.runner import AITestRunner, VALID_TARGET_TYPES, VALID_APPIUM_PLATFORMS
+from automation.runner import (
+    AITestRunner,
+    SetupContextError,
+    VALID_TARGET_TYPES,
+    VALID_APPIUM_PLATFORMS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +83,75 @@ class TestWebTargetDefaults:
         )
         assert runner._app_build_path == ""
 
+    def test_protected_web_test_requires_credentials(self, monkeypatch):
+        monkeypatch.delenv("VALID_USER_EMAIL", raising=False)
+        monkeypatch.delenv("VALID_USER_PASSWORD", raising=False)
+        runner = AITestRunner(
+            suite_path="testsuites/trackpilot.testsuite.md",
+            base_url="https://example.com",
+            target_type="web",
+        )
+        driver = type("Driver", (), {"current_url": "https://example.com/login"})()
+
+        with pytest.raises(SetupContextError, match="Web credentials are required"):
+            runner._ensure_web_authenticated(driver)
+
+    def test_protected_web_test_authenticates_before_continuing(self, monkeypatch):
+        monkeypatch.setenv("VALID_USER_EMAIL", "web-user@example.test")
+        monkeypatch.setenv("VALID_USER_PASSWORD", "WEB_TEST_SECRET_49281")
+
+        class Element:
+            def __init__(self, driver, submit=False):
+                self.driver = driver
+                self.submit = submit
+
+            def clear(self):
+                return None
+
+            def send_keys(self, value):
+                return None
+
+            def is_displayed(self):
+                return True
+
+            def click(self):
+                if self.submit:
+                    self.driver.current_url = "https://example.com/dashboard"
+
+        class Driver:
+            current_url = "https://example.com/login"
+
+            def get(self, url):
+                self.current_url = url
+
+            def find_element(self, by, value):
+                return Element(self, submit=value == "button[type='submit']")
+
+        class ImmediateWait:
+            def __init__(self, driver, timeout):
+                self.driver = driver
+
+            def until(self, condition):
+                result = condition(self.driver)
+                if not result:
+                    raise TimeoutError("condition not met")
+                return result
+
+        monkeypatch.setattr(
+            "selenium.webdriver.support.ui.WebDriverWait",
+            ImmediateWait,
+        )
+        runner = AITestRunner(
+            suite_path="testsuites/trackpilot.testsuite.md",
+            base_url="https://example.com",
+            target_type="web",
+        )
+        driver = Driver()
+
+        runner._ensure_web_authenticated(driver)
+
+        assert driver.current_url == "https://example.com/dashboard"
+
     def test_web_target_requires_base_url_explicit_empty(self):
         """Web target raises ValueError if BASE_URL is explicitly empty and env has no fallback."""
         old_val = os.environ.pop("BASE_URL", None)
@@ -107,6 +186,43 @@ class TestAppiumTargetSelection:
         assert runner._target_type == "desktop"
         assert runner._appium_platform == "macos"
         assert runner._appium_server_url == "http://127.0.0.1:4723"
+
+    def test_mac2_uses_launchable_app_path_from_dmg(self, monkeypatch, tmp_path):
+        dmg = tmp_path / "sample.dmg"
+        dmg.write_bytes(b"dmg")
+        app = tmp_path / "Mounted" / "Sample.app"
+        (app / "Contents").mkdir(parents=True)
+        (app / "Contents" / "Info.plist").write_bytes(
+            plistlib.dumps({"CFBundleIdentifier": "com.example.sample"})
+        )
+        monkeypatch.setattr(
+            BuildInspector, "resolve_macos_app", staticmethod(lambda path: app)
+        )
+        captured = {}
+
+        class FakeDriver:
+            def implicitly_wait(self, seconds):
+                captured["wait"] = seconds
+
+        def remote(*, command_executor, options):
+            captured["url"] = command_executor
+            captured["capabilities"] = options.to_capabilities()
+            return FakeDriver()
+
+        monkeypatch.setattr("appium.webdriver.Remote", remote)
+        runner = AITestRunner(
+            suite_path="testsuites/desktop-app.testsuite.md",
+            target_type="desktop",
+            appium_platform="macos",
+            app_build_path=str(dmg),
+            bundle_id="com.example.sample",
+            artifacts_dir=str(tmp_path / "artifacts"),
+        )
+        runner._create_appium_driver()
+
+        assert captured["capabilities"]["appium:appPath"] == str(app)
+        assert captured["capabilities"]["appium:bundleId"] == "com.example.sample"
+        assert "appium:app" not in captured["capabilities"]
 
     def test_mobile_android_target(self):
         """Android mobile target stores correct config."""
@@ -218,6 +334,17 @@ class TestConfigurationValidation:
                 appium_platform="android",
                 app_build_path="/path/to/app.apk",
             )
+
+    def test_android_rejects_desktop_build_before_appium_session(self):
+        runner = AITestRunner(
+            suite_path="testsuites/test.testsuite.md",
+            target_type="mobile",
+            appium_platform="android",
+            app_build_path="/path/to/desktop.dmg",
+        )
+
+        with pytest.raises(SetupContextError, match="incompatible"):
+            runner._validate_native_build_type({"artifact_type": "macos_dmg"})
 
     def test_missing_appium_server_url_uses_default(self):
         """Desktop without explicit APPIUM_SERVER_URL uses the default."""
@@ -537,6 +664,47 @@ class TestGeneratorTargetType:
         with pytest.raises(RuntimeError, match="Full Markdown coverage required"):
             generator._ensure_category_coverage(page, category, [one_case])
 
+    def test_strict_coverage_repairs_a_missing_middle_assertion(self, monkeypatch):
+        generator = TestGenerator(base_url="https://example.com", target_type="desktop")
+        generator._require_full_coverage = True
+        generator._client = object()
+        page = PageContext(page_name="Window", page_number=1)
+        category = TestCategory(
+            category_id="1.1",
+            category_name="Controls",
+            instructions=[
+                TestInstruction("Verify first"),
+                TestInstruction("Activate and verify second"),
+                TestInstruction("Verify third"),
+            ],
+        )
+
+        def case(index, scenario, action):
+            return TestCase(
+                test_id=f"temporary-{index}",
+                page="Window",
+                functionality="Controls",
+                scenario=scenario,
+                test_data={"source_instruction_index": str(index)},
+                steps=[Action(action, value="Window")],
+            )
+
+        original = [
+            case(1, "first", ActionType.VERIFY_TEXT),
+            case(2, "weak second", ActionType.ACTIVATE_APP),
+            case(3, "third", ActionType.VERIFY_TEXT),
+        ]
+        monkeypatch.setattr(
+            generator,
+            "_generate_with_ai",
+            lambda page, category: [case(1, "repaired second", ActionType.VERIFY_VISIBLE)],
+        )
+
+        covered = generator._ensure_category_coverage(page, category, original)
+
+        assert [item.scenario for item in covered] == ["first", "repaired second", "third"]
+        assert [item.test_data["source_instruction_index"] for item in covered] == ["1", "2", "3"]
+
     def test_markdown_coverage_discards_extra_generated_cases(self):
         generator = TestGenerator(base_url="https://example.com", target_type="web")
         generator._client = None
@@ -627,6 +795,39 @@ class TestLiveMetrics:
 
 
 class TestFullRunExecution:
+    def test_native_session_setup_failure_stops_before_test_execution(self, tmp_path, monkeypatch):
+        runner = AITestRunner(
+            suite_path="testsuites/desktop-app.testsuite.md",
+            project_name="desktop-app",
+            artifacts_dir=str(tmp_path),
+            target_type="desktop",
+            appium_platform="macos",
+            app_build_path="/Applications/Example.app",
+        )
+        case = TestCase(
+            test_id="TC-DESKTOP-001",
+            page="Window",
+            functionality="Launch",
+            scenario="Window opens",
+            steps=[Action(ActionType.VERIFY_VISIBLE, "Verify window")],
+        )
+        executed = []
+
+        def fail_session():
+            raise RuntimeError("session could not be created")
+
+        monkeypatch.setattr(runner, "_create_appium_driver", fail_session)
+        monkeypatch.setattr(
+            runner,
+            "_execute_single_test",
+            lambda *args, **kwargs: executed.append(args),
+        )
+
+        with pytest.raises(SetupContextError, match="no native tests were executed"):
+            runner._execute_tests([case])
+
+        assert executed == []
+
     def test_all_generated_web_cases_run_even_after_a_failure(self, tmp_path, monkeypatch):
         runner = AITestRunner(
             suite_path="testsuites/trackpilot.testsuite.md",
@@ -783,6 +984,46 @@ class TestRepoReader:
         assert git_env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
         assert "top-secret-token" not in git_env["GIT_CONFIG_VALUE_0"]
 
+    def test_matching_local_checkout_exposes_desktop_source_actions(self, tmp_path):
+        repo = tmp_path / "drawio-desktop"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "add", "origin",
+             "https://github.com/jgraph/drawio-desktop.git"],
+            check=True,
+        )
+        (repo / "package.json").write_text(
+            '{"name":"draw.io","version":"32.4.1","main":"src/main/electron.js"}',
+            encoding="utf-8",
+        )
+        main = repo / "src/main/electron.js"
+        main.parent.mkdir(parents=True)
+        main.write_text("const appName = 'draw.io';", encoding="utf-8")
+        menus = repo / "drawio/src/main/webapp/js/diagramly/Menus.js"
+        menus.parent.mkdir(parents=True)
+        menus.write_text("editorUi.actions.put('new...', new Action('new'));", encoding="utf-8")
+        resources = repo / "drawio/src/main/webapp/resources/dia.txt"
+        resources.parent.mkdir(parents=True)
+        resources.write_text("new=New\n", encoding="utf-8")
+        url = "https://github.com/jgraph/drawio-desktop.git"
+
+        reader = RepoReader(repo_url=url, repo_local_path=str(repo))
+        context = reader.inspect_codebase(target_type="desktop")
+
+        assert context["manifest"]["version"] == "32.4.1"
+        assert "src/main/electron.js" in context["entrypoints"]
+        assert "new..." in context["ui_actions"]
+        assert context["resource_labels"]["new..."] == "New"
+        assert context["repo_error"] == ""
+
+        wrong = RepoReader(
+            repo_url="https://github.com/another/project.git",
+            repo_local_path=str(repo),
+        ).inspect_codebase(target_type="desktop")
+        assert wrong["scanned_files"] == 0
+        assert "does not match" in wrong["repo_error"]
+
 
 class TestBuildInspector:
     def test_apk_metadata_is_extracted(self, tmp_path):
@@ -808,6 +1049,151 @@ class TestBuildInspector:
         context = BuildInspector(str(tmp_path / "missing.apk")).inspect()
         assert context["exists"] is False
         assert "does not exist" in context["error"]
+
+    def test_dmg_inspection_uses_contained_app_metadata(self, tmp_path, monkeypatch):
+        dmg = tmp_path / "sample.dmg"
+        dmg.write_bytes(b"sample image")
+        app = tmp_path / "Mounted" / "Sample.app"
+        (app / "Contents").mkdir(parents=True)
+        (app / "Contents" / "Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleIdentifier": "com.example.sample",
+            "CFBundleName": "Sample",
+            "CFBundleShortVersionString": "1.2.3",
+        }))
+        monkeypatch.setattr(
+            BuildInspector, "resolve_macos_app", staticmethod(lambda path: app)
+        )
+
+        context = BuildInspector(str(dmg)).inspect()
+
+        assert context["artifact_type"] == "macos_dmg"
+        assert context["launch_path"] == str(app)
+        assert context["bundle_id"] == "com.example.sample"
+        assert context["version"] == "1.2.3"
+        assert len(context["sha256"]) == 64
+
+
+class TestDesktopProjectIsolation:
+    def test_generator_cache_is_scoped_to_repository_and_build(self):
+        first = TestGenerator(
+            target_type="desktop",
+            appium_platform="macos",
+            codebase_context={
+                "repo_url": "https://github.com/example/first.git",
+                "build": {"sha256": "first-build"},
+            },
+        )
+        second = TestGenerator(
+            target_type="desktop",
+            appium_platform="macos",
+            codebase_context={
+                "repo_url": "https://github.com/example/second.git",
+                "build": {"sha256": "second-build"},
+            },
+        )
+        assert first._cache_file != second._cache_file
+
+    def test_mac2_activation_uses_supported_command(self, tmp_path):
+        calls = []
+
+        class FakeDriver:
+            capabilities = {"platformName": "mac"}
+
+            def execute_script(self, name, args):
+                calls.append((name, args))
+
+        executor = AppiumExecutor(
+            driver=FakeDriver(),
+            platform="macos",
+            screenshot_dir=str(tmp_path),
+        )
+        executor.execute(Action(
+            ActionType.ACTIVATE_APP,
+            value="com.jgraph.drawio.desktop",
+        ))
+
+        assert calls == [
+            ("macos: activateApp", {"bundleId": "com.jgraph.drawio.desktop"})
+        ]
+
+
+class TestUnifiedPipelineParameters:
+    """Verify unified --platform and --repo-url parameters."""
+
+    def test_explicit_desktop_target_disables_repository_platform_override(self):
+        runner = AITestRunner(
+            target_type="desktop",
+            appium_platform="macos",
+            app_build_path="/Applications/Example.app",
+            repo_url="https://github.com/example/electron-app",
+        )
+
+        assert runner._should_auto_detect_platform() is False
+        assert runner._target_type == "desktop"
+        assert runner._appium_platform == "macos"
+
+    def test_electron_wins_over_nested_react_native_detection(self):
+        reader = RepoReader(repo_url="https://github.com/example/electron-app")
+
+        platform = reader.suggest_platform({
+            "detected_frameworks": ["electron", "react-native"],
+        })
+
+        assert platform == "macos"
+
+    def test_platform_android_maps_to_mobile(self):
+        runner = AITestRunner(
+            platform="android",
+            repo_url="https://github.com/example/android-app",
+        )
+        assert runner._target_type == "mobile"
+        assert runner._appium_platform == "android"
+        assert runner._app_repo_url == "https://github.com/example/android-app"
+
+    def test_platform_macos_maps_to_desktop(self):
+        runner = AITestRunner(
+            platform="macos",
+            repo_url="https://github.com/example/macos-app",
+        )
+        assert runner._target_type == "desktop"
+        assert runner._appium_platform == "macos"
+
+    def test_platform_web_maps_to_web(self):
+        runner = AITestRunner(
+            platform="web",
+            repo_url="https://github.com/example/web-app",
+        )
+        assert runner._target_type == "web"
+        assert runner._appium_platform == ""
+
+    def test_summary_includes_bug_categories(self):
+        from automation.actions.schema import BugCategory, TestResult, TestStatus
+        runner = AITestRunner(
+            suite_path="testsuites/trackpilot.testsuite.md",
+            base_url="https://example.com",
+        )
+        results = [
+            TestResult(
+                test_id="TC-001",
+                test_name="Pass",
+                status=TestStatus.PASS,
+                expected="",
+                actual="",
+                duration_seconds=1.0,
+            ),
+            TestResult(
+                test_id="TC-002",
+                test_name="Fail",
+                status=TestStatus.FAIL,
+                expected="visible",
+                actual="not found",
+                duration_seconds=1.0,
+                bug_category=BugCategory.UI_BUG,
+            ),
+        ]
+        summary = runner._compute_summary(results, duration=2.0)
+        assert "bug_categories" in summary
+        assert summary["bug_categories"].get("UI_BUG") == 1
 
 
 if __name__ == "__main__":

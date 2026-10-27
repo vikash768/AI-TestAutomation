@@ -34,21 +34,24 @@ Prometheus → Grafana                  ← Metrics + dashboards
 ```bash
 # 1. Configure environment
 cp .env.example .env
-# Edit .env with your credentials
+# Edit .env with your Gemini API key & credentials
 
-# 2. Start infrastructure
+# 2. Start infrastructure (Selenium, Prometheus, Grafana, Pushgateway)
 make up
 
 # 3. Verify services
 make health
 
-# 4. Run AI-driven tests (default: TrackPilot, web)
-make test-ai
+# 4. Unified single-command pipeline (auto-analyzes repo, sources build, generates tests & executes)
+make run repo=https://github.com/org/repo platform=android
 
-# 5. Run tests for a specific suite
+# Or for web:
+make run repo=https://github.com/org/web-app platform=web
+
+# 5. Run tests for a specific pre-written suite
 make test-suite SUITE=testsuites/trackpilot.testsuite.md
 
-# 6. View results in Grafana
+# 6. View rich debuggable results & metrics in Grafana
 open http://localhost:3000
 
 # 7. Reset environment and wipe test results to run fresh tests
@@ -65,9 +68,9 @@ category so the browser/device appears quickly during a live presentation:
 # TrackPilot web application through Selenium/Chrome
 make demo-web
 
-# IJustPaid Android application through Appium
+# Android application through Appium (set MOBILE_TEST_SUITE or pass SUITE=...)
 # Starts the configured emulator/Appium when needed and resets local app data.
-make demo-mobile
+make demo-mobile SUITE=testsuites/<app>-mobile.testsuite.md
 
 # Optional: demonstrate more categories
 make demo-web AI_MAX_CATEGORIES=3 AI_MAX_TESTS=5
@@ -77,7 +80,7 @@ For the Selenium run, open `http://localhost:7900` (password: `secret`). Chrome
 appears when the terminal reaches `[3/6] Executing tests...`; the Selenium Grid
 wallpaper is expected while test cases are being generated or after they finish.
 Use `make test-web` for the full Selenium suite. `make test-mobile` runs the
-complete IJustPaid suite and requires both repository and APK inspection to
+complete configured mobile suite and requires both repository and APK inspection to
 succeed; `make demo-mobile` is the fast APK-backed presentation path.
 
 `make test-web` enforces one executable test for every instruction in the
@@ -96,7 +99,7 @@ Each application has its own `.testsuite.md` instruction file:
 ```
 testsuites/
 ├── trackpilot.testsuite.md    ← TrackPilot testing instructions
-├── ijp-mobile.testsuite.md    ← Detailed IJustPaid Android instructions
+├── drawio-desktop.testsuite.md ← draw.io desktop instructions
 └── desktop-app.testsuite.md   ← Repository-grounded native desktop baseline
 ```
 
@@ -128,8 +131,11 @@ for a short presentation run; it intentionally limits coverage.
 ### Desktop Tests (Appium)
 
 ```bash
-# Configure DESKTOP_* values in .env, then run:
+# Configure DESKTOP_* values in .env, then run the entire Markdown suite:
 make test-desktop
+
+# One category for a shorter live check:
+make demo-desktop
 
 # Or override the suite:
 make test-desktop SUITE=testsuites/myapp-desktop.testsuite.md
@@ -143,11 +149,34 @@ BUNDLE_ID=com.example.myapp \
     --target-type desktop --appium-platform macos --app-build-path /Applications/MyApp.app
 ```
 
+The configured draw.io desktop target uses
+`testsuites/drawio-desktop.testsuite.md`, the repository URL
+`https://github.com/jgraph/drawio-desktop.git`, and the arm64 32.4.1 DMG in
+`/Users/vikashmandal/Desktop/drawio-desktop/dist/`. A DMG is mounted read-only;
+its contained `.app` is passed to Appium Mac2 using `appPath`. The original DMG
+is inspected and recorded in `inspection-context.json`. The matching local
+checkout is scanned, including its initialized `drawio` submodule. Set
+`DESKTOP_APP_REPO_LOCAL_PATH` only when that checkout's Git origin matches
+`DESKTOP_APP_REPO_URL`; otherwise the runner clones the URL and its submodules.
+
+Mac2 requires full Xcode and an active Xcode developer directory. Verify with
+`xcodebuild -version` and `appium driver doctor mac2` before the live demo.
+Command Line Tools alone cannot start a Mac2 session. On this host, install
+Xcode and then select it with
+`sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`.
+
+Mac2 also needs macOS Automation Mode to be usable without a password prompt.
+Otherwise every session fails after 180s with `Failed to launch '<app>'
+application`. Run once per machine:
+`sudo automationmodetool enable-automationmode-without-authentication`
+(`automationmodetool` should then report that authentication is not required).
+The desktop preflight stops early if this is missing.
+
 ### Android Tests (Appium)
 
 ```bash
 # Via Makefile:
-make demo-mobile                                  # Default: IJustPaid
+make demo-mobile SUITE=testsuites/myapp-mobile.testsuite.md  # One category
 make test-mobile                                  # Full repo + APK-grounded suite
 make test-mobile-detailed                         # Explicit alias for full suite
 make test-mobile SUITE=testsuites/myapp-mobile.testsuite.md
@@ -251,8 +280,9 @@ MOBILE_APP_PACKAGE=com.example.app
 MOBILE_APP_ACTIVITY=com.example.app.MainActivity
 
 DESKTOP_TEST_SUITE=testsuites/myapp-desktop.testsuite.md
-DESKTOP_APP_REPO_URL=/absolute/path/to/local/desktop-repo
-DESKTOP_APP_BUILD_PATH=/Applications/MyApp.app
+DESKTOP_APP_REPO_URL=https://github.com/your-org/your-desktop-app.git
+DESKTOP_APP_REPO_LOCAL_PATH=/absolute/path/to/matching/checkout
+DESKTOP_APP_BUILD_PATH=/absolute/path/to/MyApp.dmg
 DESKTOP_APPIUM_PLATFORM=macos
 DESKTOP_BUNDLE_ID=com.example.myapp
 ```
@@ -260,7 +290,8 @@ DESKTOP_BUNDLE_ID=com.example.myapp
 For a private GitHub repository, an existing `gh auth login` session is used
 automatically, or set `GH_TOKEN` (or `GITHUB_TOKEN`) in the uncommitted `.env`.
 A local repository path is also accepted and avoids remote authentication.
-Each run writes the inspected repository/build facts to
+Each run writes the inspected repository/build facts, source commit, and
+launchable app path to
 `inspection-context.json` beside the test plan and results.
 
 Web runs also write `coverage-summary.json`, showing parsed pages, categories,
@@ -295,37 +326,44 @@ Markdown instructions, generated tests, and the verified coverage percentage.
 
 ```
 ├── testsuites/                      ← Testing instruction files (.testsuite.md)
-│   └── trackpilot.testsuite.md
+│   ├── trackpilot.testsuite.md
+│   ├── drawio-desktop.testsuite.md
+│   └── desktop-app.testsuite.md
 ├── automation/                      ← Core framework
 │   ├── ai/                          ← AI reasoning layer
 │   │   ├── suite_parser.py          ←   Parse testsuite.md → structured context
-│   │   ├── repo_reader.py           ←   Inspect repository UI/routes/test IDs
-│   │   ├── build_inspector.py       ←   Inspect APK/IPA/.app/.exe metadata
+│   │   ├── repo_reader.py           ←   Inspect repository UI/routes/test IDs/APIs
+│   │   ├── build_sourcer.py         ←   Resolve/source build artifacts & URLs
+│   │   ├── build_inspector.py       ←   Inspect APK/IPA/DMG/.app/.exe metadata
 │   │   └── test_generator.py        ←   Generate test cases + actions
-│   ├── actions/                     ← Structured action layer
-│   │   ├── schema.py                ←   Action/TestCase/TestResult schemas
-│   │   ├── executor.py              ←   Selenium action executor (web)
+│   ├── executors/                   ← Unified action & executor layer
+│   │   ├── schema.py                ←   Action/TestCase/TestResult schemas & BugCategory
+│   │   ├── selenium_executor.py     ←   Selenium action executor (web)
 │   │   └── appium_executor.py       ←   Appium action executor (desktop/mobile)
+│   ├── actions/                     ← Backward-compatibility aliases
 │   ├── validation/                  ← Validation + evidence
-│   │   └── evidence.py              ←   Failure evidence collection
-│   ├── listeners/                   ← Robot Framework listeners
-│   │   └── prometheus_listener.py   ←   Prometheus metrics (Robot mode)
+│   │   └── evidence.py              ←   Failure evidence collection & bug categorization
 │   ├── metrics/                     ← Metrics infrastructure
 │   │   ├── metrics.py               ←   Prometheus metric definitions
 │   │   └── publisher.py             ←   Pushgateway publisher
+│   ├── secrets/                     ← Secret resolver & sanitizer
+│   │   ├── resolver.py              ←   Placeholder replacement
+│   │   └── sanitizer.py             ←   Credential redaction
 │   ├── utilities/                   ← Shared utilities
 │   │   └── test_ids.py              ←   Test ID extraction
-│   └── runner.py                    ← Main AI test orchestrator
+│   └── runner.py                    ← Main AI test orchestrator (unified entry)
 ├── tests/                           ← Validation tests
-│   ├── robot/                       ←   Robot Framework tests (legacy)
-│   └── test_appium_integration.py   ←   Appium integration validation
+│   ├── test_appium_integration.py   ←   Integration validation
+│   └── test_web_generator.py        ←   Web generator validation
 ├── observability/                   ← Grafana + Prometheus config
+│   ├── grafana/                     ←   Grafana dashboards & datasources
+│   └── prometheus/                  ←   Prometheus scraper rules
 ├── scripts/                         ← Shell scripts
 │   ├── up.sh                        ←   Start infrastructure
 │   ├── down.sh                      ←   Stop infrastructure
 │   ├── health.sh                    ←   Health check
 │   ├── clean.sh                     ←   Cleanup
-│   ├── run-suite.sh                 ←   Run AI tests for a suite
+│   ├── run-suite.sh                 ←   Run AI tests (supports --repo-url & --platform)
 │   ├── mobile-preflight.sh          ←   Android emulator/Appium readiness
 │   └── desktop-preflight.sh         ←   Desktop Appium readiness
 ├── artifacts/                       ← Test execution output
@@ -334,14 +372,14 @@ Markdown instructions, generated tests, and the verified coverage percentage.
 │   │   ├── inspection-context.json  ←     Repository/build evidence
 │   │   ├── coverage-summary.json    ←     Markdown instruction coverage
 │   │   ├── test-results.json        ←     Execution results
-│   │   ├── failures.json            ←     Failure details
 │   │   ├── summary.json             ←     Run summary
 │   │   ├── execution.log            ←     Execution log
 │   │   └── screenshots/             ←     Failure screenshots
-│   └── robot/                       ←   Robot Framework output
+│   └── generated_suites/            ←   Auto-generated .testsuite.md suites
 ├── docker-compose.yml               ← Service orchestration
 ├── Dockerfile.testrunner            ← Test runner container
-└── docs/ARCHITECTURE.md             ← Phase 0 architecture
+├── Makefile                         ← Unified make targets (make run repo=... platform=...)
+└── README.md
 ```
 
 ## Services
@@ -374,7 +412,7 @@ Key variables:
 - `PROJECT_NAME` — Logical project name for metrics/artifacts
 - `APP_REPO_URL` / `MOBILE_APP_REPO_URL` / `DESKTOP_APP_REPO_URL` — repository URL or local path
 - `BASE_URL` — Application URL (required for web targets)
-- `APP_BUILD_PATH` — Generic application build path (`.apk`, `.ipa`, `.app`, `.exe`)
+- `APP_BUILD_PATH` — Generic application build path (`.apk`, `.ipa`, `.dmg`, `.app`, `.exe`)
 - `APPIUM_PLATFORM` — Appium platform: `android`, `ios`, `macos`, `windows`
 - `APPIUM_SERVER_URL` — Appium server (default: `http://127.0.0.1:4723`)
 - `TEST_SUITE` — Default suite file path

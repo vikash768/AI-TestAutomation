@@ -5,12 +5,14 @@
   "tags": [
     "testing",
     "automation",
-    "qa"
+    "qa",
+    "ai",
+    "observability"
   ],
   "timezone": "browser",
   "schemaVersion": 38,
-  "version": 1,
-  "refresh": "10s",
+  "version": 2,
+  "refresh": "5s",
   "time": {
     "from": "now-6h",
     "to": "now"
@@ -53,6 +55,7 @@
   },
   "panels": [
     {
+      "id": 1,
       "type": "stat",
       "title": "Last Run Status",
       "gridPos": {
@@ -104,6 +107,7 @@
       }
     },
     {
+      "id": 2,
       "type": "stat",
       "title": "Total Tests",
       "gridPos": {
@@ -137,6 +141,7 @@
       }
     },
     {
+      "id": 3,
       "type": "stat",
       "title": "Passed",
       "gridPos": {
@@ -170,6 +175,7 @@
       }
     },
     {
+      "id": 4,
       "type": "stat",
       "title": "Failed",
       "gridPos": {
@@ -215,6 +221,7 @@
       }
     },
     {
+      "id": 5,
       "type": "stat",
       "title": "Skipped",
       "gridPos": {
@@ -248,6 +255,7 @@
       }
     },
     {
+      "id": 6,
       "type": "gauge",
       "title": "Pass Rate",
       "gridPos": {
@@ -303,12 +311,13 @@
       }
     },
     {
+      "id": 7,
       "type": "stat",
       "title": "Suite Duration",
       "gridPos": {
         "x": 0,
         "y": 4,
-        "w": 8,
+        "w": 6,
         "h": 4
       },
       "targets": [
@@ -333,12 +342,13 @@
       }
     },
     {
+      "id": 8,
       "type": "stat",
       "title": "Last Execution Time",
       "gridPos": {
-        "x": 8,
+        "x": 6,
         "y": 4,
-        "w": 8,
+        "w": 6,
         "h": 4
       },
       "targets": [
@@ -363,11 +373,284 @@
       }
     },
     {
+      "id": 9,
+      "type": "piechart",
+      "title": "Bug Category Breakdown (UI / Functional / API)",
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (bug_category) (qa_bug_category_count{project=~\"$project\", suite=~\"$suite\", browser=~\"$browser\", test_type=~\"$test_type\"} > 0)",
+          "datasource": "Prometheus",
+          "legendFormat": "{{bug_category}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "UI_BUG"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "purple"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "FUNCTIONAL_BUG"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "API_BUG"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ENVIRONMENT_ISSUE"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "AUTOMATION_ISSUE"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "pieType": "donut",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Active Failure Details Recorded",
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "count(qa_failure_detail{project=~\"$project\", suite=~\"$suite\", test_type=~\"$test_type\"}) or vector(0)",
+          "datasource": "Prometheus",
+          "legendFormat": "failures"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Functional Stability Index",
+      "gridPos": {
+        "x": 6,
+        "y": 8,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "clamp_max(100 - (sum(qa_bug_category_count{bug_category=\"FUNCTIONAL_BUG\", project=~\"$project\", suite=~\"$suite\"}) or 0) * 20, 100)",
+          "datasource": "Prometheus",
+          "legendFormat": "health"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 70
+              },
+              {
+                "color": "green",
+                "value": 90
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Bug Category Timeline & Trends",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (bug_category) (qa_bug_category_count{project=~\"$project\", suite=~\"$suite\", browser=~\"$browser\", test_type=~\"$test_type\"})",
+          "datasource": "Prometheus",
+          "legendFormat": "{{bug_category}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 13,
       "type": "table",
       "title": "Test Case Results",
       "gridPos": {
         "x": 0,
-        "y": 8,
+        "y": 20,
         "w": 24,
         "h": 8
       },
@@ -386,17 +669,20 @@
           "options": {
             "excludeByName": {
               "Time": true,
-              "__name__": true
+              "__name__": true,
+              "instance": true,
+              "job": true
             },
             "renameByName": {
               "Value": "Status",
               "test_id": "Test ID",
+              "test_name": "Test Name",
               "suite": "Suite",
               "project": "Project",
-              "browser": "Browser",
+              "browser": "Browser/Platform",
               "test_type": "Test Type",
-              "instance": "Instance",
-              "job": "Job"
+              "page": "Page",
+              "functionality": "Functionality"
             }
           }
         }
@@ -423,9 +709,140 @@
                       "1": {
                         "text": "PASS",
                         "color": "green"
-                      },
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
                       "0": {
                         "text": "FAIL",
+                        "color": "red"
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "-1": {
+                        "text": "SKIP",
+                        "color": "orange"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.displayMode",
+                "value": "color-background"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 14,
+      "type": "table",
+      "title": "Failure Analysis & Root Cause Diagnosis",
+      "gridPos": {
+        "x": 0,
+        "y": 28,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "qa_failure_detail{project=~\"$project\", suite=~\"$suite\", test_type=~\"$test_type\"}",
+          "datasource": "Prometheus",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "instance": true,
+              "job": true,
+              "Value": true,
+              "screenshot_url": true,
+              "suite_block": true
+            },
+            "renameByName": {
+              "test_id": "Test ID",
+              "bug_category": "Bug Category",
+              "failed_step": "Failed Step Description",
+              "expected": "Expected Result",
+              "actual": "Actual Error / Behavior",
+              "suite": "Suite",
+              "project": "Project",
+              "test_type": "Target Type"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bug Category"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "UI_BUG": {
+                        "text": "UI_BUG",
+                        "color": "purple"
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "FUNCTIONAL_BUG": {
+                        "text": "FUNCTIONAL_BUG",
+                        "color": "orange"
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "API_BUG": {
+                        "text": "API_BUG",
+                        "color": "yellow"
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "ENVIRONMENT_ISSUE": {
+                        "text": "ENVIRONMENT_ISSUE",
+                        "color": "blue"
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "AUTOMATION_ISSUE": {
+                        "text": "AUTOMATION_ISSUE",
                         "color": "red"
                       }
                     }
@@ -442,18 +859,150 @@
       }
     },
     {
+      "id": 15,
+      "type": "table",
+      "title": "Failure Screenshots & Visual Evidence",
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "qa_failure_detail{project=~\"$project\", suite=~\"$suite\", test_type=~\"$test_type\"}",
+          "datasource": "Prometheus",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "instance": true,
+              "job": true,
+              "Value": true,
+              "suite_block": true,
+              "expected": true,
+              "actual": true,
+              "failed_step": true,
+              "project": true,
+              "suite": true,
+              "test_type": true
+            },
+            "renameByName": {
+              "test_id": "Test ID",
+              "bug_category": "Bug Category",
+              "screenshot_url": "Screenshot Link"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Screenshot Link"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Screenshot \ud83d\udcf7",
+                    "url": "${__data.fields.screenshot_url}",
+                    "targetBlank": true
+                  }
+                ]
+              },
+              {
+                "id": "custom.displayMode",
+                "value": "link"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 16,
+      "type": "table",
+      "title": "Testsuite.md Specification Traceability",
+      "gridPos": {
+        "x": 12,
+        "y": 36,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "qa_failure_detail{project=~\"$project\", suite=~\"$suite\", test_type=~\"$test_type\"}",
+          "datasource": "Prometheus",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "instance": true,
+              "job": true,
+              "Value": true,
+              "screenshot_url": true,
+              "expected": true,
+              "actual": true,
+              "project": true,
+              "test_type": true
+            },
+            "renameByName": {
+              "test_id": "Test ID",
+              "suite": "Suite File",
+              "suite_block": "Specification Block / Instruction",
+              "bug_category": "Bug Category",
+              "failed_step": "Failed Action Step"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left"
+          }
+        }
+      }
+    },
+    {
+      "id": 17,
       "type": "timeseries",
       "title": "Pass Rate Trend",
       "gridPos": {
         "x": 0,
-        "y": 16,
+        "y": 44,
         "w": 12,
         "h": 8
       },
       "targets": [
         {
           "expr": "qa_test_pass_rate_ratio{project=~\"$project\", suite=~\"$suite\", browser=~\"$browser\", test_type=~\"$test_type\"} * 100",
-          "datasource": "Prometheus"
+          "datasource": "Prometheus",
+          "legendFormat": "pass_rate"
         }
       ],
       "fieldConfig": {
@@ -469,18 +1018,20 @@
       }
     },
     {
+      "id": 18,
       "type": "timeseries",
       "title": "Test Duration Trend",
       "gridPos": {
         "x": 12,
-        "y": 16,
+        "y": 44,
         "w": 12,
         "h": 8
       },
       "targets": [
         {
           "expr": "qa_suite_duration_seconds{project=~\"$project\", suite=~\"$suite\", browser=~\"$browser\", test_type=~\"$test_type\"}",
-          "datasource": "Prometheus"
+          "datasource": "Prometheus",
+          "legendFormat": "duration"
         }
       ],
       "fieldConfig": {

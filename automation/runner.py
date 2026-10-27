@@ -38,13 +38,15 @@ from typing import Optional
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 
-from automation.actions.executor import ActionExecutionError, SeleniumExecutor
-from automation.actions.schema import (
+from automation.executors.selenium_executor import ActionExecutionError, SeleniumExecutor
+from automation.executors.schema import (
+    BugCategory,
     FailureClassification,
     TestCase,
     TestResult,
     TestStatus,
 )
+from automation.ai.build_sourcer import BuildSourcer
 from automation.ai.suite_parser import SuiteParser
 from automation.ai.test_generator import TestGenerator
 from automation.metrics.publisher import (
@@ -95,7 +97,7 @@ class AITestRunner:
 
     def __init__(
         self,
-        suite_path: str,
+        suite_path: str = "",
         base_url: str = "",
         browser_name: str = "",
         selenium_url: str = "",
@@ -110,21 +112,45 @@ class AITestRunner:
         app_activity: str = "",
         bundle_id: str = "",
         app_repo_url: str = "",
+        app_repo_local_path: str = "",
         app_path: str = "",
+        platform: str = "",
+        repo_url: str = "",
     ):
         self._suite_path = suite_path or os.environ.get("TEST_SUITE", "")
         self._project_name = project_name or os.environ.get("PROJECT_NAME", "")
         self._artifacts_dir = Path(artifacts_dir)
-        self._app_repo_url = app_repo_url or os.environ.get("APP_REPO_URL", "")
+        self._app_repo_url = (
+            repo_url
+            or app_repo_url
+            or os.environ.get("APP_REPO_URL", "")
+            or os.environ.get("REPO_URL", "")
+        )
+        self._app_repo_local_path = app_repo_local_path or os.environ.get("APP_REPO_LOCAL_PATH", "")
         self._require_repo_context = _env_bool("REQUIRE_REPO_CONTEXT")
         self._require_build_context = _env_bool("REQUIRE_BUILD_CONTEXT")
         self._appium_server_url = ""
         self._appium_platform = ""
         self._app_build_path = ""
+        self._app_launch_path = ""
         self._device_name = ""
         self._app_package = ""
         self._app_activity = ""
         self._bundle_id = ""
+
+        # Remember whether the caller selected a target. Repository heuristics
+        # may fill missing configuration, but must never override an explicit
+        # desktop/mobile/web choice.
+        configured_platform = platform or os.environ.get("PLATFORM", "")
+        configured_target_type = target_type or os.environ.get("TARGET_TYPE", "")
+        self._platform_was_explicit = bool(configured_platform)
+        self._target_type_was_explicit = bool(configured_target_type)
+
+        # Unified platform parameter (e.g. web, android, ios, macos, windows)
+        self._platform = configured_platform.lower()
+        if self._platform:
+            target_type = target_type or BuildSourcer.platform_to_target_type(self._platform)
+            appium_platform = appium_platform or BuildSourcer.platform_to_appium_platform(self._platform)
 
         # Target type (web / desktop / mobile)
         self._target_type = (target_type or os.environ.get("TARGET_TYPE", "web")).lower()
@@ -140,8 +166,8 @@ class AITestRunner:
             self._browser_name = browser_name or os.environ.get("BROWSER", "chrome")
             self._selenium_url = selenium_url or os.environ.get("SELENIUM_REMOTE_URL", "http://selenium:4444")
 
-            # Validate: web targets MUST have a BASE_URL
-            if not self._base_url:
+            # Validate: web targets MUST have a BASE_URL unless repo is provided for build sourcing
+            if not self._base_url and not self._app_repo_url:
                 raise ValueError(
                     "BASE_URL is required for web targets. "
                     "Set it in .env or pass --base-url."
@@ -159,6 +185,7 @@ class AITestRunner:
                 or os.environ.get("APP_BUILD_PATH", "")
                 or os.environ.get("APP_PATH", "")
             )
+            self._app_launch_path = os.environ.get("APP_LAUNCH_PATH", "")
             self._device_name = device_name or os.environ.get("DEVICE_NAME", "")
             self._app_package = app_package or os.environ.get("APP_PACKAGE", "")
             self._app_activity = app_activity or os.environ.get("APP_ACTIVITY", "")
@@ -199,7 +226,7 @@ class AITestRunner:
                 or self._bundle_id
                 or self._app_package
             )
-            if not has_app_identity:
+            if not has_app_identity and not self._app_repo_url:
                 raise ValueError(
                     f"APP_BUILD_PATH, BUNDLE_ID, or APP_PACKAGE is required for "
                     f"{self._target_type} targets. Provide at least one way to "
@@ -318,7 +345,12 @@ class AITestRunner:
             options.set_capability("platformName", "mac")
             options.set_capability("automationName", "mac2")
             if self._app_build_path:
-                options.set_capability("app", self._app_build_path)
+                from automation.ai.build_inspector import BuildInspector
+
+                launch_path = BuildInspector.resolve_macos_app(
+                    self._app_launch_path or self._app_build_path
+                )
+                options.set_capability("appPath", str(launch_path))
             if self._bundle_id:
                 options.set_capability("bundleId", self._bundle_id)
 
@@ -336,6 +368,32 @@ class AITestRunner:
         logger.info("Appium session created successfully (platform=%s)", self._appium_platform)
         return driver
 
+    def _validate_native_build_type(self, build_context: dict) -> None:
+        """Reject a known build type that cannot run on the selected Appium driver."""
+        artifact_type = str(build_context.get("artifact_type", "")).lower()
+        known_native_types = {
+            "apk", "ipa", "macos_app", "macos_dmg", "windows_exe",
+        }
+        allowed_types = {
+            "android": {"apk"},
+            # Simulator/device iOS builds may be .app or .ipa. BuildInspector
+            # currently labels an inspected .app directory as macos_app.
+            "ios": {"ipa", "macos_app"},
+            "macos": {"macos_app", "macos_dmg"},
+            "windows": {"windows_exe"},
+        }
+        allowed = allowed_types.get(self._appium_platform, set())
+        if artifact_type in known_native_types and artifact_type not in allowed:
+            raise SetupContextError(
+                f"Build type '{artifact_type}' is incompatible with Appium platform "
+                f"'{self._appium_platform}'. Check TARGET_TYPE and the target-specific "
+                "APP_BUILD_PATH configuration."
+            )
+
+    def _should_auto_detect_platform(self) -> bool:
+        """Return whether repository heuristics may select the target platform."""
+        return not self._platform_was_explicit and not self._target_type_was_explicit
+
     def run(self) -> dict:
         """Execute the full AI-driven test pipeline.
 
@@ -345,27 +403,21 @@ class AITestRunner:
         run_start = time.time()
         logger.info("=" * 60)
         logger.info("AI Test Runner — Starting")
-        logger.info("Suite: %s", self._suite_path)
+        logger.info("Suite: %s", self._suite_path or "(resolving / auto-generating)")
         logger.info("Project: %s", self._project_name or "(not set)")
         logger.info("Target: %s", self._target_type)
         if self._target_type == "web":
             logger.info("Browser: %s", self._browser_name)
-            logger.info("URL: %s", sanitize_text(self._base_url))
+            logger.info("URL: %s", sanitize_text(self._base_url) if self._base_url else "(resolving)")
         else:
-            logger.info("Platform: %s", self._appium_platform)
-            logger.info("App: %s", self._app_build_path or self._bundle_id or self._app_package or "(not set)")
+            logger.info("Platform: %s", self._appium_platform or "(resolving)")
+            logger.info("App: %s", self._app_build_path or self._bundle_id or self._app_package or "(resolving)")
         if self._app_repo_url:
             logger.info("Repo: %s", sanitize_text(self._app_repo_url))
         logger.info("Run ID: %s", self._run_id)
         logger.info("=" * 60)
 
-        # Step 1: Parse the test suite
-        logger.info("[1/6] Parsing test suite...")
-        parser = SuiteParser()
-        ctx = parser.parse(self._suite_path)
-        logger.info("Parsed: %s — %d pages", ctx.application_name, len(ctx.pages))
-
-        # Step 1b: Ground generation in repository source and the exact build.
+        # Step 0: Ground generation in repository source, resolve build, auto-generate suite if needed
         codebase_context = {}
         inspection_context: dict[str, dict] = {"repository": {}, "build": {}}
         if self._require_repo_context and not self._app_repo_url:
@@ -383,18 +435,37 @@ class AITestRunner:
                 reader = RepoReader(
                     repo_url=self._app_repo_url,
                     cache_dir=self._artifacts_dir / "repos",
+                    repo_local_path=self._app_repo_local_path,
                 )
-                codebase_context = reader.inspect_codebase(target_type=self._target_type)
+                repo_path = reader.fetch_or_locate_repo()
+
+                # Auto-detection is only a fallback. An explicit target such as
+                # desktop/macos must remain authoritative even when a submodule
+                # contains source from another platform.
+                if self._should_auto_detect_platform() and repo_path:
+                    prelim = reader.inspect_codebase(repo_path, target_type="web")
+                    detected_platform = reader.suggest_platform(prelim)
+                    logger.info("Auto-detected platform from repository: %s", detected_platform)
+                    self._platform = detected_platform
+                    self._target_type = BuildSourcer.platform_to_target_type(detected_platform)
+                    self._appium_platform = BuildSourcer.platform_to_appium_platform(detected_platform)
+
+                codebase_context = reader.inspect_codebase(repo_path=repo_path, target_type=self._target_type)
                 inspection_context["repository"] = codebase_context
+                if self._require_repo_context and codebase_context.get("repo_error"):
+                    raise SetupContextError(
+                        f"Required repository inspection failed: {codebase_context['repo_error']}"
+                    )
                 scanned = codebase_context.get("scanned_files", 0)
                 if scanned > 0:
                     logger.info(
-                        "Codebase inspection complete: scanned %d files (%d routes, %d testIDs, %d accessibility labels, %d screens)",
+                        "Codebase inspection complete: scanned %d files (%d routes, %d testIDs, %d accessibility labels, %d screens, %d APIs)",
                         scanned,
                         len(codebase_context.get("routes", [])),
                         len(codebase_context.get("test_ids", [])),
                         len(codebase_context.get("accessibility_labels", [])),
                         len(codebase_context.get("screens", [])),
+                        len(codebase_context.get("api_endpoints", [])),
                     )
                 elif self._require_repo_context:
                     detail = codebase_context.get("repo_error") or "no scannable source files were found"
@@ -403,6 +474,42 @@ class AITestRunner:
                         "For a private GitHub repository, correct the URL/access, run 'gh auth login', "
                         "set GH_TOKEN/GITHUB_TOKEN, or use an authenticated local repository path."
                     )
+
+                # Build Sourcing
+                sourcer = BuildSourcer(
+                    repo_path=repo_path,
+                    platform=getattr(self, "_platform", "") or self._appium_platform or self._target_type,
+                    artifacts_dir=self._artifacts_dir,
+                )
+                build_res = sourcer.resolve(
+                    app_build_path=self._app_build_path,
+                    base_url=self._base_url,
+                    bundle_id=self._bundle_id,
+                    app_package=self._app_package,
+                )
+                if build_res.get("resolved_path") and not self._app_build_path:
+                    self._app_build_path = build_res["resolved_path"]
+                    logger.info("Build Sourcer resolved artifact: %s (via %s)", self._app_build_path, build_res.get("source"))
+                if build_res.get("resolved_url") and not self._base_url:
+                    self._base_url = build_res["resolved_url"]
+                    logger.info("Build Sourcer resolved URL: %s (via %s)", sanitize_text(self._base_url), build_res.get("source"))
+
+                # Auto-generate suite if none specified
+                if not self._suite_path or not Path(self._suite_path).is_file():
+                    app_name = self._project_name or codebase_context.get("manifest", {}).get("name", "")
+                    generated_suite = reader.generate_suite(
+                        codebase_context=codebase_context,
+                        app_name=app_name,
+                        target_type=self._target_type,
+                        output_dir=self._artifacts_dir / "generated_suites",
+                    )
+                    self._suite_path = str(generated_suite)
+                    logger.info("Auto-generated test suite: %s", self._suite_path)
+
+                if not self._project_name:
+                    manifest_name = codebase_context.get("manifest", {}).get("name", "")
+                    self._project_name = manifest_name or reader._extract_repo_name(self._app_repo_url)
+
             except Exception as e:
                 if self._require_repo_context:
                     if isinstance(e, SetupContextError):
@@ -412,6 +519,31 @@ class AITestRunner:
                     "Codebase reading from '%s' encountered an issue: %s. Proceeding with suite instructions.",
                     self._app_repo_url, e
                 )
+
+        # Validate that required inputs are now available
+        if not self._suite_path or not Path(self._suite_path).is_file():
+            raise SetupContextError(
+                f"Test suite file not found: '{self._suite_path}'. "
+                "Provide a valid --suite path or --repo-url to generate one."
+            )
+        if self._target_type == "web" and not self._base_url:
+            raise SetupContextError(
+                "BASE_URL is required for web targets. Set it in .env, pass --base-url, "
+                "or specify a repository with a detectable homepage/dev server."
+            )
+        elif self._target_type != "web":
+            has_app_identity = bool(self._app_build_path or self._bundle_id or self._app_package)
+            if not has_app_identity:
+                raise SetupContextError(
+                    f"APP_BUILD_PATH, BUNDLE_ID, or APP_PACKAGE is required for "
+                    f"{self._target_type} targets."
+                )
+
+        # Step 1: Parse the test suite
+        logger.info("[1/6] Parsing test suite...")
+        parser = SuiteParser()
+        ctx = parser.parse(self._suite_path)
+        logger.info("Parsed: %s — %d pages", ctx.application_name, len(ctx.pages))
 
         build_context = {}
         if self._target_type != "web" and self._app_build_path:
@@ -429,6 +561,15 @@ class AITestRunner:
                     build_context.get("artifact_type", "unknown"),
                     str(build_context.get("sha256", "directory-build"))[:12],
                 )
+                self._validate_native_build_type(build_context)
+                if self._appium_platform == "macos" and build_context.get("bundle_id"):
+                    discovered_bundle = build_context["bundle_id"]
+                    if self._bundle_id and self._bundle_id != discovered_bundle:
+                        raise SetupContextError(
+                            f"Configured BUNDLE_ID {self._bundle_id} does not match "
+                            f"the build bundle ID {discovered_bundle}."
+                        )
+                    self._bundle_id = discovered_bundle
         elif self._target_type != "web" and self._require_build_context:
             raise SetupContextError(
                 "Build context is required but APP_BUILD_PATH is empty. Set the "
@@ -562,11 +703,10 @@ class AITestRunner:
             try:
                 shared_driver = self._create_appium_driver()
             except Exception as e:
-                logger.warning(
-                    "Failed to initialize shared Appium session: %s. Using per-test sessions.",
-                    sanitize_text(str(e)),
-                )
-                shared_driver = None
+                raise SetupContextError(
+                    "Unable to initialize the Appium application session; no native "
+                    f"tests were executed: {sanitize_text(str(e))}"
+                ) from e
         else:
             try:
                 shared_driver = self._create_driver()
@@ -628,7 +768,7 @@ class AITestRunner:
             return False
 
     def _ensure_web_authenticated(self, driver) -> None:
-        """Ensure web session is authenticated with credentials for protected admin panel pages."""
+        """Ensure protected web tests never continue with an anonymous session."""
         if not self._base_url:
             return
 
@@ -636,8 +776,11 @@ class AITestRunner:
             resolver = SecretResolver()
             email = resolver.resolve("{{VALID_USER_EMAIL}}")
             password = resolver.resolve("{{VALID_USER_PASSWORD}}")
-        except SecretResolutionError:
-            return
+        except SecretResolutionError as exc:
+            raise SetupContextError(
+                "Web credentials are required before protected-page tests can run. "
+                "Set WEB_VALID_USER_EMAIL and WEB_VALID_USER_PASSWORD."
+            ) from exc
 
         try:
             curr = driver.current_url or ""
@@ -649,7 +792,7 @@ class AITestRunner:
             if any(f"/{r}" in curr for r in authenticated_routes):
                 return
 
-            logger.info("Auto-authenticating TrackPilot session...")
+            logger.info("Auto-authenticating web session...")
             driver.get(f"{self._base_url}/login")
             from selenium.webdriver.common.by import By
             from selenium.webdriver.support.ui import WebDriverWait
@@ -666,12 +809,15 @@ class AITestRunner:
             pass_field.send_keys(password)
             driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
             WebDriverWait(driver, 10.0).until(lambda d: "/login" not in d.current_url)
-            logger.info("Session authenticated successfully (current URL: %s)", driver.current_url)
-        except Exception as exc:
-            logger.debug(
-                "Auto-authentication check completed/bypassed: %s",
-                sanitize_text(str(exc)),
+            logger.info(
+                "Session authenticated successfully (current URL: %s)",
+                sanitize_text(driver.current_url),
             )
+        except Exception as exc:
+            raise SetupContextError(
+                "Unable to authenticate the web session for protected-page testing: "
+                f"{sanitize_text(str(exc))}"
+            ) from exc
 
     def _publish_live_progress(
         self,
@@ -707,6 +853,24 @@ class AITestRunner:
                 status=result.status.value,
                 duration_seconds=result.duration_seconds,
             )
+            if result.status == TestStatus.FAIL:
+                cat_val = (
+                    result.bug_category.value
+                    if hasattr(result.bug_category, "value")
+                    else str(result.bug_category or "AUTOMATION_ISSUE")
+                )
+                self._publisher.publish_failure_detail(
+                    project=self._project_name,
+                    suite=suite_name,
+                    test_type=self._target_type,
+                    test_id=result.test_id,
+                    bug_category=cat_val,
+                    failed_step=result.failed_step_description or result.actual or "",
+                    expected=result.expected or "",
+                    actual=result.actual or result.failure_reason or "",
+                    screenshot_url=result.screenshot_url or "",
+                    suite_block=result.source_suite_block or result.source_instruction or "",
+                )
             self._publisher.publish_suite_result(
                 project=self._project_name,
                 suite=suite_name,
@@ -754,7 +918,7 @@ class AITestRunner:
                     screenshot_dir=str(self._run_dir / "screenshots"),
                 )
             else:
-                from automation.actions.appium_executor import AppiumExecutor
+                from automation.executors.appium_executor import AppiumExecutor
                 if driver is None:
                     driver = self._create_appium_driver()
                     owns_driver = True
@@ -795,6 +959,7 @@ class AITestRunner:
                         error_message=str(e),
                         classification=e.classification,
                         duration=duration,
+                        failed_step_index=step_idx,
                     )
                     return result
 
@@ -813,6 +978,8 @@ class AITestRunner:
                 classification = FailureClassification.ENVIRONMENT_ERROR
 
             platform_label = self._browser_name if self._target_type == "web" else getattr(self, "_appium_platform", "")
+            metadata = test_case.test_data if isinstance(test_case.test_data, dict) else {}
+            bug_cat = BugCategory.from_failure(safe_error, classification.value)
 
             return TestResult(
                 test_id=test_case.test_id,
@@ -823,6 +990,10 @@ class AITestRunner:
                 duration_seconds=duration,
                 failure_reason=safe_error,
                 failure_classification=classification,
+                bug_category=bug_cat,
+                failed_step_description=safe_error,
+                source_instruction=str(metadata.get("source_instruction", "")),
+                source_suite_block=str(metadata.get("source_suite_block", "")),
                 error_details=sanitize_text(traceback.format_exc()),
                 page=test_case.page,
                 functionality=test_case.functionality,
@@ -852,6 +1023,13 @@ class AITestRunner:
                 key = r.failure_classification.value
                 classifications[key] = classifications.get(key, 0) + 1
 
+        # Bug category breakdown
+        bug_categories: dict[str, int] = {}
+        for r in results:
+            if r.status == TestStatus.FAIL and r.bug_category:
+                cat_key = r.bug_category.value if hasattr(r.bug_category, "value") else str(r.bug_category)
+                bug_categories[cat_key] = bug_categories.get(cat_key, 0) + 1
+
         platform_label = self._browser_name if self._target_type == "web" else getattr(self, "_appium_platform", "")
 
         return {
@@ -867,6 +1045,7 @@ class AITestRunner:
             "pass_rate": round(pass_rate, 2),
             "duration_seconds": round(duration, 2),
             "failure_classifications": classifications,
+            "bug_categories": bug_categories,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -940,6 +1119,57 @@ class AITestRunner:
                 duration_seconds=r.duration_seconds,
             )
 
+        # Publish bug category counts
+        bug_counts: dict[str, int] = {
+            "UI_BUG": 0,
+            "FUNCTIONAL_BUG": 0,
+            "API_BUG": 0,
+            "ENVIRONMENT_ISSUE": 0,
+            "AUTOMATION_ISSUE": 0,
+        }
+        for r in results:
+            if r.status == TestStatus.FAIL:
+                cat_val = (
+                    r.bug_category.value
+                    if hasattr(r.bug_category, "value")
+                    else str(r.bug_category or "AUTOMATION_ISSUE")
+                )
+                if cat_val in bug_counts:
+                    bug_counts[cat_val] += 1
+                else:
+                    bug_counts[cat_val] = 1
+
+        for cat_name, count in bug_counts.items():
+            self._publisher.publish_bug_category(
+                project=self._project_name,
+                suite=suite_name,
+                browser=platform_label,
+                test_type=test_type,
+                bug_category=cat_name,
+                count=count,
+            )
+
+        # Publish failure detail per failed test for Grafana debugging tables
+        for r in results:
+            if r.status == TestStatus.FAIL:
+                cat_val = (
+                    r.bug_category.value
+                    if hasattr(r.bug_category, "value")
+                    else str(r.bug_category or "AUTOMATION_ISSUE")
+                )
+                self._publisher.publish_failure_detail(
+                    project=self._project_name,
+                    suite=suite_name,
+                    test_type=test_type,
+                    test_id=r.test_id,
+                    bug_category=cat_val,
+                    failed_step=r.failed_step_description or r.actual or "",
+                    expected=r.expected or "",
+                    actual=r.actual or r.failure_reason or "",
+                    screenshot_url=r.screenshot_url or "",
+                    suite_block=r.source_suite_block or r.source_instruction or "",
+                )
+
         # Publish suite-level metrics
         self._publisher.publish_suite_result(
             project=self._project_name,
@@ -968,6 +1198,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Unified pipeline (single command):
+  python -m automation.runner --repo-url https://github.com/org/app --platform android
+
   # Web:
   python -m automation.runner --suite testsuites/myapp.testsuite.md \\
       --base-url https://myapp.example.com
@@ -982,6 +1215,21 @@ Examples:
       --target-type mobile --appium-platform android \\
       --app-build-path /path/to/app.apk --device-name emulator-5554
         """,
+    )
+    # --- Unified entry point arguments ---
+    parser.add_argument(
+        "--repo-url",
+        "--repo",
+        "--app-repo-url",
+        dest="repo_url",
+        default=os.environ.get("APP_REPO_URL", os.environ.get("REPO_URL", "")),
+        help="Repository URL for end-to-end analysis, build sourcing, and test generation",
+    )
+    parser.add_argument(
+        "--platform",
+        default=os.environ.get("PLATFORM", ""),
+        choices=["web", "android", "ios", "macos", "windows", ""],
+        help="Target platform: web, android, ios, macos, windows",
     )
     parser.add_argument(
         "--suite",
@@ -1016,8 +1264,8 @@ Examples:
     # --- Target type ---
     parser.add_argument(
         "--target-type",
-        default=os.environ.get("TARGET_TYPE", "web"),
-        choices=["web", "desktop", "mobile"],
+        default=os.environ.get("TARGET_TYPE", ""),
+        choices=["web", "desktop", "mobile", ""],
         help="Target type: web, desktop, or mobile (default: $TARGET_TYPE or web)",
     )
     # --- Appium configuration ---
@@ -1036,7 +1284,7 @@ Examples:
         "--app-path",
         dest="app_build_path",
         default=os.environ.get("APP_BUILD_PATH", os.environ.get("APP_PATH", "")),
-        help="Path to application build artifact — .apk, .ipa, .app, .exe (default: $APP_BUILD_PATH)",
+        help="Path to application build artifact — .apk, .ipa, .dmg, .app, .exe (default: $APP_BUILD_PATH)",
     )
     parser.add_argument(
         "--device-name",
@@ -1059,9 +1307,9 @@ Examples:
         help="iOS/macOS bundle identifier (default: $BUNDLE_ID)",
     )
     parser.add_argument(
-        "--app-repo-url",
-        default=os.environ.get("APP_REPO_URL", ""),
-        help="Optional source repository URL for AI inspection (default: $APP_REPO_URL)",
+        "--app-repo-local-path",
+        default=os.environ.get("APP_REPO_LOCAL_PATH", ""),
+        help="Optional matching local checkout for repository inspection",
     )
 
     args = parser.parse_args()
@@ -1081,7 +1329,10 @@ Examples:
         app_package=args.app_package,
         app_activity=args.app_activity,
         bundle_id=args.bundle_id,
-        app_repo_url=args.app_repo_url,
+        app_repo_url=args.repo_url,
+        app_repo_local_path=args.app_repo_local_path,
+        platform=args.platform,
+        repo_url=args.repo_url,
     )
 
     try:

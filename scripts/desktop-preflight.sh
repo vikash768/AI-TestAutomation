@@ -16,7 +16,7 @@ esac
 if [ "${REQUIRE_BUILD_CONTEXT:-false}" = "true" ]; then
     if [ -z "${APP_BUILD_PATH:-}" ] || [ ! -e "$APP_BUILD_PATH" ]; then
         echo "ERROR: Desktop build is required but not found: ${APP_BUILD_PATH:-not set}"
-        echo "Set DESKTOP_APP_BUILD_PATH to a .app directory (macOS) or .exe file (Windows)."
+        echo "Set DESKTOP_APP_BUILD_PATH to a .dmg/.app (macOS) or .exe (Windows)."
         exit 1
     fi
 fi
@@ -24,6 +24,28 @@ fi
 if [ -n "${APP_BUILD_PATH:-}" ] && [ ! -e "$APP_BUILD_PATH" ]; then
     echo "ERROR: Desktop build does not exist: $APP_BUILD_PATH"
     exit 1
+fi
+
+if [ "$DESKTOP_PLATFORM" = "macos" ]; then
+    if [ -n "${APP_BUILD_PATH:-}" ]; then
+        APP_LAUNCH_PATH="$($PYTHON_CMD "$PROJECT_DIR/automation/ai/build_inspector.py" --resolve-macos-app "$APP_BUILD_PATH")" || exit 1
+        export APP_LAUNCH_PATH
+        echo "Launchable app: $APP_LAUNCH_PATH"
+    fi
+    if ! xcodebuild -version >/dev/null 2>&1; then
+        echo "ERROR: Appium Mac2 requires full Xcode. The active developer directory only has Command Line Tools."
+        echo "Install Xcode, then run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+        exit 1
+    fi
+    # XCTest must enter Automation Mode before it can launch any app. When that
+    # needs authentication, macOS shows a password prompt that nothing answers,
+    # and Mac2 fails after its 180s launch timeout with "Failed to launch ...".
+    if command -v automationmodetool >/dev/null 2>&1 \
+        && automationmodetool 2>&1 | grep -q "requires user authentication"; then
+        echo "ERROR: macOS Automation Mode requires authentication, so Mac2 cannot launch apps."
+        echo "Run once: sudo automationmodetool enable-automationmode-without-authentication"
+        exit 1
+    fi
 fi
 
 if ! command -v appium >/dev/null 2>&1; then

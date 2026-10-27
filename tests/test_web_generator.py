@@ -108,3 +108,35 @@ def test_generator_caching(tmp_path, monkeypatch):
     loaded = gen._generate_category_tests(page, cat)
     assert len(loaded) == 1
     assert loaded[0].scenario == cases[0].scenario
+
+
+def test_strict_coverage_falls_back_when_ai_returns_malformed_json(tmp_path, monkeypatch):
+    gen = TestGenerator(base_url="https://example.com", target_type="web")
+    gen._client = object()
+    gen._require_full_coverage = True
+    gen._cache_dir = tmp_path
+    gen._cache_file = tmp_path / "test_cache.json"
+    gen._cache = {}
+
+    def malformed_response(page, category):
+        raise json.JSONDecodeError("Malformed model response", "{", 1)
+
+    monkeypatch.setattr(gen, "_generate_with_ai", malformed_response)
+    page = PageContext(page_name="Reports", page_number=1, url_pattern="/reports")
+    category = TestCategory(
+        category_id="1.1",
+        category_name="Custom Report",
+        instructions=[
+            TestInstruction("Verify available filters"),
+            TestInstruction("Verify reset controls"),
+        ],
+    )
+
+    cases = gen._generate_category_tests(page, category)
+
+    assert len(cases) == 2
+    assert [case.test_data["source_instruction_index"] for case in cases] == ["1", "2"]
+    assert all(
+        any(step.action_type == ActionType.VERIFY_URL_CONTAINS for step in case.steps)
+        for case in cases
+    )

@@ -3,10 +3,14 @@
 # =============================================================================
 
 WEB_SUITE ?= testsuites/trackpilot.testsuite.md
-MOBILE_SUITE ?= testsuites/ijp-mobile.testsuite.md
-DESKTOP_SUITE ?= testsuites/desktop-app.testsuite.md
+MOBILE_SUITE ?=
+DESKTOP_SUITE ?= testsuites/drawio-desktop.testsuite.md
 
-.PHONY: up down health build test test-ai test-web test-suite test-desktop test-mobile test-mobile-detailed demo-web demo-mobile demo-desktop clean help
+.PHONY: run up down health build test test-ai test-web test-suite test-desktop test-mobile test-mobile-detailed demo-web demo-mobile demo-desktop clean help
+
+## Run unified pipeline (usage: make run repo=https://github.com/org/repo platform=android)
+run:
+	./scripts/run-suite.sh $(if $(repo),--repo-url $(repo),) $(if $(platform),--platform $(platform),) $(if $(suite),--suite $(suite),)
 
 ## Start all infrastructure services
 up:
@@ -47,13 +51,13 @@ test-desktop:
 		REQUIRE_BUILD_CONTEXT=true REQUIRE_FULL_MD_COVERAGE=true \
 		./scripts/run-suite.sh $(or $(SUITE),$(DESKTOP_SUITE))
 
-## Run mobile tests via Appium (defaults to the IJustPaid Android suite)
+## Run mobile tests via Appium (usage: make test-mobile SUITE=testsuites/xxx.testsuite.md)
 test-mobile:
-	AI_MAX_CATEGORIES= AI_MAX_TESTS= TARGET_TYPE=mobile PROJECT_NAME=$(or $(PROJECT),ijustpaid) \
+	AI_MAX_CATEGORIES= AI_MAX_TESTS= TARGET_TYPE=mobile \
 		REQUIRE_REPO_CONTEXT=true REQUIRE_BUILD_CONTEXT=true REQUIRE_FULL_MD_COVERAGE=true \
 		./scripts/run-suite.sh $(or $(SUITE),$(MOBILE_SUITE))
 
-## Explicit alias for the full repository- and build-grounded IJustPaid suite.
+## Explicit alias for the full repository- and build-grounded mobile suite.
 test-mobile-detailed: test-mobile
 
 ## Lead-demo commands limit AI generation to one category for a fast live run.
@@ -65,22 +69,13 @@ demo-web:
 
 demo-mobile:
 	AI_MAX_CATEGORIES=$(or $(AI_MAX_CATEGORIES),1) AI_MAX_TESTS=$(or $(AI_MAX_TESTS),1) TARGET_TYPE=mobile \
-		PROJECT_NAME=$(or $(PROJECT),ijustpaid) APP_REPO_URL= REQUIRE_REPO_CONTEXT=false \
+		REQUIRE_REPO_CONTEXT=true \
 		REQUIRE_BUILD_CONTEXT=true MOBILE_RESET_APP=true \
 		./scripts/run-suite.sh $(or $(SUITE),$(MOBILE_SUITE))
 
 demo-desktop:
 	AI_MAX_CATEGORIES=$(or $(AI_MAX_CATEGORIES),1) AI_MAX_TESTS=$(or $(AI_MAX_TESTS),1) TARGET_TYPE=desktop \
-		REQUIRE_REPO_CONTEXT=false REQUIRE_BUILD_CONTEXT=true ./scripts/run-suite.sh $(or $(SUITE),$(DESKTOP_SUITE))
-
-## Run legacy Robot Framework tests (if needed)
-test-robot:
-	docker compose run --rm test-runner robot \
-		--listener automation/listeners/prometheus_listener.py \
-		--outputdir /opt/testing/artifacts/robot \
-		--loglevel INFO \
-		--removekeywords tag:secret \
-		tests/robot/suites/
+		REQUIRE_REPO_CONTEXT=true REQUIRE_BUILD_CONTEXT=true ./scripts/run-suite.sh $(or $(SUITE),$(DESKTOP_SUITE))
 
 ## Clean up test run outputs (runs, screenshots, logs) while keeping AI test plan cache
 clean-runs:
@@ -98,13 +93,16 @@ clean-all:
 help:
 	@echo "AI Testing Automation — Available targets:"
 	@echo ""
+	@echo "  make run repo=<url> platform=<platform> [suite=<file>]"
+	@echo "                     Unified single-command pipeline: analyze, source build, execute"
 	@echo "  make up            Start infrastructure"
 	@echo "  make health        Check service health"
 	@echo "  make build         Build test runner image"
 	@echo ""
 	@echo "  make demo-web      Run TrackPilot in Selenium (starts/checks Selenium)"
-	@echo "  make demo-mobile   Run IJustPaid in Appium (starts/checks emulator + Appium)"
-	@echo "  make demo-desktop  Run one desktop category via Appium"
+	@echo "  make demo-mobile  [SUITE=testsuites/xxx.testsuite.md]"
+	@echo "                     Run one mobile category in Appium (starts/checks emulator + Appium)"
+	@echo "  make demo-desktop  Run one source/build-grounded desktop category via Appium"
 	@echo "  make test-web      Run the complete TrackPilot Selenium suite"
 	@echo "  make test-ai       Same as test-web (backward-compatible)"
 	@echo "  make test-suite SUITE=testsuites/xxx.testsuite.md [TARGET_TYPE=web|desktop|mobile]"
@@ -112,11 +110,9 @@ help:
 	@echo "  make test-desktop [SUITE=testsuites/xxx.testsuite.md]"
 	@echo "                     Run repo/build-grounded desktop tests via Appium"
 	@echo "  make test-mobile  [SUITE=testsuites/xxx.testsuite.md]"
-	@echo "                     Run detailed IJustPaid tests using repo + APK"
+	@echo "                     Run repo/build-grounded mobile tests via Appium"
 	@echo ""
 	@echo "  make test          Same as test-web"
-	@echo "  make test-robot    Run legacy Robot Framework tests"
-	@echo ""
 	@echo "  make down          Stop infrastructure"
 	@echo "  make clean         Full cleanup"
 	@echo ""

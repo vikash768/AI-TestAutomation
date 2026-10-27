@@ -15,6 +15,7 @@ each containing a sequence of deterministic Action steps.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -31,7 +32,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from google import genai
 from google.genai import types
 
-from automation.actions.schema import (
+from automation.executors.schema import (
     Action,
     ActionType,
     Locator,
@@ -224,10 +225,19 @@ class TestGenerator:
             logger.warning("No GEMINI_API_KEY found, falling back to mock generators.")
 
         self._cache_dir = Path("artifacts/cache")
-        suite_id = "trackpilot" if "trackpilot" in (self._base_url or "").lower() else (self._target_type or "suite")
-        # Use a new cache namespace so pre-hardening cache files, which may
-        # contain resolved credentials, are never loaded by hardened code.
-        self._cache_file = self._cache_dir / f"test_generator_safe_v2_{self._target_type}_{suite_id}.json"
+        # Scope cache entries to the inspected project and exact source/build
+        # context. A different app must never reuse another app's action plan.
+        identity = json.dumps({
+            "target": self._target_type,
+            "platform": self._appium_platform,
+            "base_url": self._base_url,
+            "repo_url": self._codebase_context.get("repo_url", ""),
+            "source_commit": self._codebase_context.get("source_commit", ""),
+            "build_sha256": self._codebase_context.get("build", {}).get("sha256", ""),
+            "summary": self._codebase_context.get("summary_prompt", ""),
+        }, sort_keys=True)
+        cache_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+        self._cache_file = self._cache_dir / f"test_generator_safe_v3_{self._target_type}_{cache_id}.json"
         self._cache: dict[str, Any] = self._load_cache()
 
     def _load_cache(self) -> dict[str, Any]:
@@ -402,8 +412,16 @@ class TestGenerator:
         cases = []
 
         # Check persistent cache first
-        cache_key = f"{page.page_name}::{category.category_id}::{len(category.instructions)}"
-        if cache_key in self._cache:
+        category_identity = json.dumps({
+            "page": page.page_name,
+            "url_pattern": page.url_pattern,
+            "category_id": category.category_id,
+            "category": category.category_name,
+            "description": category.description,
+            "instructions": [instruction.instruction for instruction in category.instructions],
+        }, sort_keys=True)
+        cache_key = hashlib.sha256(category_identity.encode("utf-8")).hexdigest()
+        if not self._require_full_coverage and cache_key in self._cache:
             try:
                 cached_data = self._cache[cache_key]
                 if isinstance(cached_data, list) and len(cached_data) >= len(category.instructions):
@@ -494,24 +512,55 @@ class TestGenerator:
         category: TestCategory,
         cases: list[TestCase],
     ) -> list[TestCase]:
-        """Guarantee at least one executable test for every Markdown instruction."""
+        """Map one executable, verifiable case to each Markdown instruction."""
         required = len(category.instructions)
         if required == 0:
-            return cases
+            return []
 
-        covered_cases = [
-            case for case in cases
-            if case.steps and any(
+        def is_executable(case: TestCase) -> bool:
+            meaningful = case.steps and any(
                 step.action_type not in {ActionType.NAVIGATE, ActionType.SLEEP}
                 for step in case.steps
             )
-        ]
-        missing_start = min(len(covered_cases), required)
-        missing_instructions = category.instructions[missing_start:]
+            if not meaningful:
+                return False
+            if not self._require_full_coverage:
+                return True
+            return any(
+                step.action_type.name.startswith("VERIFY_")
+                or step.action_type in {
+                    ActionType.WAIT_VISIBLE, ActionType.WAIT_NOT_VISIBLE,
+                    ActionType.WAIT_URL_CONTAINS, ActionType.WAIT_URL_NOT_CONTAINS,
+                }
+                for step in case.steps
+            )
+
+        covered: list[TestCase | None] = [None] * required
+        unindexed: list[TestCase] = []
+        for case in cases:
+            if not is_executable(case):
+                continue
+            metadata = case.test_data if isinstance(case.test_data, dict) else {}
+            raw_index = str(metadata.get("source_instruction_index", ""))
+            if raw_index.isdigit():
+                index = int(raw_index) - 1
+                if 0 <= index < required and covered[index] is None:
+                    covered[index] = case
+            else:
+                unindexed.append(case)
+
+        for case in unindexed:
+            slot = next((i for i, value in enumerate(covered) if value is None), None)
+            if slot is None:
+                break
+            covered[slot] = case
+
+        missing_slots = [index for index, value in enumerate(covered) if value is None]
+        missing_instructions = [category.instructions[index] for index in missing_slots]
 
         # One bounded repair request asks the model only for instructions it
         # omitted from the original category response.
-        if missing_instructions and self._client:
+        if missing_slots and self._client:
             repair_category = TestCategory(
                 category_id=category.category_id,
                 category_name=f"{category.category_name} — Remaining Coverage",
@@ -522,8 +571,24 @@ class TestGenerator:
                 instructions=missing_instructions,
             )
             try:
-                repair_cases = self._generate_with_ai(page, repair_category)
-                covered_cases.extend(repair_cases[:len(missing_instructions)])
+                repair_cases = [
+                    self._sanitize_test_case(case)
+                    for case in self._generate_with_ai(page, repair_category)
+                ]
+                for case in repair_cases:
+                    if not is_executable(case):
+                        continue
+                    metadata = case.test_data if isinstance(case.test_data, dict) else {}
+                    raw_index = str(metadata.get("source_instruction_index", ""))
+                    local_index = int(raw_index) - 1 if raw_index.isdigit() else -1
+                    if 0 <= local_index < len(missing_slots):
+                        slot = missing_slots[local_index]
+                    elif local_index in missing_slots:
+                        slot = local_index
+                    else:
+                        slot = next((i for i in missing_slots if covered[i] is None), None)
+                    if slot is not None and covered[slot] is None:
+                        covered[slot] = case
             except Exception as exc:
                 logger.warning(
                     "Coverage repair failed for %s / %s: %s",
@@ -532,24 +597,34 @@ class TestGenerator:
                     exc,
                 )
 
-        if len(covered_cases) < required and self._require_full_coverage:
+        missing_slots = [index for index, value in enumerate(covered) if value is None]
+        if missing_slots and self._require_full_coverage:
             raise RuntimeError(
                 f"Full Markdown coverage required for {page.page_name} / "
-                f"{category.category_name}, but only {len(covered_cases)} of "
-                f"{required} executable instruction tests were generated."
+                f"{category.category_name}, but only {required - len(missing_slots)} of "
+                f"{required} instructions have executable assertions "
+                f"(missing: {', '.join(str(index + 1) for index in missing_slots)})."
             )
 
         # Deterministic instruction cases are the final safety net. This keeps
         # suite coverage complete even if the AI response is short or invalid.
-        if len(covered_cases) < required:
-            remaining = category.instructions[len(covered_cases):]
+        if missing_slots:
+            remaining = [category.instructions[index] for index in missing_slots]
             fallback_category = TestCategory(
                 category_id=category.category_id,
                 category_name=category.category_name,
                 description=category.description,
                 instructions=remaining,
             )
-            covered_cases.extend(self._gen_from_instructions(page, fallback_category))
+            for slot, case in zip(missing_slots, self._gen_from_instructions(page, fallback_category)):
+                covered[slot] = case
+
+        if any(case is None for case in covered):
+            raise RuntimeError(
+                f"Coverage invariant failed for {page.page_name} / {category.category_name}"
+            )
+
+        covered_cases = [case for case in covered if case is not None]
 
         slug = re.sub(
             r"[^A-Z0-9]+",
@@ -558,32 +633,13 @@ class TestGenerator:
         ).strip("-")
         for index, case in enumerate(covered_cases, 1):
             case.test_id = f"TC-{self._target_type.upper()}-{slug}-{index:03d}"
-            if index <= required:
-                instruction = category.instructions[index - 1].instruction
-                case.test_data["source_instruction_index"] = str(index)
-                case.test_data["source_instruction"] = instruction
-                if "md-coverage" not in case.tags:
-                    case.tags.append("md-coverage")
-
-        if len(covered_cases) < required:
-            raise RuntimeError(
-                f"Coverage invariant failed for {page.page_name} / {category.category_name}: "
-                f"{len(covered_cases)} tests for {required} instructions"
-            )
-
-        # The contract is one test per Markdown instruction. Models sometimes
-        # return bonus/duplicate cases even when asked for an exact count; do
-        # not let those make a full run larger or less deterministic.
-        if len(covered_cases) > required:
-            logger.warning(
-                "Ignoring %d extra generated test(s) for %s / %s; "
-                "the Markdown defines exactly %d instruction(s).",
-                len(covered_cases) - required,
-                page.page_name,
-                category.category_name,
-                required,
-            )
-            covered_cases = covered_cases[:required]
+            if not isinstance(case.test_data, dict):
+                case.test_data = {}
+            instruction = category.instructions[index - 1].instruction
+            case.test_data["source_instruction_index"] = str(index)
+            case.test_data["source_instruction"] = instruction
+            if "md-coverage" not in case.tags:
+                case.tags.append("md-coverage")
 
         logger.info(
             "Coverage: %s / %s — %d/%d instructions have executable tests",
@@ -597,13 +653,17 @@ class TestGenerator:
     def _generate_with_ai(self, page: PageContext, category: TestCategory) -> list[TestCase]:
         # Build target-type-aware context for the AI prompt
         if self._target_type == "web":
-            target_context = f"""Target Platform: Web Browser
-Application Base URL: {self._base_url}
-Use browser-based actions: NAVIGATE, VERIFY_URL, EXECUTE_JS, CLICK, TYPE, CLEAR, VERIFY_TEXT, VERIFY_VISIBLE, WAIT_VISIBLE, WAIT_URL_CONTAINS, etc.
-TrackPilot Admin Web Application details:
+            web_hints = ""
+            if "trackpilot" in self._base_url.lower():
+                web_hints = """TrackPilot Admin Web Application details:
 - Base routes: /login, /dashboard, /users, /live, /history, /screenshots, /projects, /reports, /settings, /audit, /profile
 - Login page: email input id="email", password input id="password", submit button css="button[type='submit']"
 - Main Navigation: sidebar items with text "Dashboard", "Users", "Live Activity", "Time History", "Screenshots", "Projects & Tasks", "Reports", "Settings", "Audit Logs", "Profile", "Log out"
+"""
+            target_context = f"""Target Platform: Web Browser
+Application Base URL: {self._base_url}
+Use browser-based actions: NAVIGATE, VERIFY_URL, EXECUTE_JS, CLICK, TYPE, CLEAR, VERIFY_TEXT, VERIFY_VISIBLE, WAIT_VISIBLE, WAIT_URL_CONTAINS, etc.
+{web_hints}
 - For locators, prefer id, css, xpath, name, text, tag_name, or class_name.
 """
             available_actions = ", ".join(
@@ -616,15 +676,12 @@ TrackPilot Admin Web Application details:
 IMPORTANT: This is a NATIVE application. Do NOT generate NAVIGATE, VERIFY_URL, EXECUTE_JS, RELOAD_PAGE, GO_BACK, GET_CONSOLE_ERRORS, OPEN_BROWSER, CLOSE_BROWSER, or SET_WINDOW_SIZE actions.
 Use native-compatible actions: CLICK, TAP, TYPE, CLEAR, VERIFY_TEXT, VERIFY_VISIBLE, WAIT_VISIBLE, SWIPE, SCROLL, PRESS_KEY, SLEEP.
 For locators on native mobile apps:
-- For the "Sign In" submit button at the bottom: Use xpath "(//android.view.ViewGroup[@content-desc='Sign In'])[last()]"
-- For the "Sign In" navigation tab at the top: Use xpath "(//android.view.ViewGroup[@content-desc='Sign In'])[1]"
-- For the "Sign Up" tab at the top: Use accessibility_id "Sign Up" or xpath "//*[@content-desc='Sign Up']"
-- For bottom navigation tabs (Home, Search, Messages, Profile): Use accessibility_id "Home", "Search", "Messages", "Profile" or xpath "//*[@content-desc='Home']" etc.
-- For the center "+" create button in bottom nav: Use xpath "//android.view.ViewGroup[contains(@bounds, '1392') and @clickable='true']"
+- Prefer accessibility_id (content-desc) locators taken from the repository/build context; fall back to text-based xpath such as "//*[@content-desc='Label' or @text='Label']".
+- For bottom navigation tabs: Use accessibility_id with the tab label, or xpath "//*[@content-desc='<Tab Label>']".
 - For dismissing modals or going back: Use PRESS_KEY with value "BACK"
 - For input fields: Use xpath "//android.widget.EditText[1]" for email, and "//android.widget.EditText[2]" for password.
 - Use the credentials: Email "{self._email}", Password "{self._password}".
-- On Android, styled text headers are split into separate TextViews; always verify individual words or child options like "General Account" or "Regular Post", not long multi-word headers.
+- On Android, styled text headers are split into separate TextViews; always verify individual words or short child labels, not long multi-word headers.
 Do NOT assume a URL exists or use web URLs. The app is already launched and active on screen.
 """
             available_actions = ", ".join(
@@ -679,6 +736,7 @@ Coverage contract:
 - Return exactly {len(category.instructions)} test-case objects: one object per numbered instruction, in the same order.
 - Do not combine instructions and do not omit an instruction.
 - Each test must execute and verify the behavior named by its instruction; navigation plus SLEEP alone is not a valid test.
+- Every test must include a VERIFY_* or WAIT_VISIBLE/WAIT_NOT_VISIBLE assertion after its interaction; LAUNCH_APP or ACTIVATE_APP alone is not a verification.
 - In each object's test_data, include "source_instruction_index" and "source_instruction" for the matching numbered instruction.
 Each object must have exactly these keys:
 - "test_id": string (use format TC-TP-{page.page_name.upper().replace(' ', '')}-{category.category_name.upper().replace(' ', '')[:4]}-00X)
@@ -1551,28 +1609,13 @@ Guidelines:
         if is_verify:
             target = self._resolve_instruction_value(quotes[0]) if quotes else ""
             if target:
-                if "which account" in target.lower() or "want to create" in target.lower():
-                    loc = Locator(
-                        LocatorStrategy.XPATH,
-                        "//*[contains(@content-desc, 'Which Account') or contains(@text, 'Which Account') or contains(@text, 'Want To Create') or contains(@content-desc, 'Want To Create')]"
-                    )
-                elif "what type" in target.lower() or "post you want to create" in target.lower():
-                    loc = Locator(
-                        LocatorStrategy.XPATH,
-                        "//*[contains(@content-desc, 'What Type') or contains(@text, 'What Type') or contains(@text, 'Post You Want') or contains(@content-desc, 'Post You Want')]"
-                    )
-                elif "search here" in target.lower():
+                if "search here" in target.lower():
                     loc = Locator(
                         LocatorStrategy.XPATH,
                         "//android.widget.EditText[contains(@text, 'Search') or contains(@content-desc, 'Search') or @text='Search Here'] | //android.widget.EditText"
                     )
                 elif "sign in" in target.lower() and "button" in lower:
                     loc = Locator(LocatorStrategy.XPATH, "(//android.view.ViewGroup[@content-desc='Sign In'])[last()]")
-                elif "justpaid" in target.lower():
-                    loc = Locator(
-                        LocatorStrategy.XPATH,
-                        "//*[contains(@text, 'justpaid') or contains(@content-desc, 'justpaid') or contains(@text, 'ljustpaid') or contains(@text, 'Ijustpaid')]"
-                    )
                 elif target in ("Home", "Search", "Messages", "Profile") and ("tab" in lower or "nav" in lower or "bar" in lower):
                     loc = Locator(
                         LocatorStrategy.XPATH,
@@ -1603,12 +1646,6 @@ Guidelines:
             target = self._resolve_instruction_value(quotes[0]) if quotes else ""
             if "back" in lower or "dismiss" in lower:
                 actions.append(Action(ActionType.PRESS_KEY, "Press Back", value="BACK"))
-            elif "+" in lower or "+" in quotes or "create button" in lower:
-                loc = Locator(
-                    LocatorStrategy.XPATH,
-                    "//android.view.ViewGroup[contains(@bounds, '1392') and @clickable='true']"
-                )
-                actions.append(Action(ActionType.CLICK, "Tap Center + Button", locator=loc))
             elif target in ("Home", "Search", "Messages", "Profile"):
                 loc = Locator(
                     LocatorStrategy.XPATH,
@@ -1641,7 +1678,7 @@ Guidelines:
                     loc = Locator(LocatorStrategy.XPATH, "//*[@content-desc='Remember Me' or @text='Remember Me']")
                     actions.append(Action(ActionType.CLICK, "Tap Remember Me", locator=loc))
                 elif "visibility" in lower or "toggle" in lower:
-                    loc = Locator(LocatorStrategy.XPATH, "//android.widget.EditText[@password='true']/..//com.horcrux.svg.SvgView | //*[@content-desc='eye' or contains(@content-desc, 'password')]")
+                    loc = Locator(LocatorStrategy.XPATH, "//*[@content-desc='eye' or contains(@content-desc, 'password')]")
                     actions.append(Action(ActionType.CLICK, "Toggle Password Visibility", locator=loc))
                 else:
                     actions.append(Action(ActionType.SLEEP, f"Process: {text}", value="2"))
