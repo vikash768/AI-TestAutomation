@@ -15,7 +15,7 @@ import contextlib
 import re
 from collections import Counter
 
-from qaplatform.execute.smoke import ComponentRecord, FindingRecord, SmokeRunner, TestRecord, fingerprint
+from qaplatform.execute.smoke import ComponentRecord, FindingRecord, SmokeRunner, TestRecord, fingerprint, load_url
 from qaplatform.explore.crawler import ObservedPage
 from qaplatform.explore.scripts import FEEDBACK_JS, PAGE_STATE_JS
 from qaplatform.ingest.js_parser import CodeElement
@@ -48,7 +48,7 @@ def run_faults(runner: SmokeRunner, pages: list[ObservedPage], components: list[
             events("faults", f"Failing {p.route}'s data requests ({i}/{len(pages)})", 89)
             own = targets[p.route]
             # baseline
-            ok, why = runner.prepare(p.url)
+            ok, why = runner.prepare(p.url, p.reveal)
             if not ok:
                 tests.append(TestRecord(test_key=f"fault-502|{p.route}", name=f"{p.route} handles a failing backend", technique="fault-injection", category="stability", route=p.route,
                                         expected="Error state", observed=why, status="blocked"))
@@ -74,7 +74,7 @@ def run_faults(runner: SmokeRunner, pages: list[ObservedPage], components: list[
                 guard.injection = lambda r, q, m=mode: only_own(r, q, m)
                 guard.injected.clear()
                 runner.mon.reset()
-                ok, why = runner.prepare(p.url)
+                ok, why = runner.prepare(p.url, p.reveal)
                 page.wait_for_timeout(2000)
                 fb = page.evaluate(FEEDBACK_JS)
                 st = page.evaluate(PAGE_STATE_JS)
@@ -146,15 +146,22 @@ def run_faults(runner: SmokeRunner, pages: list[ObservedPage], components: list[
             if not base["empties"]:
                 guard.injection = lambda r, q: only_own(r, q, "hold")
                 guard.injected.clear()
+                tab_ok = False
                 with contextlib.suppress(Exception):
-                    page.goto(p.url, wait_until="domcontentloaded")
+                    page.goto(load_url(p.url, p.reveal), wait_until="domcontentloaded")
+                    for step in p.reveal:  # reopen the tab while its data request is held
+                        loc = runner.locate(step.get("selector"), step.get("role"), step.get("name"))
+                        if loc is None:
+                            raise RuntimeError(f"tab '{step.get('name')}' not found")
+                        loc.click(timeout=runner.settings.action_timeout_ms)
+                    tab_ok = True  # the screen under test really is open (the default screen fetches the same data)
                 page.wait_for_timeout(1800)
                 fb = page.evaluate(FEEDBACK_JS)
                 held = len(guard.held)
                 guard.clear_injection()
                 page.wait_for_timeout(runner.settings.settle_ms)
                 runner._dirty = True
-                if held:
+                if held and tab_ok:
                     false_empty = [x for x in fb["empties"] if x not in base["empties"]]
                     t3 = TestRecord(test_key=f"fault-slow|{p.route}", name=f"{p.route} while its data is still loading", technique="fault-injection", category="ux", route=p.route,
                                     expected="A loading state, never a claim that there is no data", observed=(f"said {false_empty[0]!r} while loading" if false_empty else ("loading indicator shown" if fb["loading"] else "no loading indicator, no false empty state")),

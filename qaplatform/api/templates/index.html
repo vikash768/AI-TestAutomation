@@ -16,7 +16,46 @@
 <label><input type="checkbox" name="llm_intent" value="true" checked> Summarise page intent with the LLM (source code only; credentials never leave this machine)</label>
 <label><input type="checkbox" name="phase2" value="true" checked> Interaction tests: menus, drawers, tabs, forms, validation, persistence, timers, failure handling</label>
 <label><input type="checkbox" name="unit" value="true"> Run the codebase's own unit tests (executes repo test command)</label>
-<label><input type="checkbox" name="load" value="true"> Bounded load probe (read-only, hard-capped; only for targets you are authorised to load-test)</label>
+<label><input type="checkbox" id="load" name="load" value="true"> Load test (read-only, hard-capped; only for targets you are authorised to load-test)</label>
+<div id="load-opts" hidden style="border-left:3px solid var(--accent);margin:6px 0 4px 6px;padding:2px 0 8px 14px">
+<p style="font-size:13px;color:var(--muted);margin:6px 0">Sends read-only GET traffic to the API endpoints the app itself calls (seen while exploring), signed in as the test account when one is given. Users ramp up 1 → N in stages so you can see where response times start to climb. The server hard-caps users, duration and total requests (<code>LOAD_MAX_*</code> settings) whatever you enter here, and the test stops on its own if errors climb.</p>
+<p style="margin:6px 0"><b>What to measure</b><br>
+<label style="display:inline"><input type="radio" name="load_mode" value="ramp" checked> Check it holds a load — ramp 1 → N users</label><br>
+<label style="display:inline"><input type="radio" name="load_mode" value="capacity"> Find the breaking point — step up users until it fails, then stop</label></p>
+<div class="grid" id="load-capacity">
+<div><label for="load_max_users">Maximum users to try</label><input type="number" id="load_max_users" name="load_max_users" value="{{ load_caps.capacity_users }}" min="1" max="{{ load_caps.capacity_users }}" step="1"></div>
+<div><label for="load_step_seconds">Seconds per step</label><input type="number" id="load_step_seconds" name="load_step_seconds" value="15" min="5" max="60" step="1"></div>
+<div><label for="load_expected_users">Users it must handle (optional)</label><input type="number" id="load_expected_users" name="load_expected_users" value="" min="0" max="{{ load_caps.capacity_users }}" step="1" placeholder="e.g. 25"></div>
+<div style="grid-column:1/-1"><small>Steps 1, 2, 5, 10, 15, 20, 30, 40, 50 … users. A step fails when more than 5% of requests error, p95 passes your target, or adding users stops adding throughput. The test stops at that step and reports it, with p50/p95 for every step. Up to <b>{{ load_caps.capacity_users }}</b> users and <b>{{ load_caps.capacity_requests }}</b> requests (<code>CAPACITY_MAX_USERS</code>, <code>CAPACITY_MAX_REQUESTS</code> in <code>.env</code>; ceilings 500 / 100000).</small></div>
+</div>
+<div class="grid" id="load-ramp">
+<div><label for="load_users">Peak virtual users</label><input type="number" id="load_users" name="load_users" value="{{ [10, load_caps.users] | min }}" min="1" max="{{ load_caps.users }}" step="1"></div>
+<div><label for="load_seconds">Duration (seconds)</label><input type="number" id="load_seconds" name="load_seconds" value="{{ [60, load_caps.seconds] | min }}" min="{{ [10, load_caps.seconds] | min }}" max="{{ load_caps.seconds }}" step="1"></div>
+<div style="grid-column:1/-1"><small>This server allows at most <b>{{ load_caps.users }}</b> users, <b>{{ load_caps.seconds }}</b> s and <b>{{ load_caps.requests }}</b> requests per load test (set by <code>LOAD_MAX_CONCURRENCY</code>, <code>LOAD_MAX_SECONDS</code>, <code>LOAD_MAX_REQUESTS</code> in <code>.env</code>; hard ceilings 50 / 120 s / 2000).</small></div>
+</div>
+<div class="grid"><div><label for="load_p95_ms">Target p95 response time (ms)</label><input type="number" id="load_p95_ms" name="load_p95_ms" value="2000" min="200" max="30000" step="50"></div></div>
+<label><input type="checkbox" id="load_authorized" name="load_authorized" value="true"> I am authorised to load-test this site (a breaking-point test deliberately pushes it until responses degrade)</label>
+</div>
+<script>
+(function(){
+  const box = document.getElementById("load"), opts = document.getElementById("load-opts");
+  // Disabled while hidden so stale or out-of-range values can't block a run that has no load test.
+  function sync(){
+    const cap = (document.querySelector('input[name=load_mode]:checked') || {}).value === "capacity";
+    opts.hidden = !box.checked;
+    document.getElementById("load-capacity").hidden = !cap;
+    document.getElementById("load-ramp").hidden = cap;
+    opts.querySelectorAll("input").forEach(i => {
+      const inHidden = i.closest("#load-capacity") ? !cap : (i.closest("#load-ramp") ? cap : false);
+      i.disabled = !box.checked || inHidden;
+    });
+    document.getElementById("load_authorized").required = box.checked;
+  }
+  box.addEventListener("change", sync);
+  document.querySelectorAll('input[name=load_mode]').forEach(r => r.addEventListener("change", sync));
+  sync();
+})();
+</script>
 <label><input type="checkbox" name="provision" value="true"> Create demo records and test delete / disable / reset on them (performs REAL creates and deletes on disposable data it makes, then cleans up — only for targets you authorise)</label>
 <details style="margin-top:12px">
 <summary style="cursor:pointer;font-weight:600;color:var(--accent)">How to create a read-only GitHub token for a private repo</summary>

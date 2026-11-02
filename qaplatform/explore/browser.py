@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import contextlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,9 @@ class Monitor:
     dialogs: list[dict] = field(default_factory=list)
     crashed: bool = False
     requests_seen: int = 0
+    # Native confirm() is dismissed by default (nothing is ever confirmed by accident). The
+    # provision module sets this only around the Delete click on its own demo record.
+    accept_confirm: bool = False
 
     def reset(self) -> None:
         self.console_errors.clear()
@@ -93,7 +97,11 @@ def attach_monitor(page: Page) -> Monitor:
     def on_dialog(dialog):
         mon.dialogs.append({"type": dialog.type, "message": dialog.message[:200]})
         try:
-            dialog.dismiss()
+            if mon.accept_confirm and dialog.type == "confirm":
+                mon.accept_confirm = False  # one confirmation only
+                dialog.accept()
+            else:
+                dialog.dismiss()
         except Exception:
             pass
 
@@ -117,6 +125,9 @@ class LoginResult:
     error: str = ""
     storage_state_path: str = ""
     login_url: str = ""
+    rate_limited: bool = False
+    retry_after: int = 0
+    server_error: int = 0
 
 
 class BrowserSession:
@@ -173,6 +184,27 @@ def goto(page: Page, url: str, settings: Settings):
     return resp
 
 
+AUTH_TOKENS_JS = """() => { try {
+  // Only values that hold a real credential: a JWT anywhere in the value (also inside a persisted
+  // JSON store), or a long opaque string. A store that merely records {"token":null,"error":...}
+  // or an attempt counter is not a session.
+  const JWT = /[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}/;
+  const OPAQUE = /^(Bearer )?[A-Za-z0-9_\\-+=\\/.]{24,}$/;
+  return Object.keys(localStorage).filter(k => /token|session|auth|jwt/i.test(k)).map(k => {
+    const v = localStorage.getItem(k) || '';
+    const m = v.match(JWT);
+    return m ? k + '=' + m[0] : (OPAQUE.test(v) ? k + '=' + v : null);
+  }).filter(Boolean);
+} catch (e) { return []; } }"""
+
+
+def _auth_tokens(page) -> set:
+    try:
+        return set(page.evaluate(AUTH_TOKENS_JS))
+    except Exception:
+        return set()
+
+
 def login(context: BrowserContext, live_url: str, email: str, password: str, settings: Settings, run_dir: Path, login_path: str = "/login", save_state: bool = True) -> LoginResult:
     page = context.new_page()
     page.set_default_timeout(settings.action_timeout_ms)
@@ -191,8 +223,20 @@ def login(context: BrowserContext, live_url: str, email: str, password: str, set
         email_box = page.locator(email_sel).first
         pass_box = page.locator(pass_sel).first
         email_box.wait_for(state="visible", timeout=settings.nav_timeout_ms)
-        rate_limited = {"hit": False}
-        page.on("response", lambda r: rate_limited.__setitem__("hit", True) if r.status == 429 and "login" in r.url.lower() else None)
+        rate_limited = {"hit": False, "retry_after": 0, "answered": False, "server_error": 0}
+
+        def _on_resp(r):
+            if r.request.method != "GET" and re.search(r"login|signin|sign-in|auth|session|token", r.url, re.I):
+                rate_limited["answered"] = True  # the sign-in request has come back (accepted or not)
+                if r.status >= 500:
+                    rate_limited["server_error"] = r.status
+            if r.status == 429 and re.search(r"login|signin|auth", r.url, re.I):
+                rate_limited["hit"] = True
+                with contextlib.suppress(Exception):
+                    rate_limited["retry_after"] = int(r.headers.get("retry-after") or 0)
+        page.on("response", _on_resp)
+        start_path = urlparse(page.url).path
+        tokens_before = _auth_tokens(page)
         email_box.fill(email)
         pass_box.fill(password)
         submit = page.locator("button[type=submit], input[type=submit]").first
@@ -208,17 +252,29 @@ def login(context: BrowserContext, live_url: str, email: str, password: str, set
         # from /login; a router-less SPA keeps the URL but drops the password field and
         # usually stores an auth token. Treat any of these as signed in.
         def _signed_in() -> bool:
-            if "/login" not in urlparse(page.url).path and "/signin" not in urlparse(page.url).path:
+            # Left the sign-in page (when it has its own path), a NEW auth token, or the
+            # password field gone and staying gone. A sign-in screen served at "/" keeps the
+            # path, so the path alone never counts there.
+            path = urlparse(page.url).path
+            if (path.rstrip("/") or "/") != (start_path.rstrip("/") or "/") and not re.search(r"/(login|signin|sign-in)(/|$)", path, re.I):
                 return True
+            if _auth_tokens(page) - tokens_before:
+                return True
+            # The password field going away counts only once the sign-in request has answered (a
+            # spinner can hide the form while it is in flight) and only if it stays away, or the
+            # app's navigation shell has appeared.
+            def pw_gone() -> bool:
+                return page.locator(pass_sel).count() == 0 or not page.locator(pass_sel).first.is_visible()
             try:
-                if page.locator(pass_sel).count() == 0 or not page.locator(pass_sel).first.is_visible():
-                    return True
+                if pw_gone():
+                    if page.locator("nav, aside, [role=navigation]").count() and page.locator("nav, aside, [role=navigation]").first.is_visible():
+                        return True
+                    if rate_limited["answered"]:
+                        page.wait_for_timeout(1500)
+                        return pw_gone()
             except Exception:
                 pass
-            try:
-                return bool(page.evaluate("() => { try { return Object.keys(localStorage).some(k => /token|session|auth|jwt/i.test(k) && (localStorage.getItem(k) || '').length > 10); } catch (e) { return false; } }"))
-            except Exception:
-                return False
+            return False
         ok = False
         for _ in range(int(settings.nav_timeout_ms / 500) + 1):
             if _signed_in():
@@ -228,7 +284,14 @@ def login(context: BrowserContext, live_url: str, email: str, password: str, set
         if not ok:
             if rate_limited["hit"]:
                 page.close()
-                return LoginResult(False, login_url, "login rate-limited by the server (HTTP 429, 'too many attempts'). The app enforces a login cooldown; wait and retry.", login_url=login_url)
+                res = LoginResult(False, login_url, "login rate-limited by the server (HTTP 429, 'too many attempts'). The app enforces a login cooldown; wait and retry.", login_url=login_url)
+                res.rate_limited, res.retry_after = True, rate_limited["retry_after"]
+                return res
+            if rate_limited["server_error"]:
+                page.close()
+                res = LoginResult(False, login_url, f"the site's sign-in endpoint answered HTTP {rate_limited['server_error']} (server error) — the app's backend is failing, not the credentials", login_url=login_url)
+                res.server_error = rate_limited["server_error"]
+                return res
             alert = page.locator("[role=alert]").first
             msg = alert.inner_text()[:200] if alert.count() and alert.is_visible() else "no sign of a session after submit (URL unchanged, password field still shown, no token stored)"
             page.close()
@@ -251,3 +314,29 @@ def login(context: BrowserContext, live_url: str, email: str, password: str, set
         except Exception:
             pass
         return LoginResult(False, login_url, f"login error: {type(exc).__name__}: {str(exc)[:200]}", login_url=login_url)
+
+
+QUIET_JS = """() => {
+  const vis = (el) => { const r = el.getBoundingClientRect(); const cs = getComputedStyle(el); return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none'; };
+  const busy = Array.from(document.querySelectorAll('[aria-busy="true"], [role=progressbar], [class*="spinner" i], [class*="skeleton" i], [class*="loader" i]')).some(vis)
+    || Array.from(document.querySelectorAll('button, span, p, td, div')).some((el) => el.children.length === 0 && vis(el) && /^(loading|loading\\.\\.\\.|loading…|please wait)$/i.test((el.innerText || '').trim()));
+  return { busy, resources: performance.getEntriesByType('resource').length };
+}"""
+
+
+def wait_for_data(page, max_ms: int = 6000) -> None:
+    """After an in-page navigation (a tab click), wait until the screen's data has arrived:
+    no loading indicator and no new network resource for two consecutive polls."""
+    import time as _t
+    deadline = _t.time() + max_ms / 1000
+    last, stable = -1, 0
+    while _t.time() < deadline:
+        try:
+            st = page.evaluate(QUIET_JS)
+        except Exception:
+            return
+        stable = stable + 1 if (not st["busy"] and st["resources"] == last) else 0
+        if stable >= 2:
+            return
+        last = st["resources"]
+        page.wait_for_timeout(300)

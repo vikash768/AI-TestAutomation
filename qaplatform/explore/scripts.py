@@ -113,6 +113,7 @@ COLLECT_INTERACTIVE_JS = r"""
       name: nameOf(el),
       tag,
       type: el.getAttribute('type') || null,
+      placeholder: el.getAttribute('placeholder') || null,
       href,
       id: el.id || null,
       testid: el.getAttribute('data-testid'),
@@ -214,6 +215,10 @@ LAYOUT_CHECK_JS = r"""
     const cs = getComputedStyle(el);
     if (cs.overflow !== 'hidden' && cs.overflowX !== 'hidden') continue;
     if (cs.textOverflow === 'ellipsis') continue;
+    // Screen-reader-only text (".visually-hidden" / ".sr-only": a 1px box clipped to nothing) is
+    // hidden on purpose, not cut off by a layout bug.
+    const r = el.getBoundingClientRect();
+    if (r.width <= 2 || r.height <= 2 || /rect\(0(px)?,? 0(px)?,? 0(px)?,? 0(px)?\)/.test(cs.clip) || /inset\(50%\)/.test(cs.clipPath)) continue;
     if (el.scrollWidth > el.clientWidth + 2 && el.clientWidth > 0 && (el.innerText || '').trim().length > 0 && el.children.length === 0) {
       clipped.push(desc(el));
     }
@@ -298,11 +303,16 @@ _VIS = r"""
 """
 
 FEEDBACK_JS = "() => {" + _VIS + r"""
-  const ERR = /(error|went wrong|could not|couldn't|cannot|can't|unable|failed|failure|unavailable|try again|problem|not reach|offline|timed out|timeout)/i;
+  const ERR = /\b(error|went wrong|could not|couldn't|cannot|can't|unable|failed|failure|unavailable|try again|problem|not reach|offline|timed out|timeout)/i;
+  // Words that are errors only in a message about the user's input ("Invalid email or password"),
+  // not as data ("Invalid Date", a "Locked" status badge): counted only inside a form, dialog or alert.
+  const INPUT_ERR = /\b(invalid|incorrect|wrong|denied|does ?n[o']t match|not valid|unauthori[sz]ed|forbidden|too many attempts|must be|is required)\b/i;
+  const DATA_TEXT = /^(invalid date|nan|locked|denied|forbidden)$/i;
   const OK = /\b(saved|success|successfully|created|updated|added|removed|deleted|changes applied)\b/i;
   const LOAD = /^(loading|loading\.\.\.|loading…|please wait|fetching|saving…|saving\.\.\.)$/i;
   const EMPTY = /(\bno [a-z ]{0,30}(yet|found|available|to show|recorded|data|results|entries|records|members|projects|screenshots|items|activity|logs)\b|nothing (to show|here|yet)|is empty|\b0 results\b)/i;
   const leaves = [];
+  const inputErrs = [];
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   while (walker.nextNode()) {
     const t = clean(walker.currentNode.textContent);
@@ -310,8 +320,9 @@ FEEDBACK_JS = "() => {" + _VIS + r"""
     const el = walker.currentNode.parentElement;
     if (!el || el.closest('script,style,noscript,option,select') || !vis(el)) continue;
     leaves.push(t);
+    if (!DATA_TEXT.test(t) && INPUT_ERR.test(t) && el.closest('form,[role=alert],[role=dialog],[aria-live],[class*="error" i],[class*="invalid" i],[class*="toast" i]')) inputErrs.push(t);
   }
-  const alerts = Array.from(document.querySelectorAll('[role=alert],[role=status],[aria-live=assertive],[aria-live=polite]')).filter(vis).map((n) => clean(n.innerText)).filter(Boolean);
+  const alerts = Array.from(document.querySelectorAll('[role=alert],[role=status],[aria-live=assertive],[aria-live=polite],[class*="field-error" i],[class*="error-message" i],[class*="form-error" i],[class*="invalid-feedback" i],[class*="help-block" i].error')).filter(vis).map((n) => clean(n.innerText)).filter(Boolean);
   const toasts = [];
   for (const el of document.body.querySelectorAll('*')) {
     const cs = getComputedStyle(el);
@@ -327,7 +338,7 @@ FEEDBACK_JS = "() => {" + _VIS + r"""
   return {
     alerts: alerts.map((t) => t.slice(0, 200)),
     toasts: toasts.map((t) => t.slice(0, 200)),
-    errors: leaves.filter((t) => ERR.test(t)).map((t) => t.slice(0, 160)),
+    errors: Array.from(new Set(leaves.filter((t) => ERR.test(t)).concat(inputErrs))).map((t) => t.slice(0, 160)),
     successes: [...alerts, ...toasts].filter((t) => OK.test(t) && !ERR.test(t)).map((t) => t.slice(0, 160)),
     loading,
     empties: leaves.filter((t) => EMPTY.test(t)).map((t) => t.slice(0, 160)),
@@ -349,6 +360,7 @@ FORMS_JS = "() => {" + _VIS + r"""
         tag: el.tagName.toLowerCase(),
         type: (el.type || '').toLowerCase(),
         label: labelOf(el),
+        placeholder: el.getAttribute('placeholder') || '',
         required: !!el.required,
         min: el.getAttribute('min'),
         max: el.getAttribute('max'),
@@ -368,6 +380,7 @@ FORMS_JS = "() => {" + _VIS + r"""
       fields,
       submit: submit ? { selector: selectorFor(submit), name: nameOf(submit), disabled: !!submit.disabled } : null,
       text: clean(f.innerText).slice(0, 200),
+      heading: clean((f.querySelector('h1, h2, h3, h4, legend, [role=heading]') || {}).innerText || ''),
     };
   });
 }"""
@@ -431,9 +444,12 @@ NAV_CONTROLS_JS = "() => {" + _VIS + r"""
   const consider = (el) => {
     if (!vis(el) || seen.has(el)) return;
     seen.add(el);
+    // a menu/listbox trigger (avatar, dropdown) opens a popup, not a screen
+    const pop = (el.getAttribute('aria-haspopup') || '').toLowerCase();
+    if (pop && pop !== 'false') return;
     const label = clean(el.innerText || el.getAttribute('aria-label') || el.getAttribute('title'));
     if (!label || label.length > 40 || SKIP.test(label)) return;
-    out.push({ selector: selectorFor(el), label, role: el.getAttribute('role') || el.tagName.toLowerCase() });
+    out.push({ selector: selectorFor(el), label, role: el.getAttribute('role') || (el.tagName === 'A' ? 'link' : 'button') });
   };
   for (const c of containers)
     for (const el of c.querySelectorAll('button, a[href], [role=tab], [role=menuitem], [role=button]')) consider(el);
@@ -459,4 +475,60 @@ FIND_MARKED_JS = "(marker) => {" + _VIS + r"""
     text: clean(el.innerText).slice(0, 100),
     controls: Array.from(el.querySelectorAll('button, a[href], [role=button], [role=menuitem]')).filter(vis).map((b) => ({ selector: selectorFor(b), label: clean(b.innerText || b.getAttribute('aria-label')) })),
   }));
+}"""
+
+# Single-record containers that carry the provision marker. A container qualifies only if it
+# is one record (a row, list item or card that holds no other such record), never a wrapper
+# around a whole table, so a control found inside it can only belong to the demo record.
+_RECORD_SEL = "tr, li, [role=row], [role=listitem], [class*='card' i]"
+MARKED_ROWS_JS = "(marker) => {" + _VIS + r"""
+  const mk = (marker || '').toLowerCase();
+  if (!mk) return [];
+  const SEL = """ + repr(_RECORD_SEL) + r""";
+  const rows = Array.from(document.querySelectorAll(SEL)).filter((el) => vis(el)
+    && (el.innerText || '').toLowerCase().includes(mk) && !el.querySelector(SEL)
+    && !el.matches('form') && !el.closest('form') && !el.querySelector('form, textarea, input[type=file], input[type=text], input:not([type])'));
+  return rows.slice(0, 5).map((el) => ({
+    text: clean(el.innerText).slice(0, 160),
+    controls: Array.from(el.querySelectorAll('button, a[href], [role=button], [role=menuitem]')).filter(vis)
+      .map((b) => ({ label: clean(b.innerText || b.getAttribute('aria-label')) })).filter((c) => c.label),
+  }));
+}"""
+
+# Stamp the one control labelled `label` inside the one marked record, for an identity click.
+# Returns the nonce, or a reason string starting with '!' when it is not unambiguous.
+MARK_CONTROL_JS = "(args) => {" + _VIS + r"""
+  const mk = (args.marker || '').toLowerCase(), want = (args.label || '').toLowerCase().trim();
+  const SEL = """ + repr(_RECORD_SEL) + r""";
+  const rows = Array.from(document.querySelectorAll(SEL)).filter((el) => vis(el)
+    && (el.innerText || '').toLowerCase().includes(mk) && !el.querySelector(SEL)
+    && !el.matches('form') && !el.closest('form') && !el.querySelector('form, textarea, input[type=file], input[type=text], input:not([type])'));
+  if (rows.length !== 1) return '!' + rows.length + ' marked records';
+  const row = rows[0];
+  const hits = Array.from(row.querySelectorAll('button, a[href], [role=button], [role=menuitem]')).filter(vis)
+    .filter((b) => clean(b.innerText || b.getAttribute('aria-label')).toLowerCase() === want);
+  if (hits.length !== 1) return '!' + hits.length + " controls named '" + want + "' in the record";
+  document.querySelectorAll('[data-qaprobe-target]').forEach((e) => e.removeAttribute('data-qaprobe-target'));
+  const nonce = 'q' + Math.random().toString(36).slice(2, 10);
+  hits[0].setAttribute('data-qaprobe-target', nonce);
+  return nonce;
+}"""
+
+# Visible modal layers, to tell whether a click opened a confirmation.
+LAYER_COUNT_JS = "() => {" + _VIS + r"""
+  return Array.from(document.querySelectorAll('[role=dialog], [role=alertdialog], [aria-modal="true"], dialog[open], [class*="modal" i]')).filter(vis).length;
+}"""
+
+# Is a record list actually on screen (rendered, not loading, not an error state)? Absence of the
+# demo record only proves deletion when the list it would be in really rendered.
+LIST_READY_JS = "() => {" + _VIS + r"""
+  const err = Array.from(document.querySelectorAll('.error-text, [role=alert], [class*="error" i]')).filter(vis)
+    .find((e) => /error|failed|could not|unable|\b[45]\d\d\b/i.test(e.innerText || ''));
+  if (err) return { ok: false, why: 'error state: ' + clean(err.innerText).slice(0, 80) };
+  const busy = Array.from(document.querySelectorAll('[aria-busy="true"], [class*="spinner" i], [class*="skeleton" i]')).some(vis)
+    || Array.from(document.querySelectorAll('td, p, div, span')).some((e) => e.children.length === 0 && vis(e) && /^loading/i.test((e.innerText || '').trim()));
+  if (busy) return { ok: false, why: 'still loading' };
+  const rows = Array.from(document.querySelectorAll('tbody tr, [role=row], li')).filter(vis).length;
+  const empty = Array.from(document.querySelectorAll('[class*="empty" i], [class*="state" i]')).some(vis);
+  return { ok: rows > 0 || empty, why: rows || empty ? '' : 'no record list on screen', rows };
 }"""

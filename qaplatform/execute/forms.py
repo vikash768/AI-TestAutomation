@@ -12,6 +12,7 @@ That gives three oracles per form:
 from __future__ import annotations
 
 import contextlib
+from pathlib import Path
 import re
 import time
 from dataclasses import dataclass, field
@@ -19,7 +20,8 @@ from urllib.parse import urlparse
 
 from qaplatform.config import Settings
 from qaplatform.execute.guard import describe, matches_any
-from qaplatform.execute.smoke import ComponentRecord, FindingRecord, SmokeRunner, TestRecord, fingerprint
+from qaplatform.execute.reveal_rules import NEVER_OPEN_RE
+from qaplatform.execute.smoke import CLOSE_RE, ComponentRecord, FindingRecord, SmokeRunner, TestRecord, fingerprint
 from qaplatform.explore.browser import BrowserSession, attach_monitor, goto
 from qaplatform.explore.crawler import ObservedPage
 from qaplatform.explore.scripts import FEEDBACK_JS, FIELD_VALIDITY_JS, FORMS_JS, PAGE_STATE_JS
@@ -110,6 +112,24 @@ def invalid_cases(f: dict) -> list[tuple[str, str, str]]:
     return cases
 
 
+# Visible text of the content area; typing into inputs and focus/blur restyles do not change it.
+CONTENT_TEXT_JS = "() => { const m = document.querySelector('main') || document.body; return (m.innerText || '').replace(/\\s+/g, ' ').slice(0, 20000); }"
+QUERY_SUBMIT_RE = re.compile(r"\b(search|filter|apply|find|look ?up|show results|go)\b", re.I)
+QUERY_FIELD_RE = re.compile(r"search|filter|query|keyword|from date|to date|date range", re.I)
+
+
+def is_query_form(form: dict) -> bool:
+    """A search/filter form reads (GET) instead of writing, so 'nothing was saved' is expected for it."""
+    if QUERY_SUBMIT_RE.search((form.get("submit") or {}).get("name") or ""):
+        return True
+    return any(f.get("type") == "search" or QUERY_FIELD_RE.search(f"{f.get('label') or ''} {f.get('name') or ''}") for f in form.get("fields") or [])
+
+
+def _req_key(url: str) -> str:
+    u = urlparse(url)
+    return u.path + ("?" + u.query if u.query else "")
+
+
 class FormTester:
     def __init__(self, runner: SmokeRunner, events, write_paths_by_route: dict[str, list[str]], tag: str):
         self.r = runner
@@ -141,6 +161,14 @@ class FormTester:
 
     def _fill_valid(self, form: dict) -> tuple[bool, str]:
         for f in form["fields"]:
+            if f.get("type") == "file":
+                # an inert sample file; the guard blocks the upload, so nothing leaves the browser
+                path = Path(self.r.run_dir) / f"qa-sample-{self.tag}.bin"
+                with contextlib.suppress(Exception):
+                    path.write_bytes(b"QA sample file - never uploaded (write guard on)\n")
+                    self.r.page.locator(f["selector"]).first.set_input_files(str(path), timeout=self.r.settings.action_timeout_ms)
+                    continue
+                return False, f"could not attach a file to '{f['label']}'"
             v = sample_value(f, self.tag)
             if v is None:
                 if f["tag"] == "select" and f["required"]:
@@ -151,23 +179,37 @@ class FormTester:
         return True, ""
 
     def _submit(self, form: dict) -> dict:
+        """Click submit; record writes (guarded), new GET queries, and whether the visible text changed."""
         page = self.r.page
         fb_before = page.evaluate(FEEDBACK_JS)
+        text_before = page.evaluate(CONTENT_TEXT_JS)
+        background: list[str] = []
+        on_bg = lambda req: background.append(_req_key(req.url)) if req.method == "GET" and req.resource_type in ("xhr", "fetch") else None
+        page.on("request", on_bg)
+        page.wait_for_timeout(800)  # what the page fetches on its own (polling) is not a query result
+        with contextlib.suppress(Exception):
+            page.remove_listener("request", on_bg)
         mark = self.r.guard.mark()
+        reads: list[str] = []
+        on_req = lambda req: reads.append(_req_key(req.url)) if req.method == "GET" and req.resource_type in ("xhr", "fetch") and _req_key(req.url) not in background else None
         btn = page.locator(form["submit"]["selector"]).first
         try:
             if btn.is_disabled():
-                return {"clicked": False, "disabled": True, "writes": [], "fb_before": fb_before, "fb_after": fb_before}
+                return {"clicked": False, "disabled": True, "writes": [], "reads": [], "fb_before": fb_before, "fb_after": fb_before}
+            page.on("request", on_req)
             btn.click(timeout=self.r.settings.action_timeout_ms)
         except Exception as exc:
-            return {"clicked": False, "error": f"{type(exc).__name__}", "writes": [], "fb_before": fb_before, "fb_after": fb_before}
+            return {"clicked": False, "error": f"{type(exc).__name__}", "writes": [], "reads": [], "fb_before": fb_before, "fb_after": fb_before}
         page.wait_for_timeout(self.r.settings.settle_ms)
+        with contextlib.suppress(Exception):
+            page.remove_listener("request", on_req)
         fb_after = page.evaluate(FEEDBACK_JS)
         writes = self.r.guard.since(mark)
         if writes and not self._new_feedback(fb_before, fb_after):
             page.wait_for_timeout(2500)  # give a failure message time to appear
             fb_after = page.evaluate(FEEDBACK_JS)
-        return {"clicked": True, "writes": writes, "fb_before": fb_before, "fb_after": fb_after}
+        changed = page.evaluate(CONTENT_TEXT_JS) != text_before
+        return {"clicked": True, "writes": writes, "reads": reads, "changed": changed, "fb_before": fb_before, "fb_after": fb_after}
 
     @staticmethod
     def _new_feedback(before: dict, after: dict) -> list[str]:
@@ -177,11 +219,17 @@ class FormTester:
 
     # -- discovery --------------------------------------------------------------------
     def discover(self, pages: list[ObservedPage], components: list[ComponentRecord], protected_routes: list[str], login_path: str) -> list[tuple[FormState, dict]]:
-        states = [FormState(p.route, p.url, [], p.route in protected_routes or bool(p.protected)) for p in pages if p.route not in (login_path,) and p.protected]
+        states = [FormState(p.route, p.url, list(p.reveal), p.route in protected_routes or bool(p.protected)) for p in pages if p.route not in (login_path,) and p.protected]
         seen_paths = set()
         for c in components:
             s = c.smoke_signals or {}
-            if c.page_url and (s.get("opened") or (c.intent or {}).get("opens")) and c.action_class == "safe" and c.selector:
+            # Openers of a form: a dialog/menu ("opened"), or a toggle that reveals an inline
+            # composer in place ("Add operator", "Upload firmware"). A button classed as mutating
+            # by its name ("Reset password") qualifies when its click sent no write — it only opened UI.
+            in_place = s.get("changed") and not s.get("url_changed") and not s.get("popups")
+            opener = s.get("opened") or (c.intent or {}).get("opens") or in_place
+            harmless = (c.action_class == "safe" or (c.action_class == "mutating" and s and not s.get("writes"))) and not NEVER_OPEN_RE.search(c.label or c.name or "")
+            if c.page_url and opener and harmless and c.selector and not CLOSE_RE.match((c.label or c.name or "").strip()):
                 path = tuple(x.get("name") for x in c.reveal) + (c.name or c.label,)
                 if (c.route, path) in seen_paths:
                     continue
@@ -292,6 +340,12 @@ class FormTester:
                     st_now = self.r.page.evaluate(PAGE_STATE_JS)
                     if urlparse(st.page_url).path != st_now.get("path"):
                         wiring.status, wiring.observed = "pass", f"navigated to {st_now.get('path')} (no write)"
+                    elif is_query_form(form) and (res.get("reads") or res.get("changed")):
+                        # A search/filter form queries (GET) or updates the page in place; it has no write to send.
+                        wiring.name = f"Valid '{name}' runs its query on {where}"
+                        wiring.expected = "With valid input the form queries or updates the page"
+                        wiring.status = "pass"
+                        wiring.observed = (f"fetched {', '.join(dict.fromkeys(res['reads']))[:160]}" if res.get("reads") else "updated the results in place") + " (no write)"
                     else:
                         wiring.status, wiring.observed = "fail", "nothing was sent and nothing was shown"
                         findings.append(self._finding("form-dead", st, name, "medium", "functional", f"Submitting a valid '{name}' form on {st.route} does nothing", wiring,
@@ -366,20 +420,97 @@ class FormTester:
 
     @staticmethod
     def _mark_components(components: list[ComponentRecord], st: FormState, form: dict, tests: list[TestRecord]) -> None:
-        labels = {f["label"].lower() for f in form["fields"]} | {(form["submit"] or {}).get("name", "").lower()}
-        failed = any(t.status == "fail" for t in tests)
+        """Credit each field (and the submit button) with the outcome of ITS tests. A field is
+        identified on the same screen by its label or placeholder (code declares inputs by
+        placeholder, the live page names them by label)."""
+        def n(x) -> str:
+            return re.sub(r"\s+", " ", (x or "").strip().lower())
+
+        def outcome(ts: list[TestRecord]) -> str | None:
+            done = [t for t in ts if t.status in ("pass", "fail")]
+            return None if not done else ("fail" if any(t.status == "fail" for t in done) else "pass")
+
+        wiring = [t for t in tests if t.technique == "form-wiring"]
+        wired = any(t.status == "pass" for t in wiring)
+        FIELD_KINDS, BUTTON_KINDS = {"input", "textarea", "select", "file", "clickable"}, {"button", "clickable"}
+        targets: list[tuple[set[str], str | None, set[str]]] = []
+        if wired:
+            # validation results mean something only if a valid submit really goes through;
+            # otherwise "nothing was sent" proves nothing about the field
+            for f in form["fields"]:
+                keys = {n(f.get("label")), n(f.get("placeholder"))} - {""}
+                targets.append((keys, outcome([t for t in tests if f"|{f['label']}|" in t.test_key]), FIELD_KINDS))
+        sub = n((form["submit"] or {}).get("name"))
+        submit_tests = wiring + [t for t in tests if t.technique == "failure-feedback"]
+        if sub and any(t.status in ("pass", "fail") for t in wiring):
+            targets.append(({sub}, outcome(submit_tests), BUTTON_KINDS))
         path = [s.get("name") for s in st.reveal]
         for c in components:
-            comp_path = [s.get("name") for s in (c.reveal or [])]
-            same_place = comp_path == path or (c.reveal == [] and c.source == "code")
-            if c.route == st.route and same_place and (c.label or c.name or "").lower() in labels and c.status in ("observed", "untested", "skipped", "not_observed"):
-                c.status = "fail" if failed else "pass"
-                c.notes = (c.notes + "; " if c.notes else "") + f"covered by form tests of '{_form_name(form)}'"
+            if c.status not in ("observed", "untested", "skipped", "not_observed"):
+                continue
+            here = c.page_url == st.page_url and [s.get("name") for s in (c.reveal or [])] == path
+            if not here:
+                continue
+            names = {n(c.name), n(c.label), n((c.attrs or {}).get("placeholder"))} - {""}
+            for keys, result, kinds in targets:
+                if result and c.kind in kinds and names & keys:
+                    c.status = result
+                    c.notes = (c.notes + "; " if c.notes else "") + f"covered by form tests of '{_form_name(form)}'"
+                    break
 
 
 # ---------------------------------------------------------------------------
 # Sign-in: real requests, no guard, at most two failed attempts
 # ---------------------------------------------------------------------------
+
+AUTH_TOKENS_JS = """() => { try {
+  // Only values that hold a real credential: a JWT anywhere in the value (also inside a persisted
+  // JSON store), or a long opaque string. A store that merely records {"token":null,"error":...}
+  // or an attempt counter is not a session.
+  const JWT = /[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}/;
+  const OPAQUE = /^(Bearer )?[A-Za-z0-9_\\-+=\\/.]{24,}$/;
+  return Object.keys(localStorage).filter(k => /token|session|auth|jwt/i.test(k)).map(k => {
+    const v = localStorage.getItem(k) || '';
+    const m = v.match(JWT);
+    return m ? k + '=' + m[0] : (OPAQUE.test(v) ? k + '=' + v : null);
+  }).filter(Boolean);
+} catch (e) { return []; } }"""
+LOGIN_PATH_RE = re.compile(r"/(login|signin|sign-in|log-in)(/|$)", re.I)
+
+
+def _auth_tokens(page) -> set[str]:
+    with contextlib.suppress(Exception):
+        return set(page.evaluate(AUTH_TOKENS_JS))
+    return set()
+
+
+def _norm_path(path: str) -> str:
+    return (path or "/").rstrip("/") or "/"
+
+
+def _spa_signed_in(page, login_path: str = "/login", tokens_before: set[str] | None = None) -> bool:
+    """Signed in, whether or not the URL changes. A router-less SPA may keep its sign-in
+    screen at "/" and just swap the view, so the evidence is: the page left the sign-in
+    path, a new auth token was stored, or the password field went away (and stayed away).
+    A failed attempt does none of these."""
+    with contextlib.suppress(Exception):
+        path = urlparse(page.url).path
+        if _norm_path(path) != _norm_path(login_path) and not LOGIN_PATH_RE.search(path):
+            return True
+    if _auth_tokens(page) - (tokens_before or set()):
+        return True
+
+    def pw_hidden() -> bool:
+        with contextlib.suppress(Exception):
+            pw = page.locator("input[type=password]")
+            return pw.count() == 0 or not pw.first.is_visible()
+        return False
+
+    if pw_hidden():
+        page.wait_for_timeout(400)  # not a re-render of the same form
+        return pw_hidden()
+    return False
+
 
 def auth_tests(settings: Settings, live_url: str, login_url: str, email: str, password: str, events, tag: str) -> tuple[list[TestRecord], list[FindingRecord]]:
     tests: list[TestRecord] = []
@@ -443,6 +574,23 @@ def auth_tests(settings: Settings, live_url: str, login_url: str, email: str, pa
         if sent:
             finding("empty", "low", "validation", "Sign-in sends a request with empty credentials", t, "WCAG 2.2 3.3.1 Error Identification")
 
+        # "Remember me"-style checkbox on the sign-in form toggles (no request needed)
+        goto(page, login_url, settings)
+        with contextlib.suppress(Exception):
+            cb = page.locator("form input[type=checkbox]").first
+            if cb.count() and cb.is_visible():
+                label = (page.evaluate("(el) => { const l = el.closest('label') || document.querySelector(`label[for='${el.id}']`); return ((l && l.innerText) || el.getAttribute('aria-label') || 'checkbox').trim(); }", cb.element_handle()) or "checkbox")[:40]
+                before = cb.is_checked()
+                cb.click()
+                after = cb.is_checked()
+                cb.click()
+                back = cb.is_checked()
+                ok_toggle = after != before and back == before
+                rec("remember", f"'{label}' on the sign-in form toggles", "Clicking toggles the checkbox on and off", f"checked: {before} -> {after} -> {back}",
+                    "pass" if ok_toggle else "fail", cat="functional")
+                if not ok_toggle:
+                    finding("remember", "low", "functional", f"'{label}' on the sign-in form does not toggle", tests[-1], "WCAG 2.2 4.1.2 Name, Role, Value")
+
         rl = {"hit": False}
         page.on("response", lambda r: rl.__setitem__("hit", True) if r.status == 429 else None)
 
@@ -451,6 +599,7 @@ def auth_tests(settings: Settings, live_url: str, login_url: str, email: str, pa
             page.locator("input[type=email], input[name*=email i], input[id*=email i], input[autocomplete=username]").first.fill(e)
             page.locator("input[type=password]").first.fill(p)
             fb0 = page.evaluate(FEEDBACK_JS)
+            tok0 = _auth_tokens(page)
             mon.reset()
             rl["hit"] = False
             page.locator("button[type=submit], input[type=submit]").first.click()
@@ -460,7 +609,7 @@ def auth_tests(settings: Settings, live_url: str, login_url: str, email: str, pa
             fb1 = page.evaluate(FEEDBACK_JS)
             old = set(fb0["alerts"]) | set(fb0["errors"])
             msg = next((x for x in fb1["alerts"] + fb1["errors"] if x and x not in old), "")
-            return {"path": urlparse(page.url).path, "message": msg, "errors": mon.snapshot()["page_errors"], "rate_limited": rl["hit"]}
+            return {"path": urlparse(page.url).path, "message": msg, "errors": mon.snapshot()["page_errors"], "rate_limited": rl["hit"], "signed_in": _spa_signed_in(page, route, tok0)}
 
         unknown = attempt(f"qa.probe.unknown+{tag}@example.com", "Wrong#Pass-2026")
         if unknown["rate_limited"]:
@@ -468,7 +617,7 @@ def auth_tests(settings: Settings, live_url: str, login_url: str, email: str, pa
             # results would be unreliable, so record and stop rather than emit false findings.
             rec("ratelimited", "Negative sign-in checks", "Run negative login tests", "login endpoint returned 429 (rate limited); negative-auth checks skipped to avoid false results and deepening the lockout", "blocked", cat="security")
             return tests, findings
-        stayed = route in unknown["path"] or "/login" in unknown["path"]
+        stayed = not unknown["signed_in"]
         t = rec("unknown", "Unknown account is refused with a message", "Stays on sign-in and explains the failure", f"path {unknown['path']}; message {unknown['message']!r}",
                 "pass" if stayed and unknown["message"] else "fail", cat="functional")
         if not stayed:
@@ -494,14 +643,19 @@ def auth_tests(settings: Settings, live_url: str, login_url: str, email: str, pa
             page.locator("input[type=email], input[name*=email i], input[id*=email i], input[autocomplete=username]").first.fill(email)
             pwl = page.locator("input[type=password]").first
             pwl.fill(password)
+            tok0 = _auth_tokens(page)
             pwl.press("Enter")
-            with contextlib.suppress(Exception):
-                page.wait_for_url(lambda u: "/login" not in urlparse(u).path, timeout=settings.nav_timeout_ms)
-            ok = "/login" not in urlparse(page.url).path
+            ok = False
+            for _ in range(int(settings.nav_timeout_ms / 500) + 1):
+                if _spa_signed_in(page, route, tok0):
+                    ok = True
+                    break
+                page.wait_for_timeout(500)
             if rl["hit"]:
                 rec("enter", "Pressing Enter in the password field signs in", "Enter submits the form", "skipped: login rate-limited (429)", "blocked", cat="functional")
             else:
-                t = rec("enter", "Pressing Enter in the password field signs in", "Enter submits the form and reaches the app", f"path after Enter: {urlparse(page.url).path}", "pass" if ok else "fail", cat="functional")
+                t = rec("enter", "Pressing Enter in the password field signs in", "Enter submits the form and the user is signed in",
+                        f"after Enter: path {urlparse(page.url).path}, signed in={ok} (URL change, login form gone, or auth token stored)", "pass" if ok else "fail", cat="functional")
                 if not ok:
                     finding("enter", "low", "functional", "Enter key does not submit the sign-in form", t, "WCAG 2.2 2.1.1 Keyboard")
         ctx.close()

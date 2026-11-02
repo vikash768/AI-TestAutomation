@@ -14,6 +14,8 @@ The output is deterministic. Nothing here talks to an LLM.
 """
 from __future__ import annotations
 
+import json
+import contextlib
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -146,6 +148,7 @@ class CodeInventory:
     wrappers: dict = field(default_factory=dict)
     files_parsed: int = 0
     routeless: bool = False
+    dead_files: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     page_files: dict = field(default_factory=dict)  # route -> file
 
@@ -162,6 +165,7 @@ class CodeInventory:
             "files_parsed": self.files_parsed,
             "warnings": self.warnings,
             "page_files": self.page_files,
+            "dead_files": self.dead_files,
         }
 
 
@@ -1149,6 +1153,89 @@ def _resolve_import(from_file: Path, spec: str, root: Path) -> str | None:
     return None
 
 
+# Every way a module names another: static/side-effect imports, re-exports, import(), require().
+_SPEC_RE = re.compile(r"""(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|^\s*import\s+)(['"])([^'"\n]+)\1""", re.M)
+
+
+def _module_specs(text: str) -> list[str]:
+    return [m.group(2) for m in _SPEC_RE.finditer(text)]
+
+
+def _alias_map(repo_root: Path) -> dict[str, str]:
+    """Path aliases ('@/' -> 'src/'): the common defaults plus tsconfig/jsconfig paths and
+    simple vite aliases. Values are repo-relative directory prefixes."""
+    aliases = {"@/": "src/", "~/": "src/", "src/": "src/"}
+    for name in ("tsconfig.json", "jsconfig.json", "tsconfig.app.json"):
+        f = repo_root / name
+        if not f.is_file():
+            continue
+        raw = re.sub(r"//[^\n]*|/\*.*?\*/", "", f.read_text(errors="ignore"), flags=re.S)
+        for key, target in re.findall(r'"([^"]+)/\*"\s*:\s*\[\s*"([^"]+)/\*"', raw):
+            aliases[key + "/"] = target.lstrip("./").rstrip("/") + "/"
+    for name in ("vite.config.js", "vite.config.ts", "vite.config.mjs"):
+        f = repo_root / name
+        if f.is_file():
+            for key, target in re.findall(r"""['"]?(@[\w-]*|~)['"]?\s*:\s*(?:path\.resolve\([^,]+,\s*)?['"]\.?/?([\w./-]+)['"]""", f.read_text(errors="ignore")):
+                aliases[key + "/"] = target.rstrip("/") + "/"
+    return aliases
+
+
+def _package_names(repo_root: Path) -> set[str]:
+    names: set[str] = set()
+    f = repo_root / "package.json"
+    if f.is_file():
+        with contextlib.suppress(Exception):
+            data = json.loads(f.read_text())
+            for sec in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+                names |= set((data.get(sec) or {}).keys())
+    return names
+
+
+def _resolve_spec(from_rel: str, spec: str, repo_root: Path, aliases: dict[str, str]) -> str | None:
+    if spec.startswith("."):
+        return _resolve_import(repo_root / from_rel, spec, repo_root)
+    for key, target in sorted(aliases.items(), key=lambda kv: -len(kv[0])):
+        if spec.startswith(key):
+            hit = _resolve_import(repo_root / "__alias__.js", "./" + target + spec[len(key):], repo_root)
+            if hit:
+                return hit
+    return None
+
+
+def _is_external(spec: str, packages: set[str]) -> bool:
+    name = "/".join(spec.split("/")[:2]) if spec.startswith("@") else spec.split("/")[0]
+    if name in packages or spec.startswith(("node:", "http:", "https:", "virtual:")):
+        return True
+    # Unlisted bare names without an alias prefix are still packages (react/jsx-runtime, built-ins).
+    return not spec.startswith(("@/", "~/", "~", "src/", "#")) and not (spec.startswith("@") and "/" not in spec)
+
+
+def reachable_files(repo_root: Path, entry: str, files) -> tuple[set[str], list[str]]:
+    """Files reachable from the entry through any import form, and local-looking specifiers
+    that could not be resolved (when there are any, reachability is incomplete)."""
+    aliases, packages = _alias_map(repo_root), _package_names(repo_root)
+    seen: set[str] = set()
+    unresolved: list[str] = []
+    stack = [entry]
+    while stack:
+        cur = stack.pop()
+        if cur in seen or cur not in files:
+            continue
+        seen.add(cur)
+        try:
+            text = (repo_root / cur).read_text(errors="ignore")
+        except OSError:
+            continue
+        for spec in _module_specs(text):
+            hit = _resolve_spec(cur, spec, repo_root, aliases)
+            if hit:
+                if hit not in seen:
+                    stack.append(hit)
+            elif not _is_external(spec, packages) and not re.search(r"\.(css|scss|sass|less|svg|png|jpe?g|gif|webp|json)$", spec):
+                unresolved.append(f"{cur}: {spec}")
+    return seen, unresolved
+
+
 def build_inventory(repo_root: Path, framework: str = "react") -> CodeInventory:
     repo_root = Path(repo_root).resolve()
     inv = CodeInventory(framework=framework)
@@ -1259,7 +1346,17 @@ def build_inventory(repo_root: Path, framework: str = "react") -> CodeInventory:
     if not page_file_for_route:
         inv.routeless = True
         entry = next((c for c in ("src/main.jsx", "src/main.tsx", "src/index.jsx", "src/main.js", "src/App.jsx", "src/app.jsx") if c in files), None)
-        screen_files = sorted(rel for rel in files if re.search(r"(^|/)(screens|pages|views|tabs)/[^/]+\.(jsx|tsx|js)$", rel))
+        # Only screens the app can actually render count. Walk every import form from the entry;
+        # a screen file nothing reaches is dead code — present in the repo, never shown. If any
+        # local import cannot be resolved the walk is incomplete, so nothing is called dead.
+        reachable, unresolved = reachable_files(repo_root, entry, files) if entry else (set(), [])
+        all_screens = sorted(rel for rel in files if re.search(r"(^|/)(screens|pages|views|tabs)/[^/]+\.(jsx|tsx|js)$", rel)
+                             and not re.match(r"index\.", Path(rel).name))
+        trust = bool(reachable) and not unresolved
+        if unresolved:
+            inv.warnings.append(f"reachability incomplete ({len(unresolved)} unresolved local imports, e.g. {unresolved[0]}); no screen reported as dead")
+        screen_files = [sf for sf in all_screens if not trust or sf in reachable]
+        inv.dead_files = [sf for sf in all_screens if trust and sf not in reachable]
         if screen_files:
             for sf in screen_files:
                 page_file_for_route["#" + Path(sf).stem] = sf
@@ -1270,7 +1367,7 @@ def build_inventory(repo_root: Path, framework: str = "react") -> CodeInventory:
             root = entry or (sorted(files)[0] if files else None)
             if root:
                 page_file_for_route["/"] = root
-        inv.warnings.append(f"router-less app: {len(screen_files)} screen pseudo-pages, entry={entry}")
+        inv.warnings.append(f"router-less app: {len(screen_files)} reachable screen pseudo-pages, {len(inv.dead_files)} unreachable (dead) screens, entry={entry}")
     inv.page_files = page_file_for_route
 
     # transitive local JSX imports per page file (depth-limited)

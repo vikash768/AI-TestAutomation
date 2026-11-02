@@ -17,14 +17,14 @@ def client():
 def test_index_and_create_run(client):
     r = client.get("/")
     assert r.status_code == 200 and "Start run" in r.text
-    r = client.post("/runs", data={"repo_url": "https://github.com/x/y.git", "live_url": "https://example.com", "email": "a@b.c", "password": "pw", "project": "demo"}, follow_redirects=False)
+    r = client.post("/runs", data={"repo_url": "https://github.com/x/y.git", "live_url": "https://example.com", "email": "a@b.c", "password": "Plaintext-Probe-9f3c", "project": "demo"}, follow_redirects=False)
     assert r.status_code == 303
     run_id = r.headers["location"].rsplit("/", 1)[-1]
     j = client.get(f"/api/runs/{run_id}").json()
     assert j["status"] == "queued" and j["project"] == "demo"
     page = client.get(f"/runs/{run_id}")
     assert page.status_code == 200 and run_id in page.text
-    assert "pw" not in page.text
+    assert "Plaintext-Probe-9f3c" not in page.text
 
 
 def test_secrets_are_encrypted_at_rest(client):
@@ -33,8 +33,8 @@ def test_secrets_are_encrypted_at_rest(client):
     from qaplatform.secrets import decrypt_secrets
     with session(os.environ["DATABASE_URL"]) as db:
         run = db.query(Run).first()
-        assert run.secrets and "pw" not in run.secrets
-        assert decrypt_secrets("test-key", run.secrets)["password"] == "pw"
+        assert run.secrets and "Plaintext-Probe-9f3c" not in run.secrets
+        assert decrypt_secrets("test-key", run.secrets)["password"] == "Plaintext-Probe-9f3c"
 
 
 def test_metrics_endpoint(client):

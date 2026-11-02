@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import logging
 import time
 import traceback
@@ -52,6 +53,7 @@ def build_components(rec, intents: dict) -> list[ComponentRecord]:
                 row.action_class = "download"
                 intent["action_class"] = "download"
             row.page_url, row.page_protected = m.page.url, bool(m.page.protected)
+            row.reveal = list(m.page.reveal)
             row.visible, row.enabled, row.in_dialog = o.visible, o.enabled, o.in_dialog
             row.attrs["haspopup"] = o.haspopup
             row.notes = f"matched by {m.reason}"
@@ -61,7 +63,7 @@ def build_components(rec, intents: dict) -> list[ComponentRecord]:
         components.append(row)
     seen_obs: dict[tuple, ComponentRecord] = {}
     for page, o in rec.unmatched_observed:
-        sig = (page.route, o.role, normalize(o.name) or o.selector)
+        sig = (page.route, o.role, re.sub(r"\d{4,}", "#", normalize(o.name)) or o.selector)  # per-row controls collapse to one
         if sig in seen_obs:
             prev = seen_obs[sig]
             prev.attrs["instances"] = int(prev.attrs.get("instances", 1)) + 1
@@ -73,7 +75,7 @@ def build_components(rec, intents: dict) -> list[ComponentRecord]:
             key=f"obs|{page.route}|{o.role}|{o.name}|{o.selector}"[:400], route=page.route, kind=ROLE_KIND.get(o.role, "button"),
             label=o.name, source="observed", selector=o.selector, role=o.role, name=o.name, href=o.href, attrs={"type": o.type, "tag": o.tag, "path_hint": o.path_hint, "haspopup": o.haspopup},
             intent={**intent, "action_class": cls}, action_class=cls, page_url=page.url, page_protected=bool(page.protected), visible=o.visible, enabled=o.enabled,
-            in_dialog=o.in_dialog, notes="present on live page, not declared in code",
+            in_dialog=o.in_dialog, reveal=list(page.reveal), notes="present on live page, not declared in code",
         )
         components.append(seen_obs[sig])
     return components
@@ -87,7 +89,7 @@ def coverage_after(components: list[ComponentRecord]) -> dict:
     return {
         "coverage_interaction": round(len(found) / len(code), 4) if code else 0.0,
         "matched_interaction": len(found),
-        "revealed_components": sum(1 for c in components if c.reveal),
+        "revealed_components": sum(1 for c in components if any(not s.get("nav") for s in c.reveal)),
         "tested_components": len(tested),
         "equivalent_components": sum(1 for c in components if c.status == "equivalent"),
         "tested_ratio": round(len(tested) / len(exercisable), 4) if exercisable else 0.0,
@@ -131,6 +133,26 @@ def finalize_categories(stats: dict, tests: list, findings: list) -> dict:
     return stats
 
 
+def dead_screen_checks(inv) -> tuple[list, list]:
+    """Screens present in the repo that no import chain from the app entry reaches.
+    The live app can never show them, so they are reported (not counted as untested)."""
+    from qaplatform.execute.smoke import FindingRecord, TestRecord, fingerprint
+    tests, findings = [], []
+    for f in getattr(inv, "dead_files", []) or []:
+        screen = Path(f).stem
+        tests.append(TestRecord(test_key=f"reachability|{f}", name=f"{screen} screen is reachable from the app entry", technique="static-reachability",
+                                category="functional", route="(codebase)", expected="Imported (directly or transitively) by the app entry",
+                                observed="Nothing imports this file", status="fail"))
+        findings.append(FindingRecord(
+            fingerprint=fingerprint("dead-screen", f), route="(codebase)", category="functional", severity="low",
+            title=f"Screen '{screen}' is in the codebase but can never be shown",
+            description=f"{f} defines a screen, but no file reachable from the app entry imports it, so users cannot open it. "
+                        "Either it is dead code or the feature was never wired into navigation.",
+            expected="Every screen in the codebase is reachable from the app's navigation", observed=f"{f}: imported by nothing",
+            standard_ref="ISTQB static testing (unreachable code)", confidence=0.95, reproduced_n=1, reproduced_m=1, test_key=f"reachability|{f}"))
+    return tests, findings
+
+
 def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path, inv, ex, components: list[ComponentRecord], protected_routes: list[str],
                 options: dict, events, tag: str = "run", repo_path: "Path | None" = None) -> tuple[list, list, dict]:
     """Phase 1 checks and smoke clicks, then the Phase 2 modules. A module that fails is recorded, not fatal."""
@@ -150,18 +172,24 @@ def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path,
     t2, f2 = page_tests(ex.pages, settings)
     tests += t2
     findings += f2
+    t2, f2 = dead_screen_checks(inv)
+    tests += t2
+    findings += f2
     stats: dict = {"modules": {}}
     api_base = detect_api_base(inv, live_url)
     default_enabled = set(PHASE2_MODULES) | {"security"}
-    if options.get("load"):
+    if options.get("load") and options.get("load_authorized"):
         default_enabled.add("load")
     if options.get("unit"):
         default_enabled.add("unit")
     if options.get("provision"):
         default_enabled.add("provision")
-    enabled = set(options.get("modules") or default_enabled) if options.get("phase2", True) else set()
+    enabled = set(options.get("modules") or default_enabled)
     if not options.get("phase2", True):
-        enabled = set()
+        # unticking interaction tests drops only those; security and the opt-ins (load, unit, provision) stay
+        enabled -= set(PHASE2_MODULES)
+    if not options.get("load_authorized"):
+        enabled.discard("load")  # load traffic needs the operator's explicit authorisation, however modules were chosen
 
     def _run(name, fn):
         if name not in enabled:
@@ -191,6 +219,8 @@ def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path,
 
     events("execute", f"{len(tests)} checks done; starting smoke clicks", 60)
     if not (ex.storage_state_path or secrets.get("email")):
+        # No test account: public endpoints can still be load-tested, unauthenticated.
+        _run("load", lambda: run_load(settings, live_url, ex.pages, api_base, {}, events, **_load_kwargs(options), auth_kind="none"))
         return tests, findings, finalize_categories(stats, tests, findings)
     runner = SmokeRunner(settings, live_url, ex.storage_state_path, run_dir, secrets, events)
     t3, f3 = runner.run(components, ex.pages, protected_routes)
@@ -216,12 +246,92 @@ def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path,
         ("state", lambda: run_state(runner, ex.pages, components, protected_routes, storage_keys, events)),
         ("lifecycle", lambda: run_lifecycle(runner, inv, ex.pages, components, events)),
         ("faults", lambda: run_faults(runner, ex.pages, components, inv.elements, events)),
-        ("load", lambda: run_load(settings, live_url, ex.pages, api_base, None, events)),
+        ("load", lambda: _load_with_session(runner, settings, live_url, ex.pages, api_base, options, events)),
         ("provision", lambda: run_provision(runner, components, ex.pages, protected_routes, login_path, events, tag)),
     ]
     for name, fn in plan:
         _run(name, fn)
+    credit_signin_components(components, ex.pages, tests)
+    credit_session_enders(components, tests)
+    credit_shared_internals(components, inv)
     return tests, findings, finalize_categories(stats, tests, findings)
+
+
+def _load_with_session(runner, settings, live_url, pages, api_base, options, events):
+    """Load test with a fresh signed-in session (the app's own auth header or cookies), so
+    protected endpoints are measured for real instead of answering 401 under load."""
+    from qaplatform.execute.load import run_load
+    headers, how = runner.capture_auth_headers(api_base)
+    events("load", f"Load test credentials: {how}" + ("" if headers else " (protected endpoints will be reported as not measurable)"), 90)
+    return run_load(settings, live_url, pages, api_base, headers, events,
+                    **_load_kwargs(options), auth_kind=how)
+
+
+def _load_kwargs(options: dict) -> dict:
+    capacity = options.get("load_mode") == "capacity"
+    return {"users": int((options.get("load_max_users") if capacity else options.get("load_users")) or (50 if capacity else 10)),
+            "seconds": int(options.get("load_seconds") or 60), "p95_ms": int(options.get("load_p95_ms") or 2000),
+            "mode": "capacity" if capacity else "ramp", "step_seconds": int(options.get("load_step_seconds") or 15),
+            "expected_users": int(options.get("load_expected_users") or 0)}
+
+
+def credit_session_enders(components: list, tests: list) -> None:
+    """The logout test clicks the app's sign-out control (finding it in a profile menu if
+    needed); every sign-out control takes that test's outcome."""
+    t = next((t for t in tests if t.test_key.startswith("logout|") and t.status in ("pass", "fail")), None)
+    if t is None:
+        return
+    used = t.test_key.split("|", 1)[1]
+    for c in components:
+        if c.action_class == "session_ending" and c.status in ("observed", "untested", "skipped") and (c.key == used or c.page_url):
+            c.status = t.status
+            c.notes = (c.notes + "; " if c.notes else "") + f"exercised by '{t.name}' ({t.status})"
+
+
+def credit_shared_internals(components: list, inv) -> None:
+    """Controls inside a shared component's own file (<Dropdown>'s trigger and options) are not
+    separate features: they are exercised through each place the component is used. When those
+    usages were tested, the internals are marked equivalent instead of 'not found'."""
+    from pathlib import PurePosixPath
+    tag_of = {e.key: e.tag for e in inv.elements}
+    tested_usages: dict[str, int] = {}
+    for c in components:
+        tag = tag_of.get(c.key) or ""
+        if tag[:1].isupper() and c.status in ("pass", "fail"):
+            tested_usages[tag] = tested_usages.get(tag, 0) + 1
+    for c in components:
+        if c.status != "not_observed" or not c.code_file:
+            continue
+        comp = PurePosixPath(c.code_file).stem
+        if tested_usages.get(comp):
+            # annotated only: nothing clicked THIS element, so it is not counted as tested
+            c.notes = f"inside the shared <{comp}> component, whose {tested_usages[comp]} usage(s) were tested; this element itself was not found"
+
+
+def credit_signin_components(components: list, pages: list, tests: list) -> None:
+    """Sign-in screen controls are exercised by the signed-out sign-in tests; give the controls
+    those tests actually use (identifier, password, submit, remember-me) that test's outcome.
+    Anything else on the screen (forgot-password link, show-password toggle) gets no credit."""
+    from qaplatform.execute.smoke import on_signin_screen
+    by_key = {t.test_key: t for t in tests if t.test_key.startswith("auth|")}
+    for c in components:
+        if not on_signin_screen(c, pages):
+            continue
+        label = (c.label or c.name or "").lower()
+        ftype = str((c.attrs or {}).get("type") or "").lower()
+        if c.kind == "checkbox" and re.search(r"remember|keep me|stay signed", label):
+            t = by_key.get("auth|remember")
+        elif c.kind in ("button", "clickable") and re.fullmatch(r"(sign ?in|log ?in|continue|submit)", label.strip()):
+            t = by_key.get("auth|unknown")
+        elif c.kind in ("input",) and (ftype in ("email", "password") or re.search(r"\b(email|password|username|user name)\b", label)):
+            t = by_key.get("auth|enter")
+        else:
+            t = None
+        if t is None or t.status not in ("pass", "fail"):
+            continue
+        c.status = t.status
+        c.source = "both" if c.source == "code" else c.source
+        c.notes = f"exercised by the sign-in test '{t.name}' ({t.status})"
 
 
 class RunContext:
@@ -274,6 +384,7 @@ def merge_inventories(invs: list) -> "CodeInventory":
         for route, pf in inv.page_files.items():
             merged.page_files[route] = f"{name}/{pf}"
         merged.files_parsed += inv.files_parsed
+        merged.dead_files.extend(f"{name}/{d}" for d in getattr(inv, "dead_files", []))
         merged.warnings.extend(f"[{name}] {w}" for w in inv.warnings)
     merged.routeless = any(i.routeless for i, _ in invs) or not merged.routes
     return merged

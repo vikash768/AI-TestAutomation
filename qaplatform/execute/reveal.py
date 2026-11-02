@@ -18,7 +18,8 @@ import contextlib
 import re
 from dataclasses import dataclass, field
 
-from qaplatform.execute.smoke import CLOSE_RE, ComponentRecord, FindingRecord, SmokeRunner, TestRecord, fingerprint, step_of
+from qaplatform.execute.reveal_rules import NEVER_OPEN_RE
+from qaplatform.execute.smoke import CLOSE_RE, ComponentRecord, FindingRecord, SmokeRunner, TestRecord, fingerprint, layered, step_of
 from qaplatform.explore.crawler import ObservedElement, ObservedPage
 from qaplatform.explore.safety import classify_action
 from qaplatform.explore.scripts import LAYERS_JS
@@ -40,11 +41,17 @@ def sig(e: dict) -> tuple:
     return (e.get("role"), name)
 
 
+def _fold_sig(role, name) -> tuple:
+    return (role, re.sub(r"\d{4,}", "#", normalize(name)))
+
+
 def shape_key(comp: ComponentRecord) -> tuple:
     """The same control inside the same shared component, wherever it is opened from."""
     last = comp.reveal[-1] if comp.reveal else {}
     opener = last.get("file") or re.sub(r"\d+", "#", normalize(last.get("name")))
-    return (opener, comp.role, sig({"role": comp.role, "name": comp.name or comp.label})[1])
+    # Per-row controls ("View details for HIV-20261014-190330") are one control: fold record ids
+    # (long digit runs) but keep short numbers, so "Step 1" and "Step 2" stay distinct.
+    return (opener, comp.role, re.sub(r"\d{4,}", "#", sig({"role": comp.role, "name": comp.name or comp.label})[1] or ""))
 
 
 def to_observed(e: dict) -> ObservedElement:
@@ -104,12 +111,17 @@ class Revealer:
         self.layers = LayerAudit()
         self.clicks = 0
         self.tested_shapes: dict[tuple, str] = {}
+        self.revealed_sets: list[frozenset] = []
+        self.navigations: list[str] = []
 
     # -- discovery -----------------------------------------------------------
     def openers(self, components: list[ComponentRecord]) -> list[ComponentRecord]:
         picked: dict[str, list[ComponentRecord]] = {}
         for c in components:
-            if not self.r.clickable(c) or c.reveal or c.in_dialog or c.action_class != "safe":
+            s0 = c.smoke_signals or {}
+            # "Reset password" is mutating by name, but if its click sent no write it only opened UI.
+            harmless = (c.action_class == "safe" or (c.action_class == "mutating" and s0 and not s0.get("writes"))) and not NEVER_OPEN_RE.search(c.label or c.name or "")
+            if not self.r.clickable(c) or layered(c) or c.in_dialog or not harmless:
                 continue
             label = (c.label or c.name or "").strip()
             if CLOSE_RE.match(label):
@@ -157,6 +169,26 @@ class Revealer:
                code_by_key: dict[str, CodeElement], protected_routes: list[str], origin: str) -> list[ComponentRecord]:
         """revealed: (opener, route, page_url, reveal_path, elements, opener_file). Returns the components to click next."""
         by_key = {c.key: c for c in components}
+        # A click that shows an already-captured screen ("Explore test results" -> the Results tab)
+        # is navigation, not a new panel: absorbing it again would duplicate every control there.
+        known = {_fold_sig(c.role, c.name or c.label) for c in components if not layered(c) and c.selector}
+        kept = []
+        for item in revealed:
+            opener, elements = item[0], item[4]
+            sigs = frozenset(_fold_sig(e.get("role"), e.get("name")) for e in elements if e.get("name"))
+            copy_of = next((prev for prev in self.revealed_sets if sigs and len(sigs & prev) / len(sigs) >= 0.8), frozenset())
+            # Drop only controls already known (top-level on a captured screen, or in a panel this
+            # one copies); anything new in the set is kept, so a new control is never lost.
+            fresh_elems = [e for e in elements if not e.get("name") or (_fold_sig(e.get("role"), e.get("name")) not in known and _fold_sig(e.get("role"), e.get("name")) not in copy_of)]
+            if sigs:
+                self.revealed_sets.append(sigs)
+            if not fresh_elems:
+                if opener is not None:
+                    opener.notes = (opener.notes + "; " if opener.notes else "") + "switches to a screen that is tested on its own"
+                    self.navigations.append(opener.label or opener.name or "?")
+                continue
+            kept.append(item[:4] + (fresh_elems,) + item[5:])
+        revealed = kept
         unmatched_code = [code_by_key[c.key] for c in components if c.source == "code" and c.key in code_by_key]
         pages = []
         for opener, route, page_url, path, elements, opener_file in revealed:
@@ -285,4 +317,5 @@ class Revealer:
         tests.extend(self.layers.tests)
         findings.extend(self.layers.findings.values())
         stats["clicks"] = self.clicks
+        stats["navigations"] = len(self.navigations)
         return tests, findings, stats

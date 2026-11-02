@@ -41,6 +41,60 @@
 </table>
 <p><small>A category showing <b>no</b> did not run this time — usually because it is opt-in (load, unit) or needs something the run lacked (e.g. a login for authenticated functional tests).</small></p>
 {% endif %}
+{% set ld = run.stats.get('load') %}
+{% if ld %}
+{% set verdict = ld.get('verdict', 'unknown') %}
+{% set vclass = {'pass':'completed','degraded':'high','fail':'failed','not_measurable':'low'}.get(verdict, 'low') %}
+<h2>Load test <span class="pill {{ vclass }}">{{ verdict | replace('_', ' ') }}</span></h2>
+<p>
+Signed in as: <b>{{ ld.get('auth') or 'none' }}</b> ·
+peak <b>{{ ld.get('users', '?') }}</b> users ·
+<b>{{ ld.get('seconds', '?') }}</b>s ·
+target p95 <b>{{ ld.get('p95_target_ms', '?') }}</b> ms
+{% if ld.get('knee_users') %} · response times started climbing at <b>{{ ld.knee_users }}</b> users{% endif %}
+</p>
+{% if ld.get('aborted') %}<p style="color:var(--crit)"><b>Stopped early:</b> {{ ld.get('abort_reason') or 'error rate climbed' }}</p>{% endif %}
+{% set cap = ld.get('capacity') %}
+{% if cap %}{% set bp = cap.get('breaking_point') %}{% set ok = cap.get('last_healthy') %}
+<div class="card" style="border-left:4px solid {{ 'var(--crit)' if bp else 'var(--ok, #2e7d32)' }};margin:8px 0">
+{% if bp %}
+<p style="font-size:18px;margin:4px 0"><b>Breaking point: {{ bp.users }} concurrent users</b></p>
+<p style="margin:4px 0">{{ bp.reason }} — at {{ bp.users }} users: p50 <b>{{ bp.p50 if bp.p50 is not none else '–' }} ms</b>, p95 <b>{{ bp.p95 if bp.p95 is not none else '–' }} ms</b>, {{ bp.rps }} req/s, {{ '%.0f' % ((bp.error_rate or 0) * 100) }}% errors.</p>
+{% if ok %}<p style="margin:4px 0">Last healthy step: <b>{{ ok.users }} users</b> — p50 <b>{{ ok.p50 }} ms</b>, p95 <b>{{ ok.p95 }} ms</b>, {{ ok.rps }} req/s.</p>{% endif %}
+{% set kn = cap.get('knee') %}{% if kn and kn.users < bp.users %}<p style="margin:4px 0">Starts slowing down at <b>{{ kn.users }} users</b> — p50 <b>{{ kn.p50 }} ms</b>, p95 <b>{{ kn.p95 }} ms</b>: {{ kn.reason }}.</p>{% endif %}
+{% else %}
+<p style="font-size:18px;margin:4px 0"><b>No breaking point up to {{ cap.get('max_tested_users', 0) }} users</b></p>
+{% set kn = cap.get('knee') %}{% if kn %}<p style="margin:4px 0">But it starts slowing down at <b>{{ kn.users }} users</b> — p50 <b>{{ kn.p50 }} ms</b>, p95 <b>{{ kn.p95 }} ms</b>: {{ kn.reason }}.</p>{% endif %}
+{% if ok %}<p style="margin:4px 0">At {{ ok.users }} users: p50 <b>{{ ok.p50 }} ms</b>, p95 <b>{{ ok.p95 }} ms</b>, {{ ok.rps }} req/s. Raise "Maximum users to try" (CAPACITY_MAX_USERS) to push further.</p>{% endif %}
+{% endif %}
+{% if cap.get('expected_users') %}<p style="margin:4px 0"><small>Expected to handle {{ cap.expected_users }} users: {{ 'NOT met' if bp and bp.users <= cap.expected_users else 'met' }}.</small></p>{% endif %}
+<p style="margin:4px 0"><small>Steps of {{ '%.0f' % cap.get('step_seconds', 0) }} s; a step fails at &gt;5% errors, p95 over {{ cap.get('p95_target_ms') }} ms, or throughput falling as users are added. The test stops at the first failing step.</small></p>
+</div>
+{% endif %}
+{% if verdict == 'not_measurable' %}<p><small>No API endpoint could be measured under load{% if ld.get('abort_reason') and not ld.get('aborted') %}: {{ ld.abort_reason }}{% endif %}. Each endpoint's reason is listed below.</small></p>{% endif %}
+{% if ld.get('stages') %}
+<table>
+<thead><tr><th>Users</th><th>Requests</th><th>Req/s</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>Server errors</th><th>Client errors</th></tr></thead>
+<tbody>
+{% for st in ld.stages %}{% set p95 = st.get('p95') %}
+<tr><td>{{ st.get('users', '') }}</td><td>{{ st.get('requests', 0) }}</td><td>{{ '%.1f' % (st.get('rps') or 0) }}</td><td>{{ st.p50 if st.get('p50') is not none else '–' }}</td>
+<td{% if p95 is number and ld.get('p95_target_ms') and p95 > ld.p95_target_ms %} style="color:var(--crit);font-weight:700"{% endif %}>{{ p95 if p95 is not none else '–' }}</td>
+<td>{{ st.p99 if st.get('p99') is not none else '–' }}</td><td{% if st.get('server_errors') %} style="color:var(--crit);font-weight:700"{% endif %}>{{ st.get('server_errors', 0) }}</td><td>{{ st.get('client_errors', 0) }}</td></tr>
+{% endfor %}
+</tbody></table>
+{% endif %}
+{% if ld.get('endpoints') %}
+<h2>Load test by endpoint</h2>
+<table>
+<thead><tr><th>Endpoint</th><th>Requests</th><th>p50 ms</th><th>p95 ms</th><th>Server errors</th><th>Client errors</th><th>Statuses</th><th>Note</th></tr></thead>
+<tbody>
+{% for ep in ld.endpoints %}
+<tr><td><code>{{ ep.get('path', '') }}</code></td><td>{{ ep.get('requests', 0) }}</td><td>{{ ep.p50 if ep.get('p50') is not none else '–' }}</td><td>{{ ep.p95 if ep.get('p95') is not none else '–' }}</td>
+<td{% if ep.get('server_errors') %} style="color:var(--crit);font-weight:700"{% endif %}>{{ ep.get('server_errors', 0) }}</td><td>{{ ep.get('client_errors', 0) }}</td><td><small>{{ (ep.get('statuses') or []) | join(', ') }}</small></td><td><small>{{ ep.get('blocked_reason') or '' }}</small></td></tr>
+{% endfor %}
+</tbody></table>
+{% endif %}
+{% endif %}
 {% endif %}
 </div>
 

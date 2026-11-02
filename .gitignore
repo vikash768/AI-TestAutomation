@@ -16,3 +16,6 @@ artifacts/cache/
 .vscode/
 *.swp
 .DS_Store
+
+# Local dev override (source mounted into containers)
+docker-compose.override.yml

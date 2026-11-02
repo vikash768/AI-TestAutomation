@@ -50,7 +50,9 @@ def metrics():
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, db: Session = Depends(db_session)):
     runs = db.execute(select(Run).order_by(Run.created_at.desc()).limit(25)).scalars().all()
-    return templates.TemplateResponse(request, "index.html", {"runs": runs, "grafana_url": GRAFANA_URL, "defaults": {
+    caps = {"users": settings.load_max_concurrency, "seconds": settings.load_max_seconds, "requests": settings.load_max_requests,
+            "capacity_users": settings.capacity_max_users, "capacity_requests": settings.capacity_max_requests}
+    return templates.TemplateResponse(request, "index.html", {"runs": runs, "grafana_url": GRAFANA_URL, "load_caps": caps, "defaults": {
         "repo_url": os.environ.get("TARGET_REPO_URL", ""), "live_url": os.environ.get("TARGET_LIVE_URL", ""),
         "email": os.environ.get("VALID_USER_EMAIL", ""), "project": os.environ.get("PROJECT_NAME", "")}})
 
@@ -59,18 +61,45 @@ def index(request: Request, db: Session = Depends(db_session)):
 def create_run(
     project: str = Form("default"), repo_url: str = Form(...), live_url: str = Form(...), email: str = Form(""), password: str = Form(""),
     github_token: str = Form(""), max_pages: int = Form(60), llm_intent: bool = Form(False), phase2: bool = Form(False), load: bool = Form(False), unit: bool = Form(False), provision: bool = Form(False), branch: str = Form(""),
+    load_authorized: bool = Form(False), load_users: str = Form(""), load_seconds: str = Form(""), load_p95_ms: str = Form(""),
+    load_mode: str = Form("ramp"), load_max_users: str = Form(""), load_step_seconds: str = Form(""), load_expected_users: str = Form(""),
     db: Session = Depends(db_session),
 ):
     import re as _re
     repos = [u.strip() for u in _re.split(r"[\s,]+", repo_url.strip()) if u.strip()]
     if not repos or not live_url.strip():
         raise HTTPException(400, "at least one repo URL and a live URL are required")
+    try:
+        load_opts = _load_options(load, load_authorized, load_users, load_seconds, load_p95_ms, load_mode, load_max_users, load_step_seconds, load_expected_users)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     run = Run(project=project.strip() or "default", repo_url=repos[0], live_url=live_url.strip(), status="queued", stage="queued",
-              options={"repos": repos, "max_pages": max_pages, "llm_intent": llm_intent, "phase2": phase2, "load": load, "unit": unit, "provision": provision, "branch": branch.strip()},
+              options={"repos": repos, "max_pages": max_pages, "llm_intent": llm_intent, "phase2": phase2, **load_opts, "unit": unit, "provision": provision, "branch": branch.strip()},
               secrets=encrypt_secrets(settings.secret_key, {"email": email, "password": password, "github_token": github_token}))
     db.add(run)
     db.commit()
     return RedirectResponse(url=f"/runs/{run.id}", status_code=303)
+
+
+LOAD_RANGES = {"load_users": (1, 50, 10), "load_seconds": (10, 120, 60), "load_p95_ms": (200, 30000, 2000),
+               "load_max_users": (1, 500, 50), "load_step_seconds": (5, 60, 15), "load_expected_users": (0, 500, 0)}
+
+
+def _load_options(load: bool, authorized: bool, users="", seconds="", p95_ms="", mode="ramp", max_users="", step_seconds="", expected_users="") -> dict:
+    """Form values -> run.options load keys. Numbers are clamped rather than rejected (the worker caps again via LOAD_MAX_*);
+    a blank or non-numeric field falls back to its default. Load without the authorisation box is refused outright."""
+    if load and not authorized:
+        raise ValueError("Load testing needs the 'I am authorised to load-test this site' box ticked — untick Load test or confirm authorisation.")
+    out = {"load": bool(load), "load_authorized": bool(load and authorized), "load_mode": "capacity" if mode == "capacity" else "ramp"}
+    for key, raw in (("load_users", users), ("load_seconds", seconds), ("load_p95_ms", p95_ms), ("load_max_users", max_users),
+                     ("load_step_seconds", step_seconds), ("load_expected_users", expected_users)):
+        lo, hi, default = LOAD_RANGES[key]
+        try:
+            v = int(float(str(raw).strip())) if str(raw).strip() else default
+        except (ValueError, OverflowError):  # "abc", "nan", "inf"
+            v = default
+        out[key] = max(lo, min(hi, v))
+    return out
 
 
 @app.get("/runs/{run_id}", response_class=HTMLResponse)
@@ -92,6 +121,18 @@ def run_report(run_id: str):
     if not path.exists():
         raise HTTPException(404, "report not ready")
     return FileResponse(str(path), media_type="text/html")
+
+
+@app.get("/runs/{run_id}/{asset:path}")
+def run_asset(run_id: str, asset: str):
+    """Files the report links relatively (screenshots/…), served only from inside that run's folder."""
+    run_dir = (settings.artifacts_dir / "runs" / run_id).resolve()
+    path = (run_dir / asset).resolve()
+    if not path.is_relative_to(run_dir) or not path.is_file() or path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp", ".html", ".json"):
+        raise HTTPException(404)
+    if path.name in ("storage_state.json",) or "state" in path.stem.lower():
+        raise HTTPException(404)  # never serve session material
+    return FileResponse(str(path))
 
 
 @app.get("/api/runs")

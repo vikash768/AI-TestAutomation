@@ -16,13 +16,13 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urldefrag
 
 from playwright.sync_api import TimeoutError as PWTimeout
 
 from qaplatform.config import Settings
 from qaplatform.execute.guard import NetworkGuard, describe
-from qaplatform.explore.browser import BrowserSession, attach_monitor, goto, login, same_origin
+from qaplatform.explore.browser import BrowserSession, attach_monitor, goto, login, same_origin, wait_for_data
 from qaplatform.explore.crawler import GuardResult, ObservedPage
 from qaplatform.explore.scripts import COLLECT_INTERACTIVE_JS, PAGE_STATE_JS
 from qaplatform.judge.gate import confidence, gate_status
@@ -32,6 +32,49 @@ EventCb = Callable[..., None]
 
 CLOSE_RE = re.compile(r"^(cancel|close|dismiss|done|no|keep|go back|✕|×|x)$", re.I)
 CLICKABLE_KINDS = {"button", "link", "clickable", "menuitem", "tab", "switch", "checkbox", "radio"}
+
+
+SIGNED_OUT_JS = """(tokenKeys) => {
+  const pw = Array.from(document.querySelectorAll('input[type=password]')).some(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+  const shell = !!document.querySelector('nav, aside, [role=navigation]');
+  let tokens = null;
+  try { tokens = tokenKeys.length ? tokenKeys.some(k => (localStorage.getItem(k) || '').length > 0) : null; } catch (e) {}
+  return { pw, shell, tokens, path: location.pathname };
+}"""
+
+
+def signed_out(page, token_keys: list[str]) -> bool:
+    """Signed out, also for SPAs whose sign-in screen lives at '/': the URL is a sign-in path,
+    the code's own session keys are gone, or the sign-in form replaced the app shell."""
+    try:
+        st = page.evaluate(SIGNED_OUT_JS, token_keys)
+    except Exception:
+        return False
+    if re.search(r"/(login|signin|sign-in)(/|$)", st.get("path") or "", re.I):
+        return True
+    if st.get("tokens") is False:
+        return True
+    return bool(st.get("pw") and not st.get("shell"))
+
+
+def on_signin_screen(c: "ComponentRecord", pages: list) -> bool:
+    """A control captured on the signed-out sign-in screen. Router-less apps show the sign-in
+    screen and the signed-in app at the same URL, so the URL alone is not enough."""
+    if c.page_protected:
+        return False
+    return any(p.url == c.page_url and not p.protected and (p.state or {}).get("hasPasswordField") for p in pages)
+
+
+def load_url(page_url: str, reveal: list | None) -> str:
+    """The URL to load for a page: a router-less tab's synthetic fragment is dropped so the load is real."""
+    if reveal and any(s.get("nav") for s in reveal):
+        return urldefrag(page_url)[0]
+    return page_url
+
+
+def layered(comp: "ComponentRecord") -> bool:
+    """True when the component sits behind a dialog/menu click, not just a router-less tab's nav click."""
+    return any(not s.get("nav") for s in comp.reveal or [])
 
 
 def step_of(comp: "ComponentRecord") -> dict:
@@ -122,7 +165,18 @@ def _same_name(loc, expected: str) -> bool:
     a, e = _norm(actual), _norm(expected)
     if not e:
         return True
-    return a == e or (len(e) >= 3 and (e in a or a in e))
+    # A state-flipping name counts only for descriptive labels ("Switch to dark theme"), never
+    # for bare row actions like "Enable"/"Disable", where it could be another row's control.
+    return a == e or (len(e) >= 3 and (e in a or a in e)) or (len(e.split()) >= 3 and _toggled(a) == e)
+
+
+# A toggle's name flips with its state ("Switch to dark theme" <-> "Switch to light theme").
+_TOGGLE_PAIRS = [("dark", "light"), ("show", "hide"), ("expand", "collapse"), ("more", "less"), ("mute", "unmute"), ("play", "pause")]
+_TOGGLE_MAP = {**{x: y for x, y in _TOGGLE_PAIRS}, **{y: x for x, y in _TOGGLE_PAIRS}}
+
+
+def _toggled(name: str) -> str:
+    return " ".join(_TOGGLE_MAP.get(w, w) for w in name.split())
 
 
 def _try_visible(loc) -> bool:
@@ -311,6 +365,11 @@ class SmokeRunner:
                 ctx.clock.install()
             self.page = ctx.new_page()
             self.mon = attach_monitor(self.page)
+            # A reused session's token can go stale during the crawl (e.g. rotated),
+            # leaving every page on the login screen. Verify we are signed in and
+            # re-login once if not, so each module starts authenticated.
+            if self.secrets.get("email"):
+                self._ensure_authenticated()
             self._dirty = True
             try:
                 yield self
@@ -318,6 +377,34 @@ class SmokeRunner:
                 with contextlib.suppress(Exception):
                     ctx.close()
                 self.ctx = self.page = self.mon = self.guard = None
+
+    def capture_auth_headers(self, api_base: str = "") -> tuple[dict, str]:
+        """A fresh signed-in session's credentials for the app's own API calls: the Authorization
+        header the app itself sends, else its cookies. Kept in memory only, never stored or logged."""
+        found: dict = {}
+        # only the app's own hosts: a third-party call's credential must never be replayed (or leaked) to the app
+        hosts = {h for h in (urlparse(self.live_url).hostname, urlparse(api_base).hostname if api_base else None) if h}
+
+        def on_req(req):
+            if found or req.resource_type not in ("xhr", "fetch") or urlparse(req.url).hostname not in hosts:
+                return
+            with contextlib.suppress(Exception):
+                h = req.all_headers()
+                if h.get("authorization"):
+                    found["Authorization"] = h["authorization"]
+        with self.session():
+            self.page.on("request", on_req)
+            goto(self.page, self.live_url + "/", self.settings)
+            wait_for_data(self.page)
+            if found:
+                return found, "authorization header"
+            def for_host(c) -> bool:
+                d = (c.get("domain") or "").lstrip(".").lower()
+                return any(h == d or h.endswith("." + d) for h in hosts)
+            cookies = [c for c in self.ctx.cookies() if for_host(c)]
+            if cookies:
+                return {"Cookie": "; ".join(f"{c['name']}={c['value']}" for c in cookies)}, "session cookie"
+        return {}, "none"
 
     def new_page(self) -> None:
         with contextlib.suppress(Exception):
@@ -336,6 +423,18 @@ class SmokeRunner:
         if res.success and save and res.storage_state_path:
             self.storage_state = res.storage_state_path
         return res.success
+
+    def _ensure_authenticated(self) -> bool:
+        """If the current session is not signed in, re-login once (and refresh the state)."""
+        from qaplatform.explore.browser import goto
+        with contextlib.suppress(Exception):
+            goto(self.page, self.live_url + "/", self.settings)
+            if signed_out(self.page, []):
+                if self._relogin(self.ctx):
+                    goto(self.page, self.live_url + "/", self.settings)
+                    return True
+                return False
+        return True
 
     # -- helpers -----------------------------------------------------------
     def state(self) -> dict:
@@ -376,6 +475,9 @@ class SmokeRunner:
 
     def prepare(self, page_url: str, reveal: list | None = None) -> tuple[bool, str]:
         """Fresh load of page_url, then replay the clicks that reveal a component."""
+        # A tab screen's URL carries a synthetic '#Name' the app never reads. Going to it from
+        # the same document is a same-page hash change (no reload), so load the bare URL.
+        page_url = load_url(page_url, reveal)
         goto(self.page, page_url, self.settings)
         self._dirty = False
         protected_target = "/login" not in _path(page_url)
@@ -391,6 +493,8 @@ class SmokeRunner:
             except Exception as exc:
                 return False, f"reveal step {i + 1} ('{step.get('name')}') not clickable: {type(exc).__name__}"
             self.page.wait_for_timeout(self.settings.settle_ms)
+            if step.get("nav"):
+                wait_for_data(self.page)  # a tab's rows load after it opens
         return True, ""
 
     def screenshot(self, name: str) -> dict | None:
@@ -647,7 +751,12 @@ class SmokeRunner:
         tests: list[TestRecord] = []
         findings: list[FindingRecord] = []
         page_by_url = {p.url: p for p in pages}
-        todo = [c for c in components if self.clickable(c) and not c.in_dialog and not c.reveal]
+        # Tab screens carry only their nav click; deeper (dialog/menu) chains belong to the reveal module.
+        signin = {c.key for c in components if on_signin_screen(c, pages)}
+        for c in components:
+            if c.key in signin and c.status in ("untested", "observed"):
+                c.notes = "sign-in screen control: exercised by the sign-in tests (signed out)"
+        todo = [c for c in components if self.clickable(c) and not c.in_dialog and not layered(c) and c.key not in signin]
         session_enders = [c for c in components if c.action_class == "session_ending" and c.page_url and c.visible and (c.selector or c.role)]
         self.classify_skips(components)
         with self.session():
@@ -698,7 +807,7 @@ class SmokeRunner:
         findings: list[FindingRecord] = []
         t0 = time.time()
         with self.guard.suspended():
-            ok, why = self.prepare(comp.page_url)
+            ok, why = self.prepare(comp.page_url, comp.reveal)
             loc = self.locate(comp.selector, comp.role, comp.name or comp.label) if ok else None
             if loc is None or (loc is not None and not _try_visible(loc)):
                 # Logout is often tucked inside a profile/avatar menu — open it and look again.

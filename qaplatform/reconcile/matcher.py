@@ -72,7 +72,17 @@ def _score(code: CodeElement, obs: ObservedElement, origin: str) -> tuple[int, s
         reasons.append("kind")
     elif cg == "button" and og == "link" or cg == "link" and og == "button":
         score += 1
+    elif code.kind == "clickable" and og == "select":
+        score += 1  # a custom component (<Dropdown label="Status">) rendering a combobox
     else:
+        return 0, ""
+    # Literal attributes that contradict the live element rule a pairing out, however
+    # close the rest looks (a template label like {initials} otherwise matches on kind alone).
+    ctype, otype = code.attrs.get("type"), (obs.type or "").lower()
+    if code.kind == "button" and ctype in ("button", "submit", "reset") and otype in ("button", "submit", "reset") and ctype != otype:
+        return 0, ""
+    popup = str(code.attrs.get("aria-haspopup") or "").strip("{}\"' ").lower()
+    if popup in ("menu", "listbox", "dialog", "tree", "grid", "true") and not obs.haspopup and obs.tag == "button":
         return 0, ""
     cl = normalize(code.label)
     on = normalize(obs.name)
@@ -100,6 +110,18 @@ def _score(code: CodeElement, obs: ObservedElement, origin: str) -> tuple[int, s
         if cpath and (opath == cpath or opath.rstrip("/") == cpath.rstrip("/")):
             score += 4
             reasons.append("href=")
+    # Structural evidence for controls whose label is a template ({initials}): the same popup
+    # kind and the same explicit button type.
+    templated = "{" in (code.label or "") and label_pattern(code.label) is None and len(normalize(obs.name)) <= 4
+    if templated and popup and obs.haspopup and popup == str(obs.haspopup).lower():
+        score += 2
+        reasons.append("haspopup=")
+    if templated and code.kind == "button" and ctype in ("button", "submit", "reset") and ctype == otype:
+        score += 1
+    ph = code.attrs.get("placeholder")
+    if isinstance(ph, str) and ph and obs.placeholder and normalize(ph) == normalize(obs.placeholder):
+        score += 4
+        reasons.append("placeholder=")
     if isinstance(code.attrs.get("id"), str) and obs.id and code.attrs["id"] == obs.id:
         score += 4
         reasons.append("id=")
@@ -117,14 +139,24 @@ def reconcile(code_elements: list[CodeElement], pages: list[ObservedPage], prote
         by_route.setdefault(p.route, []).append(p)
     protected_pages = [p for p in pages if p.route in protected_routes or p.protected]
     used: set[tuple[int, int]] = set()  # (id(page), index of element)
+    # The sign-in screen: declares a password field AND a sign-in button. (A user-management
+    # screen also has password fields — create user, reset password — but no sign-in button.)
+    pw_routes = {e.route for e in code_elements if str((e.attrs or {}).get("type") or "").lower() == "password"}
+    signin_routes = {e.route for e in code_elements if re.fullmatch(r"(sign ?in|log ?in)", normalize(e.label))}
+    login_routes = pw_routes & signin_routes
 
     for code in code_elements:
         if code.kind not in INTERACTIVE_KINDS:
             continue
         # A pseudo-page (#Screen from a router-less SPA) or the shared layout is matched
         # against every authenticated page, since the live app shows them all on one URL.
-        if code.route == "(layout)" or (code.route or "").startswith("#"):
+        if code.route == "(layout)":
             candidates: list[ObservedPage] = protected_pages or pages
+        elif (code.route or "").startswith("#"):
+            # Only the sign-in screen's code (it declares a password field) may match the public
+            # sign-in page; every other screen is matched against signed-in pages only.
+            public = [p for p in pages if p not in protected_pages]
+            candidates = (public or pages) if code.route in login_routes else (protected_pages or pages)
         else:
             candidates = by_route.get(code.route, [])
         best: Match | None = None

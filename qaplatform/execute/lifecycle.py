@@ -64,7 +64,7 @@ def run_lifecycle(runner: SmokeRunner, inv: CodeInventory, pages: list[ObservedP
         events("lifecycle", f"Clock-controlled check of {code_ref} on {route}", 88)
         with runner.session(clock=True):
             page, mon, clock = runner.page, runner.mon, runner.ctx.clock
-            ok, why = runner.prepare(p.url)
+            ok, why = runner.prepare(p.url, p.reveal)
             if not ok:
                 tests.append(TestRecord(test_key=f"timer|{timer.file}:{timer.line}|{route}", name=f"{route} polls every {ms / 1000:g}s", technique="lifecycle", category="lifecycle",
                                         route=route, expected=code_ref, observed=why, status="blocked"))
@@ -175,7 +175,7 @@ def run_lifecycle(runner: SmokeRunner, inv: CodeInventory, pages: list[ObservedP
         if not p:
             continue
         with runner.session(clock=True):
-            runner.prepare(p.url)
+            runner.prepare(p.url, p.reveal)
             runner.ctx.clock.pause_at(runner.page.evaluate("Date.now()") + 500)
             runner.ctx.clock.run_for(int(t.ms) + 2000)
             runner.page.wait_for_timeout(1000)

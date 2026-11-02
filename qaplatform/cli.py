@@ -50,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     with session(settings.database_url) as db:
         run = Run(project=args.project, repo_url=repos[0], live_url=args.live, status="claimed", stage="claimed",
                   options={"repos": repos, "max_pages": args.max_pages or settings.max_pages, "llm_intent": not args.no_llm, "phase2": not args.no_phase2,
-                           "modules": [m.strip() for m in args.modules.split(",") if m.strip()] or None, "load": args.load, "unit": args.unit, "unit_db": args.unit_db, "provision": args.provision, "branch": args.branch},
+                           "modules": [m.strip() for m in args.modules.split(",") if m.strip()] or None, "load": args.load, "load_authorized": args.load, "unit": args.unit, "unit_db": args.unit_db, "provision": args.provision, "branch": args.branch},
                   secrets=encrypt_secrets(settings.secret_key, {"email": args.email, "password": args.password}))
         db.add(run)
         db.commit()

@@ -15,7 +15,7 @@ from typing import Callable
 from urllib.parse import urljoin, urlparse
 
 from qaplatform.config import Settings
-from qaplatform.explore.browser import BrowserSession, LoginResult, attach_monitor, goto, login, same_origin
+from qaplatform.explore.browser import BrowserSession, LoginResult, attach_monitor, goto, login, same_origin, wait_for_data
 from qaplatform.explore.scripts import COLLECT_INTERACTIVE_JS, LAYOUT_CHECK_JS, NAV_CONTROLS_JS, PAGE_STATE_JS
 from qaplatform.ingest.js_parser import CodeRoute
 
@@ -44,6 +44,7 @@ class ObservedElement:
     download: bool = False
     haspopup: str | None = None
     expanded: str | None = None
+    placeholder: str | None = None
 
 
 @dataclass
@@ -220,6 +221,21 @@ def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: s
         events("explore", "Logging in with the test account", 30)
         ctx = session.new_context()
         result.login = login(ctx, base, email, password, settings, run_dir)
+        # The site may rate-limit sign-in (often from earlier runs). Wait it out and retry on
+        # our own, with growing pauses, instead of failing the run.
+        waited = 0
+        for pause in (60, 120, 240, 300, 300):
+            transient = result.login.rate_limited or result.login.server_error
+            if result.login.success or not transient or waited >= settings.login_wait_max_seconds:
+                break
+            pause = min(max(pause, result.login.retry_after or 0), settings.login_wait_max_seconds - waited)
+            why = "rate-limited by the site" if result.login.rate_limited else f"failing on the site's side (HTTP {result.login.server_error})"
+            events("explore", f"Sign-in is {why}; waiting {pause}s before retrying (waited {waited}s so far)", 30, level="warn")
+            ctx.close()
+            time.sleep(pause)
+            waited += pause
+            ctx = session.new_context()
+            result.login = login(ctx, base, email, password, settings, run_dir)
         if not result.login.success:
             result.warnings.append(result.login.error)
             ctx.close()
@@ -291,8 +307,10 @@ def _sweep_tabs(page, base: str, settings: Settings, shots_dir: Path, mon, resul
             loc = page.locator(ctl["selector"]).first
             if loc.count() == 0 or not loc.is_visible():
                 continue
+            mon.reset()  # this screen's own requests only (fault injection targets them)
             loc.click(timeout=settings.action_timeout_ms)
             page.wait_for_timeout(settings.settle_ms)
+            wait_for_data(page)  # per-row controls exist only once the screen's data has loaded
         except Exception as exc:
             result.warnings.append(f"nav '{label}': {type(exc).__name__}")
             continue
@@ -300,4 +318,7 @@ def _sweep_tabs(page, base: str, settings: Settings, shots_dir: Path, mon, resul
         if observed.state.get("domHash") in seen_hashes and len(observed.elements) <= 3:
             continue  # clicking it changed nothing meaningful
         seen_hashes.add(observed.state.get("domHash"))
+        # The URL hash is ours, not the app's: reloading it lands on the default screen.
+        # Record the nav click so every later test can reopen this screen.
+        observed.reveal = [{"selector": ctl["selector"], "role": ctl.get("role"), "name": label, "nav": True}]
         result.pages.append(observed)

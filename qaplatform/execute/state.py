@@ -14,7 +14,7 @@ import re
 from urllib.parse import urlparse
 
 from qaplatform.execute.guard import describe
-from qaplatform.execute.smoke import ComponentRecord, FindingRecord, SmokeRunner, TestRecord, fingerprint, step_of
+from qaplatform.execute.smoke import ComponentRecord, FindingRecord, SmokeRunner, TestRecord, fingerprint, load_url, signed_out, step_of
 from qaplatform.explore.browser import goto
 from qaplatform.explore.crawler import ObservedPage
 from qaplatform.explore.scripts import FORMS_JS, LAYERS_JS, PAGE_STATE_JS, STORAGE_KEYS_JS
@@ -47,9 +47,12 @@ def run_state(runner: SmokeRunner, pages: list[ObservedPage], components: list[C
         for i, p in enumerate(protected_pages, 1):
             if i % 5 == 0:
                 events("state", f"Reload check {i}/{len(protected_pages)}", 87)
-            ok, why = runner.prepare(p.url)
-            t = TestRecord(test_key=f"reload|{p.route}", name=f"Reloading {p.route} keeps the user there, signed in", technique="persistence", category="persistence", route=p.route,
-                           steps=[{"type": "NAVIGATE", "value": p.url}, {"type": "RELOAD"}], expected=f"After reload the URL is still {p.route} and the page renders")
+            ok, why = runner.prepare(p.url, p.reveal)
+            in_url = not any(s.get("nav") for s in p.reveal)
+            t = TestRecord(test_key=f"reload|{p.route}", name=f"Reloading {p.route} keeps the user " + ("there, signed in" if in_url else "signed in"), technique="persistence",
+                           category="persistence", route=p.route, steps=[{"type": "NAVIGATE", "value": load_url(p.url, p.reveal)}, *[{"type": "CLICK", "target": s, "description": "reveal"} for s in p.reveal], {"type": "RELOAD"}],
+                           expected=f"After reload the URL is still {p.route} and the page renders" if in_url else
+                           "After reload the user is still signed in and the app renders (the code keeps the open screen in memory, not the URL, so its default screen is expected)")
             if not ok:
                 t.status, t.observed = "blocked", why
                 tests.append(t)
@@ -64,10 +67,10 @@ def run_state(runner: SmokeRunner, pages: list[ObservedPage], components: list[C
             heading2 = page.evaluate(HEADING_JS)
             t.observed = f"after reload: {now}, heading {heading2!r}"
             t.reproduced_n = t.reproduced_m = 1
-            if "/login" in (now or "") and "/login" not in p.route:
+            if signed_out(page, token_keys) and "/login" not in p.route:
                 t.status = "fail"
                 findings.append(_f("reload-logout", p.route, "", "high", "persistence", f"Reloading {p.route} signs the user out", t, "ISO/IEC 25010 Reliability; OWASP WSTG-SESS"))
-            elif _path(now or "") != _path(p.url) or st.get("rootEmpty") or int(st.get("bodyTextLength", 0)) < 30:
+            elif (in_url and _path(now or "") != _path(p.url)) or st.get("rootEmpty") or int(st.get("bodyTextLength", 0)) < 30:
                 t.status = "fail"
                 findings.append(_f("reload-lost", p.route, "", "high", "persistence", f"Reloading {p.route} does not return to the same page", t, "ISTQB state transition"))
             else:
@@ -79,11 +82,11 @@ def run_state(runner: SmokeRunner, pages: list[ObservedPage], components: list[C
         if token_keys and protected_pages:
             p = protected_pages[0]
             tab = runner.ctx.new_page()
-            goto(tab, p.url, runner.settings)
+            goto(tab, load_url(p.url, p.reveal), runner.settings)
             now = _path(tab.url)
             t = TestRecord(test_key=f"newtab|{p.route}", name=f"A new tab opens {p.route} signed in", technique="persistence", category="persistence", route=p.route,
                            expected="localStorage session (code) is shared with a new tab of the same browser", observed=f"new tab landed on {now}",
-                           status="pass" if "/login" not in now else "fail", reproduced_n=1, reproduced_m=1)
+                           status="fail" if signed_out(tab, token_keys) else "pass", reproduced_n=1, reproduced_m=1)
             tests.append(t)
             if t.status == "fail":
                 findings.append(_f("newtab", p.route, "", "medium", "persistence", "A new browser tab is not signed in", t, "ISO/IEC 25010 Usability",
@@ -98,7 +101,7 @@ def run_state(runner: SmokeRunner, pages: list[ObservedPage], components: list[C
             if link:
                 pairs.append((a, link))
         for a, link in pairs[:4]:
-            ok, why = runner.prepare(a.url)
+            ok, why = runner.prepare(a.url, a.reveal)
             t = TestRecord(test_key=f"back|{a.route}|{link.label}", name=f"Back from {_path(link.href)} returns to {a.route}", technique="navigation", category="navigation", route=a.route,
                            steps=[{"type": "NAVIGATE", "value": a.url}, {"type": "CLICK", "target": step_of(link)}, {"type": "GO_BACK"}, {"type": "GO_FORWARD"}],
                            expected=f"Back returns to {a.route} with its content; Forward returns to {_path(link.href)}")
@@ -135,7 +138,7 @@ def run_state(runner: SmokeRunner, pages: list[ObservedPage], components: list[C
 
         # unsaved edits (heuristic, needs review): type into a form, leave via the nav
         for p in protected_pages:
-            ok, _ = runner.prepare(p.url)
+            ok, _ = runner.prepare(p.url, p.reveal)
             if not ok:
                 continue
             forms = [f for f in page.evaluate(FORMS_JS) if any(x["type"] in ("", "text", "textarea", "email") for x in f["fields"]) and not f["inLayer"]]
@@ -168,7 +171,7 @@ def run_state(runner: SmokeRunner, pages: list[ObservedPage], components: list[C
         # logout when the logout request fails (guard blocks it): local credentials must still be cleared
         logout = next((c for c in components if c.action_class == "session_ending" and c.page_url and c.visible), None)
         if logout:
-            ok, why = runner.prepare(logout.page_url)
+            ok, why = runner.prepare(logout.page_url, logout.reveal)
             loc = runner.locate(logout.selector, logout.role, logout.name or logout.label) if ok else None
             t = TestRecord(test_key="logout-offline", name="Logging out while the server is unreachable still signs out locally", technique="session", category="security", route=logout.route,
                            steps=[{"type": "NAVIGATE", "value": logout.page_url}, {"type": "CLICK", "target": step_of(logout)}],
@@ -180,7 +183,7 @@ def run_state(runner: SmokeRunner, pages: list[ObservedPage], components: list[C
                 results = []
                 for attempt in range(2):
                     if attempt:
-                        runner.prepare(logout.page_url)
+                        runner.prepare(logout.page_url, logout.reveal)
                         loc = runner.locate(logout.selector, logout.role, logout.name or logout.label)
                         if loc is None:
                             break
@@ -191,7 +194,7 @@ def run_state(runner: SmokeRunner, pages: list[ObservedPage], components: list[C
                     blocked = runner.guard.since(mark)
                     keys_after = page.evaluate(STORAGE_KEYS_JS)
                     left = [k for k in token_keys if k in keys_after]
-                    on_login = "/login" in _path(page.url)
+                    on_login = signed_out(page, token_keys)
                     results.append((on_login and not left, blocked, left, _path(page.url)))
                     if on_login and not left:
                         break
@@ -217,7 +220,7 @@ def run_state(runner: SmokeRunner, pages: list[ObservedPage], components: list[C
         if logout and protected_pages:
             p = protected_pages[0]
             with runner.guard.suspended():
-                ok, _ = runner.prepare(p.url)
+                ok, _ = runner.prepare(logout.page_url, logout.reveal)
                 loc = runner.locate(logout.selector, logout.role, logout.name or logout.label) if ok else None
                 if loc is not None:
                     loc.click()
@@ -225,11 +228,17 @@ def run_state(runner: SmokeRunner, pages: list[ObservedPage], components: list[C
                     page.go_back()
                     page.wait_for_timeout(runner.settings.settle_ms * 2)
                     st = page.evaluate(PAGE_STATE_JS)
-                    shows_login = bool(st.get("hasPasswordField")) or "/login" in (st.get("path") or "")
+                    # Protected content counts as shown only if Back lands on the app itself, signed in,
+                    # with its shell on screen. A logout that adds no history entry sends Back out of
+                    # the app (about:blank or the previous site): nothing protected is shown.
+                    in_app = urlparse(page.url).scheme in ("http", "https") and urlparse(page.url).netloc == urlparse(runner.live_url).netloc
+                    shell = in_app and bool(page.evaluate("() => !!document.querySelector('nav, aside, [role=navigation]')"))
+                    shows_login = not (in_app and shell and not signed_out(page, token_keys) and not st.get("hasPasswordField"))
                     t = TestRecord(test_key="back-after-logout", name="Back after logout does not show protected pages", technique="session", category="security", route=p.route,
                                    steps=[{"type": "NAVIGATE", "value": p.url}, {"type": "CLICK", "target": step_of(logout)}, {"type": "GO_BACK"}],
                                    expected="After logout, Back shows the sign-in page, not the previous protected page",
-                                   observed=f"after Back: {st.get('path')}, sign-in form {'shown' if shows_login else 'not shown'}",
+                                   observed=f"after Back: {page.url if not in_app else st.get('path')}, " + ("left the app (nothing protected shown)" if not in_app else
+                                            ("sign-in shown" if shows_login else "signed-in app shell shown")),
                                    status="pass" if shows_login else "fail", reproduced_n=1, reproduced_m=1)
                     tests.append(t)
                     if not shows_login:
