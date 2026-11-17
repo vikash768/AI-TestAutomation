@@ -1,0 +1,285 @@
+{
+ "uid": "qa-components",
+ "title": "QA Components",
+ "tags": [
+  "qa"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "version": 1,
+ "time": {
+  "from": "now-30d",
+  "to": "now"
+ },
+ "templating": {
+  "list": [
+   {
+    "name": "run",
+    "label": "Run",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "qa-postgres"
+    },
+    "query": "SELECT id AS __value, id || ' \u00b7 ' || project || ' \u00b7 ' || to_char(created_at, 'YYYY-MM-DD HH24:MI') AS __text FROM runs WHERE status = 'completed' ORDER BY created_at DESC",
+    "refresh": 2,
+    "multi": false,
+    "includeAll": false,
+    "sort": 0,
+    "definition": "SELECT id AS __value, id || ' \u00b7 ' || project || ' \u00b7 ' || to_char(created_at, 'YYYY-MM-DD HH24:MI') AS __text FROM runs WHERE status = 'completed' ORDER BY created_at DESC"
+   },
+   {
+    "name": "route",
+    "label": "Route",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "qa-postgres"
+    },
+    "query": "SELECT DISTINCT route FROM components WHERE run_id = '${run}' ORDER BY 1",
+    "refresh": 2,
+    "multi": true,
+    "includeAll": true,
+    "sort": 0,
+    "definition": "SELECT DISTINCT route FROM components WHERE run_id = '${run}' ORDER BY 1",
+    "allValue": ".*"
+   },
+   {
+    "name": "cstatus",
+    "label": "Status",
+    "type": "custom",
+    "query": "pass,fail,flaky,equivalent,blocked,skipped,observed,not_observed,untested",
+    "multi": true,
+    "includeAll": true,
+    "options": [
+     {
+      "text": "All",
+      "value": "$__all",
+      "selected": true
+     },
+     {
+      "text": "pass",
+      "value": "pass",
+      "selected": false
+     },
+     {
+      "text": "fail",
+      "value": "fail",
+      "selected": false
+     },
+     {
+      "text": "flaky",
+      "value": "flaky",
+      "selected": false
+     },
+     {
+      "text": "equivalent",
+      "value": "equivalent",
+      "selected": false
+     },
+     {
+      "text": "blocked",
+      "value": "blocked",
+      "selected": false
+     },
+     {
+      "text": "skipped",
+      "value": "skipped",
+      "selected": false
+     },
+     {
+      "text": "observed",
+      "value": "observed",
+      "selected": false
+     },
+     {
+      "text": "not_observed",
+      "value": "not_observed",
+      "selected": false
+     },
+     {
+      "text": "untested",
+      "value": "untested",
+      "selected": false
+     }
+    ],
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    }
+   }
+  ]
+ },
+ "panels": [
+  {
+   "id": 1,
+   "title": "Components by status",
+   "type": "bargauge",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "rawSql": "SELECT status, count(*) AS components FROM components WHERE run_id = '${run}' GROUP BY status ORDER BY 2 DESC",
+     "refId": "A",
+     "editorMode": "code"
+    }
+   ],
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 8,
+    "h": 7
+   },
+   "options": {
+    "orientation": "horizontal",
+    "displayMode": "gradient",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": true
+    }
+   }
+  },
+  {
+   "id": 2,
+   "title": "Coverage per route (code components found on the live app)",
+   "type": "barchart",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "rawSql": "SELECT route, count(*) FILTER (WHERE source = 'both') AS found, count(*) FILTER (WHERE source = 'code') AS \"not found\" FROM components WHERE run_id = '${run}' AND source IN ('code','both') GROUP BY route ORDER BY route",
+     "refId": "A",
+     "editorMode": "code"
+    }
+   ],
+   "gridPos": {
+    "x": 8,
+    "y": 0,
+    "w": 16,
+    "h": 7
+   },
+   "options": {
+    "orientation": "horizontal",
+    "stacking": "normal",
+    "xField": "route",
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    }
+   }
+  },
+  {
+   "id": 3,
+   "title": "Components",
+   "type": "table",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "rawSql": "SELECT route, kind, label, source, (SELECT string_agg(s->>'name', ' > ') FROM jsonb_array_elements(coalesce(attrs::jsonb->'reveal', '[]'::jsonb)) s) AS \"reached via\", action_class AS \"action class\", status, CASE WHEN code_file <> '' THEN code_file || ':' || coalesce(code_line::text, '') ELSE '' END AS code, intent->'expected' AS expected, intent->>'llm_expected' AS \"intent (llm)\", notes FROM components WHERE run_id = '${run}' AND route IN (${route:sqlstring}) AND status IN (${cstatus:sqlstring}) ORDER BY route, kind, label",
+     "refId": "A",
+     "editorMode": "code"
+    }
+   ],
+   "gridPos": {
+    "x": 0,
+    "y": 7,
+    "w": 24,
+    "h": 20
+   },
+   "options": {
+    "cellHeight": "sm",
+    "showHeader": true
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true,
+      "wrapText": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "status"
+      },
+      "properties": [
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "pass": {
+            "color": "green",
+            "index": 0
+           },
+           "fail": {
+            "color": "red",
+            "index": 1
+           },
+           "flaky": {
+            "color": "orange",
+            "index": 2
+           },
+           "blocked": {
+            "color": "yellow",
+            "index": 3
+           },
+           "not_observed": {
+            "color": "purple",
+            "index": 4
+           },
+           "skipped": {
+            "color": "text",
+            "index": 5
+           },
+           "equivalent": {
+            "color": "green",
+            "index": 6
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}

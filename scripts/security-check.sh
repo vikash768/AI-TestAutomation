@@ -24,7 +24,7 @@ while IFS= read -r path; do
                 *) report_tracked_file "$path" "tracked environment file" ;;
             esac
             ;;
-        artifacts/cache/*|artifacts/runs/*|artifacts/screenshots/*|artifacts/logs/*|artifacts/robot/*|artifacts/repos/*|artifacts/builds/*)
+        artifacts/cache/*|artifacts/runs/*|artifacts/logs/*|artifacts/repos/*|artifacts/builds/*)
             report_tracked_file "$path" "tracked generated artifact"
             ;;
         *.pem|*.key|*.p12|*.pfx|*.jks|*.keystore|*/id_rsa|*/id_ed25519)
@@ -36,7 +36,7 @@ while IFS= read -r path; do
         */.pytest_cache/*|*/.mypy_cache/*|*/.ruff_cache/*|*/__pycache__/*|*.pyc|*.pyo|*/.idea/*|*/.vscode/*|*/.DS_Store)
             report_tracked_file "$path" "tracked local development output"
             ;;
-        *.apk|*.aab|*.ipa|*.xcarchive/*|*.app/*|*.msi)
+        *.apk|*.aab|*.ipa|*.xcarchive/*|*.app/*|*.dmg|*.msi)
             report_tracked_file "$path" "tracked mobile or desktop build artifact"
             ;;
     esac
@@ -61,9 +61,7 @@ check_ignored ".env" "environment-file"
 check_ignored ".env.local" "environment-file"
 check_ignored "artifacts/cache/security-check-probe.json" "generated artifact"
 check_ignored "artifacts/runs/security-check-probe.json" "generated artifact"
-check_ignored "artifacts/screenshots/security-check-probe.png" "generated artifact"
 check_ignored "artifacts/logs/security-check-probe.log" "generated artifact"
-check_ignored "artifacts/robot/output.xml" "Robot artifact"
 check_ignored "security-check-probe.pem" "private-key"
 check_ignored "service-account-security-check.json" "credential-JSON"
 
@@ -85,6 +83,7 @@ scan_pattern "private key header" '-----BEGIN ([A-Z0-9]+ )?PRIVATE KEY-----'
 scan_pattern "AWS access key literal" 'AKIA[0-9A-Z]{16}'
 scan_pattern "Google API key literal" 'AIza[0-9A-Za-z_-]{30,}'
 scan_pattern "GitHub token literal" 'gh[pousr]_[0-9A-Za-z]{20,}'
+scan_pattern "GitHub fine-grained token literal" 'github_pat_[0-9A-Za-z_]{20,}'
 scan_pattern "Slack token literal" 'xox[baprs]-[0-9A-Za-z-]{10,}'
 scan_pattern "Bearer token literal" '[Bb]earer[[:space:]]+[0-9A-Za-z._~+/-]{20,}'
 

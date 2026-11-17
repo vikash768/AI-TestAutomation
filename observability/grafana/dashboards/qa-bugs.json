@@ -1,0 +1,1420 @@
+{
+ "uid": "qa-bugs",
+ "title": "QA Bug Report",
+ "tags": [
+  "qa"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "version": 1,
+ "refresh": "",
+ "description": "One row per bug with where to fix it, the code line, steps to reproduce and a screenshot.",
+ "time": {
+  "from": "now-30d",
+  "to": "now"
+ },
+ "links": [
+  {
+   "title": "Run page",
+   "type": "link",
+   "url": "${api_url}/runs/${run}",
+   "targetBlank": true,
+   "icon": "external link"
+  },
+  {
+   "title": "All findings",
+   "type": "link",
+   "url": "/d/qa-findings/qa-findings?var-run=${run}",
+   "icon": "dashboard"
+  },
+  {
+   "title": "Components",
+   "type": "link",
+   "url": "/d/qa-components/qa-components?var-run=${run}",
+   "icon": "dashboard"
+  },
+  {
+   "title": "Runs",
+   "type": "link",
+   "url": "/d/qa-runs/qa-runs",
+   "icon": "dashboard"
+  }
+ ],
+ "templating": {
+  "list": [
+   {
+    "name": "run",
+    "label": "Run",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "qa-postgres"
+    },
+    "refresh": 2,
+    "multi": false,
+    "includeAll": false,
+    "sort": 0,
+    "query": "SELECT id AS __value, id || ' · ' || project || ' · ' || platform || ' · ' || to_char(created_at, 'YYYY-MM-DD HH24:MI') AS __text FROM runs WHERE status = 'completed' ORDER BY created_at DESC",
+    "definition": "SELECT id AS __value, id || ' · ' || project || ' · ' || platform || ' · ' || to_char(created_at, 'YYYY-MM-DD HH24:MI') AS __text FROM runs WHERE status = 'completed' ORDER BY created_at DESC"
+   },
+   {
+    "name": "api_url",
+    "label": "API URL (screenshots, run page)",
+    "type": "textbox",
+    "query": "http://localhost:8000",
+    "current": {
+     "text": "http://localhost:8000",
+     "value": "http://localhost:8000"
+    },
+    "options": [
+     {
+      "text": "http://localhost:8000",
+      "value": "http://localhost:8000",
+      "selected": true
+     }
+    ]
+   }
+  ]
+ },
+ "panels": [
+  {
+   "id": 1,
+   "type": "text",
+   "title": "",
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 15,
+    "h": 9
+   },
+   "options": {
+    "mode": "markdown",
+    "content": "### How to read this report\n\n1. **Pick the run** in the *Run* menu above (newest first). The run page with the live log is [here](${api_url}/runs/${run}).\n2. **Bugs to fix** lists one bug per row, most severe first. Each row has everything needed to fix it:\n   * **Fix in**: who changes what. *app code* = the repository's source, *app build* = build configuration (Gradle, AndroidManifest, signing), *backend* = the server the app calls.\n   * **Code**: the file and line, at the exact commit that was tested. Click it to open it in the repository.\n   * **Screenshot** and **Steps to reproduce**: the proof. Click a screenshot to open it full size; scroll the table right for Expected / Actual.\n   * **Expected / Actual / How to fix**: what should happen, what happened, and the change that fixes it.\n3. **Held for review** are likely bugs the platform could not confirm on its own (heuristics, emulator-only measurements). Check them, then mark each *real* or *not a bug* on the run page; those labels feed the precision gauge.\n4. **All tests** shows every check that ran, passes included, so you can see what was covered and what was blocked.\n\nSeverity: **critical** crash, data loss or security hole · **high** broken feature or security weakness · **medium** wrong behaviour with a workaround · **low** polish, accessibility, performance."
+   }
+  },
+  {
+   "id": 2,
+   "type": "stat",
+   "title": "This run",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "gridPos": {
+    "x": 15,
+    "y": 0,
+    "w": 9,
+    "h": 9
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT\n  r.platform AS \"Platform\",\n  CASE WHEN r.platform = 'web' THEN r.live_url ELSE trim(coalesce(r.stats::jsonb->'build'->>'app_id', '') || ' ' || coalesce(r.stats::jsonb->'build'->>'version', '')) END AS \"Tested build / URL\",\n  coalesce(left(r.commit_sha, 10), '-') AS \"Code commit\",\n  coalesce(r.framework, '-') AS \"Framework\",\n  to_char(r.finished_at, 'YYYY-MM-DD HH24:MI') AS \"Finished\"\nFROM runs r WHERE r.id = '${run}'",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "/.*/",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "horizontal",
+    "wideLayout": true
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     }
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 3,
+   "type": "stat",
+   "title": "Bugs",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 9,
+    "w": 12,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT\n  count(*) FILTER (WHERE status IN ('reported', 'confirmed')) AS \"Bugs to fix\",\n  count(*) FILTER (WHERE status IN ('reported', 'confirmed') AND severity IN ('critical', 'high')) AS \"Critical + high\",\n  count(*) FILTER (WHERE status = 'needs_review') AS \"Held for review\"\nFROM findings WHERE run_id = '${run}'",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "background",
+    "graphMode": "none",
+    "orientation": "vertical"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 1
+       }
+      ]
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Critical + high"
+      },
+      "properties": [
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "green",
+           "value": null
+          },
+          {
+           "color": "red",
+           "value": 1
+          }
+         ]
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Held for review"
+      },
+      "properties": [
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "blue",
+           "value": null
+          }
+         ]
+        }
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": 4,
+   "type": "stat",
+   "title": "Tests",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 9,
+    "w": 12,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT\n  count(*) FILTER (WHERE status = 'pass') AS \"Passed\",\n  count(*) FILTER (WHERE status IN ('fail', 'flaky')) AS \"Failed\",\n  count(*) FILTER (WHERE status = 'blocked') AS \"Blocked / skipped\",\n  count(*) AS \"Total\"\nFROM tests WHERE run_id = '${run}'",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "background",
+    "graphMode": "none",
+    "orientation": "vertical"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "blue",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Passed"
+      },
+      "properties": [
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "green",
+           "value": null
+          }
+         ]
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Failed"
+      },
+      "properties": [
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "green",
+           "value": null
+          },
+          {
+           "color": "red",
+           "value": 1
+          }
+         ]
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Blocked / skipped"
+      },
+      "properties": [
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "text",
+           "value": null
+          }
+         ]
+        }
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": 5,
+   "type": "barchart",
+   "title": "Bugs by where to fix",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 13,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT coalesce(nullif(fix_in, ''), 'unclassified') AS \"Fix in\",\n  count(*) FILTER (WHERE severity IN ('critical', 'high')) AS \"critical + high\",\n  count(*) FILTER (WHERE severity = 'medium') AS \"medium\",\n  count(*) FILTER (WHERE severity IN ('low', 'info')) AS \"low\"\nFROM findings WHERE run_id = '${run}' AND status IN ('reported', 'confirmed') GROUP BY 1 ORDER BY 1",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "orientation": "horizontal",
+    "stacking": "normal",
+    "showValue": "auto",
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "xField": "Fix in"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "decimals": 0,
+     "min": 0,
+     "custom": {
+      "fillOpacity": 85
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "critical + high"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "red"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "medium"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "yellow"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "low"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "blue"
+        }
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": 6,
+   "type": "barchart",
+   "title": "Bugs by category",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 13,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT category AS \"Category\", count(*) AS \"Bugs\" FROM findings\nWHERE run_id = '${run}' AND status IN ('reported', 'confirmed') GROUP BY 1 ORDER BY 2 DESC",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "orientation": "horizontal",
+    "showValue": "auto",
+    "legend": {
+     "showLegend": false
+    },
+    "xField": "Category"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "decimals": 0,
+     "min": 0,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "orange"
+     },
+     "custom": {
+      "fillOpacity": 85
+     }
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 7,
+   "type": "barchart",
+   "title": "Tests by type",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 13,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT technique AS \"Test type\",\n  count(*) FILTER (WHERE status = 'pass') AS \"pass\",\n  count(*) FILTER (WHERE status IN ('fail', 'flaky')) AS \"fail\",\n  count(*) FILTER (WHERE status = 'blocked') AS \"blocked\"\nFROM tests WHERE run_id = '${run}' GROUP BY 1 ORDER BY 1",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "orientation": "horizontal",
+    "stacking": "normal",
+    "showValue": "auto",
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "xField": "Test type"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "decimals": 0,
+     "min": 0,
+     "custom": {
+      "fillOpacity": 85
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "pass"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "green"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "fail"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "red"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "blocked"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "text"
+        }
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": 8,
+   "type": "table",
+   "title": "Bugs to fix",
+   "description": "Confirmed by the platform (deterministic check or reproduced). One row per bug; scroll right for How to fix and the screenshot.",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 20,
+    "w": 24,
+    "h": 22
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT\n  f.id AS \"#\",\n  f.severity AS \"Severity\",\n  f.title AS \"Bug\",\n  regexp_replace(coalesce(\n      (SELECT e->>'path' FROM jsonb_array_elements(coalesce(f.evidence::jsonb, '[]'::jsonb)) e WHERE e->>'type' = 'screenshot' AND coalesce(e->>'path', '') <> '' LIMIT 1),\n      (SELECT p.screenshot FROM pages p WHERE p.run_id = f.run_id AND p.route = f.route AND coalesce(p.screenshot, '') <> '' ORDER BY p.id LIMIT 1),\n      ''), '^.*artifacts/', '${api_url}/artifacts/') AS \"Screenshot\",\n  f.fix_in AS \"Fix in\",\n  f.code_ref AS \"Code\",\n  CASE WHEN f.code_ref <> '' AND r.repo_url ~ '^https://(github|gitlab)\\.com/' AND coalesce(r.commit_sha, '') <> ''\n       THEN regexp_replace(r.repo_url, '\\.git$', '') || '/blob/' || r.commit_sha || '/' || split_part(f.code_ref, ':', 1)\n            || CASE WHEN split_part(f.code_ref, ':', 2) <> '' THEN '#L' || split_part(f.code_ref, ':', 2) ELSE '' END\n       ELSE '' END AS code_url,\n  f.fix AS \"How to fix\",\n  (SELECT string_agg(t.ord || '. ' || t.s, E'\\n' ORDER BY t.ord)\n     FROM jsonb_array_elements_text(coalesce(f.steps::jsonb, '[]'::jsonb)) WITH ORDINALITY AS t(s, ord)) AS \"Steps to reproduce\",\n  f.expected AS \"Expected\",\n  f.observed AS \"Actual\",\n  f.route AS \"Screen\",\n  f.category AS \"Category\",\n  f.standard_ref AS \"Standard\",\n  round(f.confidence::numeric, 2)::text || CASE WHEN f.reproduced_m > 0 THEN ' (' || f.reproduced_n || '/' || f.reproduced_m || ')' ELSE '' END AS \"Confidence\"\nFROM findings f JOIN runs r ON r.id = f.run_id\nWHERE f.run_id = '${run}' AND f.status IN ('reported', 'confirmed')\nORDER BY CASE f.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, f.fix_in, f.route, f.id",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "showHeader": true,
+    "cellHeight": "lg",
+    "footer": {
+     "show": false
+    },
+    "sortBy": []
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true,
+      "wrapText": true,
+      "align": "left",
+      "inspect": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "#"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 50
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Severity"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 90
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "critical": {
+            "color": "dark-red",
+            "index": 0
+           },
+           "high": {
+            "color": "orange",
+            "index": 1
+           },
+           "medium": {
+            "color": "yellow",
+            "index": 2
+           },
+           "low": {
+            "color": "blue",
+            "index": 3
+           },
+           "info": {
+            "color": "green",
+            "index": 4
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bug"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 220
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Screen"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 130
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Fix in"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 95
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "app code": {
+            "color": "blue",
+            "index": 0
+           },
+           "app build": {
+            "color": "purple",
+            "index": 1
+           },
+           "backend": {
+            "color": "orange",
+            "index": 2
+           },
+           "content": {
+            "color": "green",
+            "index": 3
+           },
+           "device": {
+            "color": "text",
+            "index": 4
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Code"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 200
+       },
+       {
+        "id": "links",
+        "value": [
+         {
+          "title": "Open this line in the repository, at the commit that was tested",
+          "url": "${__data.fields.code_url}",
+          "targetBlank": true
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "code_url"
+      },
+      "properties": [
+       {
+        "id": "custom.hidden",
+        "value": true
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Steps to reproduce"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 280
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Expected"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 200
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Actual"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 220
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "How to fix"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 340
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Screenshot"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 150
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "image"
+        }
+       },
+       {
+        "id": "links",
+        "value": [
+         {
+          "title": "Open the full-size screenshot",
+          "url": "${__value.raw}",
+          "targetBlank": true
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Category"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 110
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Standard"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 160
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Confidence"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 100
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": 9,
+   "type": "table",
+   "title": "Held for review (possible bugs)",
+   "description": "Not confirmed automatically: heuristics, emulator-only measurements, single observations. Mark them real / not a bug on the run page.",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 42,
+    "w": 24,
+    "h": 14
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT\n  f.id AS \"#\",\n  f.severity AS \"Severity\",\n  f.title AS \"Bug\",\n  regexp_replace(coalesce(\n      (SELECT e->>'path' FROM jsonb_array_elements(coalesce(f.evidence::jsonb, '[]'::jsonb)) e WHERE e->>'type' = 'screenshot' AND coalesce(e->>'path', '') <> '' LIMIT 1),\n      (SELECT p.screenshot FROM pages p WHERE p.run_id = f.run_id AND p.route = f.route AND coalesce(p.screenshot, '') <> '' ORDER BY p.id LIMIT 1),\n      ''), '^.*artifacts/', '${api_url}/artifacts/') AS \"Screenshot\",\n  f.fix_in AS \"Fix in\",\n  f.code_ref AS \"Code\",\n  CASE WHEN f.code_ref <> '' AND r.repo_url ~ '^https://(github|gitlab)\\.com/' AND coalesce(r.commit_sha, '') <> ''\n       THEN regexp_replace(r.repo_url, '\\.git$', '') || '/blob/' || r.commit_sha || '/' || split_part(f.code_ref, ':', 1)\n            || CASE WHEN split_part(f.code_ref, ':', 2) <> '' THEN '#L' || split_part(f.code_ref, ':', 2) ELSE '' END\n       ELSE '' END AS code_url,\n  f.fix AS \"How to fix\",\n  (SELECT string_agg(t.ord || '. ' || t.s, E'\\n' ORDER BY t.ord)\n     FROM jsonb_array_elements_text(coalesce(f.steps::jsonb, '[]'::jsonb)) WITH ORDINALITY AS t(s, ord)) AS \"Steps to reproduce\",\n  f.expected AS \"Expected\",\n  f.observed AS \"Actual\",\n  f.route AS \"Screen\",\n  f.category AS \"Category\",\n  f.standard_ref AS \"Standard\",\n  round(f.confidence::numeric, 2)::text || CASE WHEN f.reproduced_m > 0 THEN ' (' || f.reproduced_n || '/' || f.reproduced_m || ')' ELSE '' END AS \"Confidence\"\nFROM findings f JOIN runs r ON r.id = f.run_id\nWHERE f.run_id = '${run}' AND f.status IN ('needs_review')\nORDER BY CASE f.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, f.fix_in, f.route, f.id",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "showHeader": true,
+    "cellHeight": "lg",
+    "footer": {
+     "show": false
+    },
+    "sortBy": []
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true,
+      "wrapText": true,
+      "align": "left",
+      "inspect": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "#"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 50
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Severity"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 90
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "critical": {
+            "color": "dark-red",
+            "index": 0
+           },
+           "high": {
+            "color": "orange",
+            "index": 1
+           },
+           "medium": {
+            "color": "yellow",
+            "index": 2
+           },
+           "low": {
+            "color": "blue",
+            "index": 3
+           },
+           "info": {
+            "color": "green",
+            "index": 4
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bug"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 220
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Screen"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 130
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Fix in"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 95
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "app code": {
+            "color": "blue",
+            "index": 0
+           },
+           "app build": {
+            "color": "purple",
+            "index": 1
+           },
+           "backend": {
+            "color": "orange",
+            "index": 2
+           },
+           "content": {
+            "color": "green",
+            "index": 3
+           },
+           "device": {
+            "color": "text",
+            "index": 4
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Code"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 200
+       },
+       {
+        "id": "links",
+        "value": [
+         {
+          "title": "Open this line in the repository, at the commit that was tested",
+          "url": "${__data.fields.code_url}",
+          "targetBlank": true
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "code_url"
+      },
+      "properties": [
+       {
+        "id": "custom.hidden",
+        "value": true
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Steps to reproduce"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 280
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Expected"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 200
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Actual"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 220
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "How to fix"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 340
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Screenshot"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 150
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "image"
+        }
+       },
+       {
+        "id": "links",
+        "value": [
+         {
+          "title": "Open the full-size screenshot",
+          "url": "${__value.raw}",
+          "targetBlank": true
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Category"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 110
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Standard"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 160
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Confidence"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 100
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": 10,
+   "type": "table",
+   "title": "All tests in this run",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "qa-postgres"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 56,
+    "w": 24,
+    "h": 14
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "qa-postgres"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT status AS \"Result\", technique AS \"Test type\", category AS \"Category\", name AS \"Test\", route AS \"Screen\",\n  expected AS \"Expected\", observed AS \"Actual\",\n  CASE WHEN reproduced_m > 0 THEN reproduced_n || '/' || reproduced_m ELSE '' END AS \"Reproduced\"\nFROM tests WHERE run_id = '${run}'\nORDER BY CASE status WHEN 'fail' THEN 0 WHEN 'flaky' THEN 1 WHEN 'blocked' THEN 2 ELSE 3 END, technique, name",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "footer": {
+     "show": false
+    }
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true,
+      "wrapText": true,
+      "align": "left"
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Result"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 85
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "fail": {
+            "color": "red",
+            "index": 0,
+            "text": "FAIL"
+           },
+           "flaky": {
+            "color": "orange",
+            "index": 1,
+            "text": "FLAKY"
+           },
+           "blocked": {
+            "color": "text",
+            "index": 2,
+            "text": "BLOCKED"
+           },
+           "pass": {
+            "color": "green",
+            "index": 3,
+            "text": "PASS"
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Test type"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 110
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Category"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 110
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Test"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 280
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Screen"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 140
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Reproduced"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 90
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}

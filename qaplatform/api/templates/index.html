@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Test an application</h1>
+<div class="card">
+<form method="post" action="/runs" id="run-form">
+<div class="grid">
+<div><label for="platform">Platform</label><select id="platform" name="platform">
+<option value="web">Web (Playwright)</option>
+<option value="android">Android app (Appium)</option>
+<option value="ios">iOS app (Appium)</option>
+<option value="macos">macOS desktop app (Appium)</option>
+</select></div>
+<div><label for="repo_url">Codebase URL(s) (git) or local path(s)</label><textarea id="repo_url" name="repo_url" rows="2" required placeholder="https://github.com/org/frontend.git">{{ defaults.web.repo_url }}</textarea>
+<small data-for="app" hidden>One per line: the app's code first, then (optional) its backend API.</small></div>
+<div data-for="web"><label for="live_url">Live URL</label><input type="url" id="live_url" name="live_url" required value="{{ defaults.web.live_url }}" placeholder="https://app.example.com"></div>
+<div data-for="app" hidden><label for="app_path">App build: file path or installed app id</label><input type="text" id="app_path" name="app_path" value="" placeholder="/path/app-release.apk · /Applications/App.app · com.example.app"></div>
+<div><label for="project">Project name</label><input type="text" id="project" name="project" value="{{ defaults.web.project }}"></div>
+<div><label for="branch">Branch (optional)</label><input type="text" id="branch" name="branch" placeholder="main"></div>
+<div><label for="email">Test account email or username</label><input type="text" id="email" name="email" autocomplete="username" value="{{ defaults.web.email }}"></div>
+<div><label for="password">Test account password</label><input type="password" id="password" name="password"></div>
+<div><label for="github_token">Git token for private repos (optional)</label><input type="password" id="github_token" name="github_token" autocomplete="new-password" placeholder="leave empty to use the token in .env"></div>
+<div><label for="max_pages" id="max_pages_label">Max pages to explore</label><input type="number" id="max_pages" name="max_pages" value="60" min="1" max="500"></div>
+</div>
+<label><input type="checkbox" name="llm_intent" value="true" checked> <span data-for="web">Summarise page intent with the LLM (source code only; credentials never leave this machine)</span><span data-for="app" hidden>Use the LLM to describe each screen and plan user journeys and validation cases (code, screen texts and control labels only; credentials never leave this machine; the safety rules still decide every action)</span></label>
+<label><input type="checkbox" name="phase2" value="true" checked> <span data-for="web">Interaction tests: open menus, drawers and tabs; forms, validation, persistence, timers, failure handling</span><span data-for="app" hidden>Device tests: sign-in negatives, rotation, background / resume, relaunch, offline, input bounds</span></label>
+<label data-for="app" hidden><input type="checkbox" name="clean_start" value="true"> Clean start: clear the app's data on the device first (deletes anything stored only on the device)</label>
+<label data-for="app" hidden><input type="checkbox" name="journeys" value="true" checked> Full journeys with QA test data: fill forms with <code>qa_&lt;run&gt;_&lt;time&gt;</code> values, submit, verify, then clean up only what this run created</label>
+<label data-for="app" hidden><input type="checkbox" name="remote_qa_data" value="true"> Let journeys create QA records on the backend (off: stop before any step that would upload or sync; records that cannot be deleted are listed as leftovers)</label>
+<div data-for="app" hidden class="grid"><label><input type="checkbox" name="load_test" value="true" id="load_test" {{ 'checked' if defaults.load_test.enabled }}> Backend API load test (GET only, bounded by LOAD_TEST_* settings)</label>
+<div><label for="load_test_base_url">Backend API base URL for the load test (optional; else found in the code)</label><input type="url" id="load_test_base_url" name="load_test_base_url" value="{{ defaults.load_test.base_url }}" placeholder="https://api.example.com"></div></div>
+<button type="submit">Start run</button>
+<p data-for="web"><small>Every write the browser tries to make (POST, PUT, PATCH, DELETE) is intercepted and never reaches the server; only sign-in, token refresh and the logout test go through. Destructive actions only have their confirmation opened and cancelled. Credentials are encrypted at rest and wiped when the run finishes.</small></p>
+<p data-for="app" hidden><small>Native runs go to the host worker (<code>make app-worker-start</code>), which drives Appium on this machine: Android via UiAutomator2 on a connected device or emulator, macOS via Mac2. Only controls classed safe from their label and the code are tapped: anything that saves, uploads, syncs, deletes, signs out or leaves the app is held back and listed. Typed test input is never submitted and the original value is put back. Credentials are encrypted at rest and wiped when the run finishes.</small></p>
+</form>
+</div>
+
+<h2>Recent runs</h2>
+<div class="card">
+<table>
+<thead><tr><th>Run</th><th>Project</th><th>Platform</th><th>Target</th><th>Status</th><th>Stage</th><th>Result</th><th>Created</th></tr></thead>
+<tbody>
+{% for r in runs %}
+<tr><td><a href="/runs/{{ r.id }}">{{ r.id }}</a></td><td>{{ r.project }}</td><td>{{ r.platform or 'web' }}</td><td>{{ r.live_url }}</td><td><span class="pill {{ r.status }}">{{ r.status }}</span></td><td>{{ r.stage }} {{ r.progress }}%</td><td>{{ r.message }}</td><td><small>{{ r.created_at.strftime('%Y-%m-%d %H:%M') if r.created_at else '' }}</small></td></tr>
+{% else %}
+<tr><td colspan="8">No runs yet.</td></tr>
+{% endfor %}
+</tbody></table>
+</div>
+<script>
+(function () {
+  const defaults = {{ defaults | tojson }};
+  const form = document.getElementById("run-form");
+  const platform = document.getElementById("platform");
+  const fields = {repo_url: "repo_url", live_url: "live_url", app_path: "app_path", project: "project", email: "email"};
+  let current = "web";
+  function apply(next) {
+    const isApp = next !== "web";
+    form.querySelectorAll("[data-for=web]").forEach(el => el.hidden = isApp);
+    form.querySelectorAll("[data-for=app]").forEach(el => el.hidden = !isApp);
+    document.getElementById("live_url").required = !isApp;
+    document.getElementById("app_path").required = isApp;
+    document.getElementById("max_pages_label").textContent = isApp ? "Max screens to explore" : "Max pages to explore";
+    const mp = document.getElementById("max_pages");
+    if (mp.value === String((defaults[current] || {}).max_pages)) mp.value = (defaults[next] || {}).max_pages;
+    // swap in the new platform's defaults unless the user typed something of their own
+    for (const [key, id] of Object.entries(fields)) {
+      const input = document.getElementById(id);
+      const prev = (defaults[current] || {})[key] || "";
+      if (input.value === prev) input.value = (defaults[next] || {})[key] || "";
+    }
+    current = next;
+  }
+  // the browser restores the select after a reload or Back without firing "change": follow whatever it shows
+  function sync() { if (platform.value !== current) apply(platform.value); }
+  platform.addEventListener("change", sync);
+  window.addEventListener("pageshow", sync);
+  if (platform.value === "web" && defaults.platform && defaults.platform !== "web") platform.value = defaults.platform;
+  sync();
+})();
+</script>
+{% endblock %}

@@ -6,29 +6,22 @@
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
 .venv/
 venv/
-env/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 .coverage.*
-coverage.xml
 htmlcov/
 
-# Artifacts (generated at runtime)
-artifacts/robot/
-artifacts/screenshots/
-artifacts/logs/
+# Artifacts (generated at runtime; contain screenshots and cloned repos)
 artifacts/runs/
-artifacts/cache/
 artifacts/repos/
+artifacts/cache/
 artifacts/builds/
-/log.html
-/report.html
-/output.xml
+artifacts/logs/
+artifacts/workers/
 *.log
 *.pid
 
@@ -44,37 +37,28 @@ id_ed25519
 service-account*.json
 service_account*.json
 *-service-account.json
-*-service-account-key.json
 google-credentials*.json
-gcp-credentials*.json
 credentials.local.json
-credentials.*.local.json
 
-# Local mobile/desktop builds
+# Mobile / desktop builds under test
 *.apk
 *.aab
 *.ipa
 *.xcarchive/
 *.app/
+*.dmg
 *.msi
 
-# IDE
+# IDE / OS
 .idea/
 .vscode/
 *.swp
-*.swo
-*~
-
-# OS
 .DS_Store
 Thumbs.db
 
-# Docker volumes
-prometheus_data/
-grafana_data/
-
-# Temporary root scratch files
-/*.png
-/*.jpg
-/*.jpeg
-/*.xml
+# Local SQLite used for runs outside docker compose
+artifacts/*.db
+artifacts/local.db
+artifacts/app-worker.pid
+artifacts/screenshots/
+artifacts/robot/

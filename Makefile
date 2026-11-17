@@ -1,118 +1,103 @@
 # =============================================================================
-# AI Testing Automation — Makefile
+# AI-TestAutomation — Makefile
 # =============================================================================
+.PHONY: up down build logs health test run run-android run-desktop app-worker app-worker-start app-worker-stop app-worker-status appium open clean reset-runs psql security-check
 
-WEB_SUITE ?= testsuites/trackpilot.testsuite.md
-MOBILE_SUITE ?=
-DESKTOP_SUITE ?= testsuites/drawio-desktop.testsuite.md
-
-.PHONY: run up down health build test test-ai test-web test-suite test-desktop test-mobile test-mobile-detailed demo-web demo-mobile demo-desktop clean help
-
-## Run unified pipeline (usage: make run repo=https://github.com/org/repo platform=android)
-run:
-	./scripts/run-suite.sh $(if $(repo),--repo-url $(repo),) $(if $(platform),--platform $(platform),) $(if $(suite),--suite $(suite),)
-
-## Start all infrastructure services
+## Build images and start every service (Postgres, API, worker, Prometheus, Grafana)
 up:
-	./scripts/up.sh
+	docker compose up -d --build
+	@echo ""
+	@echo "  UI:         http://localhost:$${API_PORT:-8000}"
+	@echo "  Grafana:    http://localhost:$${GRAFANA_PORT:-3000}  (admin / admin)"
+	@echo "  Prometheus: http://localhost:$${PROMETHEUS_PORT:-9090}"
 
-## Stop all services
+## Stop every service (data volumes are kept)
 down:
-	./scripts/down.sh
+	docker compose down
 
-## Check health of all services
-health:
-	./scripts/health.sh
-
-## Build the test runner container
+## Rebuild the application image only
 build:
-	docker compose build test-runner
+	docker compose build api worker
 
-## Run the default Selenium web demo (TrackPilot)
-test-ai: test-web
+## Tail logs of the worker and API
+logs:
+	docker compose logs -f --tail=100 worker api
 
-test-web:
-	AI_MAX_CATEGORIES= AI_MAX_TESTS= TARGET_TYPE=web PROJECT_NAME=$(or $(PROJECT),trackpilot) \
-		APP_REPO_URL= REQUIRE_FULL_MD_COVERAGE=true \
-		./scripts/run-suite.sh $(or $(SUITE),$(WEB_SUITE))
+## Check that each service answers
+health:
+	@curl -sf http://localhost:$${API_PORT:-8000}/healthz > /dev/null && echo "  api        ok" || echo "  api        DOWN"
+	@curl -sf http://localhost:$${GRAFANA_PORT:-3000}/api/health > /dev/null && echo "  grafana    ok" || echo "  grafana    DOWN"
+	@curl -sf http://localhost:$${PROMETHEUS_PORT:-9090}/-/healthy > /dev/null && echo "  prometheus ok" || echo "  prometheus DOWN"
+	@docker compose exec -T postgres pg_isready -U $${POSTGRES_USER:-qa} > /dev/null 2>&1 && echo "  postgres   ok" || echo "  postgres   DOWN"
 
-## Run AI-driven tests for a specific suite (usage: make test-suite SUITE=testsuites/xxx.testsuite.md)
-## Supports optional TARGET_TYPE=web|desktop|mobile (default: web)
-test-suite:
-	AI_MAX_CATEGORIES= AI_MAX_TESTS= TARGET_TYPE=$(or $(TARGET_TYPE),web) \
-		REQUIRE_FULL_MD_COVERAGE=true ./scripts/run-suite.sh $(SUITE)
+## Run the unit tests locally (needs .venv: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/playwright install chromium)
+test:
+	.venv/bin/python -m pytest tests/unit -q
 
-## Run AI-driven tests (defaults to the Selenium web demo)
-test: test-web
+## Run one pipeline from the terminal inside the worker container:
+##   make run REPO=https://github.com/org/app.git LIVE=https://app.example.com
+run:
+	docker compose exec worker python -m qaplatform.cli run --repo "$(REPO)" --live "$(LIVE)" --project "$${PROJECT_NAME:-default}"
 
-## Run desktop tests via Appium (usage: make test-desktop SUITE=testsuites/xxx.testsuite.md)
-test-desktop:
-	AI_MAX_CATEGORIES= AI_MAX_TESTS= TARGET_TYPE=desktop REQUIRE_REPO_CONTEXT=true \
-		REQUIRE_BUILD_CONTEXT=true REQUIRE_FULL_MD_COVERAGE=true \
-		./scripts/run-suite.sh $(or $(SUITE),$(DESKTOP_SUITE))
+## Native app runs (Android / iOS / macOS) need this machine's Appium server, emulator and build
+## files, so they run in a worker on the host, next to the dockerised web worker:
+##   make up && make app-worker          then pick "Android app" or "macOS desktop app" in the form
+app-worker:
+	@test -x .venv/bin/python || (echo "Create the venv first: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt" && exit 1)
+	set -a; . ./.env; set +a; DATABASE_URL=postgresql+psycopg://$${POSTGRES_USER:-qa}:$${POSTGRES_PASSWORD:-qa}@localhost:$${POSTGRES_PORT:-5434}/$${POSTGRES_DB:-qa} \
+		QA_WORKER_PLATFORMS=android,ios,macos .venv/bin/python -m qaplatform.worker
 
-## Run mobile tests via Appium (usage: make test-mobile SUITE=testsuites/xxx.testsuite.md)
-test-mobile:
-	AI_MAX_CATEGORIES= AI_MAX_TESTS= TARGET_TYPE=mobile \
-		REQUIRE_REPO_CONTEXT=true REQUIRE_BUILD_CONTEXT=true REQUIRE_FULL_MD_COVERAGE=true \
-		./scripts/run-suite.sh $(or $(SUITE),$(MOBILE_SUITE))
+## Same worker, detached from the terminal (own session; survives closing it). Log: artifacts/logs/app-worker.log
+app-worker-start:
+	@mkdir -p artifacts/logs
+	@if [ -f artifacts/app-worker.pid ] && kill -0 $$(cat artifacts/app-worker.pid) 2>/dev/null; then \
+		echo "App worker already running (pid $$(cat artifacts/app-worker.pid)). Log: artifacts/logs/app-worker.log"; exit 0; fi; \
+	perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' $(MAKE) --no-print-directory app-worker > artifacts/logs/app-worker.log 2>&1 < /dev/null & \
+	echo $$! > artifacts/app-worker.pid; sleep 3; \
+	if kill -0 $$(cat artifacts/app-worker.pid) 2>/dev/null; then echo "App worker started (pid $$(cat artifacts/app-worker.pid)). Log: artifacts/logs/app-worker.log"; \
+	else echo "App worker exited; see artifacts/logs/app-worker.log"; tail -5 artifacts/logs/app-worker.log; exit 1; fi
 
-## Explicit alias for the full repository- and build-grounded mobile suite.
-test-mobile-detailed: test-mobile
+app-worker-stop:
+	@if [ -f artifacts/app-worker.pid ] && kill -0 $$(cat artifacts/app-worker.pid) 2>/dev/null; then \
+		kill -- -$$(cat artifacts/app-worker.pid) 2>/dev/null || kill $$(cat artifacts/app-worker.pid); \
+		for i in $$(seq 1 30); do ps -axo pgid= | grep -qw $$(cat artifacts/app-worker.pid) || break; sleep 1; done; \
+		echo "App worker stopped (its Appium session closed; an interrupted run goes back to the queue)"; \
+	else echo "No app worker running"; fi; rm -f artifacts/app-worker.pid
 
-## Lead-demo commands limit AI generation to one category for a fast live run.
-## Override with AI_MAX_CATEGORIES=N when a longer demo is desired.
-demo-web:
-	AI_MAX_CATEGORIES=$(or $(AI_MAX_CATEGORIES),1) AI_MAX_TESTS=$(or $(AI_MAX_TESTS),1) TARGET_TYPE=web \
-		PROJECT_NAME=$(or $(PROJECT),trackpilot) APP_REPO_URL= \
-		./scripts/run-suite.sh $(or $(SUITE),$(WEB_SUITE))
+app-worker-status:
+	@if [ -f artifacts/app-worker.pid ] && kill -0 $$(cat artifacts/app-worker.pid) 2>/dev/null; then echo "App worker running (pid $$(cat artifacts/app-worker.pid))"; \
+	else echo "App worker not running: make app-worker-start"; fi; tail -3 artifacts/logs/app-worker.log 2>/dev/null || true
 
-demo-mobile:
-	AI_MAX_CATEGORIES=$(or $(AI_MAX_CATEGORIES),1) AI_MAX_TESTS=$(or $(AI_MAX_TESTS),1) TARGET_TYPE=mobile \
-		REQUIRE_REPO_CONTEXT=true \
-		REQUIRE_BUILD_CONTEXT=true MOBILE_RESET_APP=true \
-		./scripts/run-suite.sh $(or $(SUITE),$(MOBILE_SUITE))
+## Start a local Appium server (the app worker also starts one on demand when APPIUM_AUTOSTART=true)
+appium:
+	appium --address 127.0.0.1 --port 4723
 
-demo-desktop:
-	AI_MAX_CATEGORIES=$(or $(AI_MAX_CATEGORIES),1) AI_MAX_TESTS=$(or $(AI_MAX_TESTS),1) TARGET_TYPE=desktop \
-		REQUIRE_REPO_CONTEXT=true REQUIRE_BUILD_CONTEXT=true ./scripts/run-suite.sh $(or $(SUITE),$(DESKTOP_SUITE))
+## One native run from the terminal, on the host:
+##   make run-android REPO=https://github.com/org/mobile.git APP=/path/app-release.apk
+##   make run-desktop REPO=https://github.com/jgraph/drawio-desktop APP=/Applications/draw.io.app
+run-android:
+	set -a; . ./.env; set +a; DATABASE_URL=postgresql+psycopg://$${POSTGRES_USER:-qa}:$${POSTGRES_PASSWORD:-qa}@localhost:$${POSTGRES_PORT:-5434}/$${POSTGRES_DB:-qa} \
+		.venv/bin/python -m qaplatform.cli run --platform android --repo "$(or $(REPO),$${ANDROID_REPO_URL})" --app "$(or $(APP),$${ANDROID_APP_PATH})" --project "$${ANDROID_PROJECT_NAME:-android}" --email "$${ANDROID_USER_EMAIL:-}" --password "$${ANDROID_USER_PASSWORD:-}"
 
-## Clean up test run outputs (runs, screenshots, logs) while keeping AI test plan cache
-clean-runs:
-	rm -rf artifacts/runs/* artifacts/screenshots/* artifacts/logs/*
+run-desktop:
+	set -a; . ./.env; set +a; DATABASE_URL=postgresql+psycopg://$${POSTGRES_USER:-qa}:$${POSTGRES_PASSWORD:-qa}@localhost:$${POSTGRES_PORT:-5434}/$${POSTGRES_DB:-qa} \
+		.venv/bin/python -m qaplatform.cli run --platform macos --repo "$(or $(REPO),$${DESKTOP_REPO_URL})" --app "$(or $(APP),$${DESKTOP_APP_PATH})" --project "$${DESKTOP_PROJECT_NAME:-desktop}"
 
-## Clean up artifacts, volumes, and containers
+## Check the repository for tracked secrets, builds and generated artifacts
+security-check:
+	./scripts/security-check.sh
+
+## Open a psql shell on the findings database
+psql:
+	docker compose exec postgres psql -U $${POSTGRES_USER:-qa} -d $${POSTGRES_DB:-qa}
+
+## Remove run artifacts (reports, screenshots, cloned repos) but keep the database
 clean:
-	./scripts/clean.sh
+	rm -rf artifacts/runs/* artifacts/repos/* artifacts/cache/* artifacts/logs/*
 
-## Clean everything including AI test plan cache
-clean-all:
-	CLEAN_CACHE=true ./scripts/clean.sh
-
-## Show help
-help:
-	@echo "AI Testing Automation — Available targets:"
-	@echo ""
-	@echo "  make run repo=<url> platform=<platform> [suite=<file>]"
-	@echo "                     Unified single-command pipeline: analyze, source build, execute"
-	@echo "  make up            Start infrastructure"
-	@echo "  make health        Check service health"
-	@echo "  make build         Build test runner image"
-	@echo ""
-	@echo "  make demo-web      Run TrackPilot in Selenium (starts/checks Selenium)"
-	@echo "  make demo-mobile  [SUITE=testsuites/xxx.testsuite.md]"
-	@echo "                     Run one mobile category in Appium (starts/checks emulator + Appium)"
-	@echo "  make demo-desktop  Run one source/build-grounded desktop category via Appium"
-	@echo "  make test-web      Run the complete TrackPilot Selenium suite"
-	@echo "  make test-ai       Same as test-web (backward-compatible)"
-	@echo "  make test-suite SUITE=testsuites/xxx.testsuite.md [TARGET_TYPE=web|desktop|mobile]"
-	@echo "                     Run AI tests for a specific suite"
-	@echo "  make test-desktop [SUITE=testsuites/xxx.testsuite.md]"
-	@echo "                     Run repo/build-grounded desktop tests via Appium"
-	@echo "  make test-mobile  [SUITE=testsuites/xxx.testsuite.md]"
-	@echo "                     Run repo/build-grounded mobile tests via Appium"
-	@echo ""
-	@echo "  make test          Same as test-web"
-	@echo "  make down          Stop infrastructure"
-	@echo "  make clean         Full cleanup"
-	@echo ""
+## Delete runs from the database (all, or PROJECT=name) with their findings, tests and artifacts; keeps builds
+reset-runs:
+	@ids=$$(docker compose exec -T postgres psql -U $${POSTGRES_USER:-qa} -d $${POSTGRES_DB:-qa} -qAtc \
+		"DELETE FROM runs $(if $(PROJECT),WHERE project = '$(PROJECT)') RETURNING id") || exit 1; \
+	for id in $$ids; do rm -rf artifacts/runs/$$id artifacts/repos/$$id; done; \
+	echo "Deleted $$(echo $$ids | wc -w | tr -d ' ') run(s)$(if $(PROJECT), for project $(PROJECT))"

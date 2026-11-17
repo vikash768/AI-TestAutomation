@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Fixture App</title>
+<style>
+body{font:14px system-ui;margin:0} nav a,button{margin:4px;padding:6px 10px;min-height:28px} .drawer{position:fixed;top:0;right:0;width:420px;height:100vh;background:#fff;border-left:1px solid #ccc;padding:16px;z-index:10}
+.backdrop{position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:9} .toast{position:fixed;bottom:10px;right:10px;background:#222;color:#fff;padding:8px} [role=menu]{position:fixed;background:#fff;border:1px solid #ccc;z-index:20}
+main{padding:16px} label{display:block;margin-top:8px} input,select{display:block;padding:6px;min-height:28px}
+</style></head>
+<body><div id="root"></div>
+<script>
+// A deliberately imperfect SPA. SEEDED BUGS are marked; everything else is correct and must produce no finding.
+const TOKEN = 'fx.refresh';
+const state = { drawer: null, menu: false, confirm: null, toast: null, error: null, liveTimer: null, liveCount: 0, autoRefresh: true };
+const root = document.getElementById('root');
+const api = async (method, path, body) => {
+  const r = await fetch(path, { method, headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (localStorage.getItem(TOKEN) || '') }, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.message || 'Request failed');
+  return j;
+};
+const go = (p) => { history.pushState({}, '', p); render(); };
+window.addEventListener('popstate', () => render());
+const toast = (m) => { state.toast = m; render(); setTimeout(() => { state.toast = null; render(); }, 1800); };
+const h = (html) => { const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content; };
+const authed = () => !!localStorage.getItem(TOKEN);
+
+function shell(inner) {
+  return `<nav><a href="/home" data-link>Home</a><a href="/items" data-link>Items</a><a href="/live" data-link>Live</a><a href="/settings" data-link>Settings</a><a href="/profile" data-link>Profile</a>
+    <button id="logout">Log out</button></nav><main>${inner}</main>
+    ${state.toast ? `<div class="toast" role="status">${state.toast}</div>` : ''}`;
+}
+
+async function render() {
+  stopLive();  // correct cleanup for the timer (see live page for the seeded leak)
+  const path = location.pathname;
+  if (path === '/login' || !authed() && path !== '/login') {
+    if (path !== '/login') { history.replaceState({}, '', '/login'); }
+    root.innerHTML = `<main><h1>Sign in</h1><form id="loginf">${state.error ? `<p role="alert">${state.error}</p>` : ''}
+      <label for="em">Email</label><input id="em" type="email" required>
+      <label for="pw">Password</label><input id="pw" type="password" required>
+      <button type="button" id="toggle" aria-label="Show password">eye</button>
+      <button type="submit">Sign in</button></form></main>`;
+    document.getElementById('toggle').onclick = () => { const p = document.getElementById('pw'); p.type = p.type === 'password' ? 'text' : 'password'; };
+    document.getElementById('loginf').onsubmit = async (e) => {
+      e.preventDefault(); state.error = null;
+      try { const j = await api('POST', '/api/login', { email: em.value, password: pw.value }); localStorage.setItem(TOKEN, j.token); go('/home'); }
+      catch (err) { state.error = err.message; render(); }
+    };
+    return;
+  }
+  if (path === '/home') {
+    root.innerHTML = shell(`<h1>Home</h1><p>Welcome back.</p><button id="menu" aria-haspopup="menu" aria-expanded="${state.menu}">Actions ▾</button>
+      ${state.menu ? `<div role="menu" style="top:120px;left:20px"><button role="menuitem" id="m-edit">Edit</button><button role="menuitem" id="m-del">Delete</button><button role="menuitem" id="m-arch">Archive now</button></div>` : ''}
+      ${state.drawer === 'edit' ? `<div class="backdrop" id="bd"></div><div class="drawer" role="dialog" aria-modal="true" aria-label="Edit"><h2>Edit</h2><form id="editf"><label for="nm">Name</label><input id="nm" required value="Alpha"><button type="submit">Save</button></form><button id="x">Close</button></div>` : ''}
+      ${state.confirm ? `<div class="backdrop"></div><div class="drawer" role="alertdialog" aria-modal="true" aria-label="Confirm"><p>Delete this item?</p><button id="c-cancel">Cancel</button><button id="c-ok">Delete</button></div>` : ''}`);
+    menu.onclick = () => { state.menu = !state.menu; render(); };
+    const md = document.getElementById('m-edit'); if (md) md.onclick = () => { state.menu = false; state.drawer = 'edit'; render(); setTimeout(() => { const f = document.getElementById('nm'); f && f.focus(); }, 0); };
+    const mx = document.getElementById('m-del'); if (mx) mx.onclick = () => { state.menu = false; state.confirm = 'del'; render(); };
+    // SEEDED BUG (destructive-no-confirm): archives immediately with a DELETE, no confirmation.
+    const ma = document.getElementById('m-arch'); if (ma) ma.onclick = async () => { state.menu = false; try { await api('DELETE', '/api/items/1'); } catch (e) {} render(); };
+    const cc = document.getElementById('c-cancel'); if (cc) cc.onclick = () => { state.confirm = null; render(); };
+    const ok = document.getElementById('c-ok'); if (ok) ok.onclick = async () => { try { await api('DELETE', '/api/items/1'); } catch (e) {} state.confirm = null; render(); };
+    const x = document.getElementById('x'); if (x) x.onclick = () => { state.drawer = null; render(); };
+    const ef = document.getElementById('editf'); if (ef) ef.onsubmit = async (e) => { e.preventDefault(); try { await api('PATCH', '/api/items/1', { name: nm.value }); state.drawer = null; toast('Saved'); } catch (err) { toast('Could not save. Try again.'); } };
+    document.onkeydown = (e) => { if (e.key === 'Escape' && (state.drawer || state.menu)) { state.drawer = null; state.menu = false; render(); } };
+  } else if (path === '/items') {
+    let rows = null, failed = false;
+    try { rows = (await api('GET', '/api/items')).items; } catch (e) { failed = true; }
+    // SEEDED BUG (fault: blank page): on an API failure the page renders nothing at all.
+    if (failed) { root.innerHTML = ''; return; }
+    root.innerHTML = shell(`<h1>Items</h1><button id="add">+ Add item</button><button id="note">Quick note</button>
+      <ul>${rows.map((r) => `<li>${r.name}</li>`).join('')}</ul>
+      ${state.drawer === 'add' ? `<div class="backdrop"></div><div class="drawer"><h2>Add item</h2><form id="addf"><p id="adderr" role="alert"></p>
+         <label for="iname">Item name</label><input id="iname" required>
+         <label for="iemail">Owner email</label><input id="iemail" type="email" required>
+         <button type="submit">Save item</button></form><button id="x2">Cancel</button></div>` : ''}
+      ${state.drawer === 'note' ? `<div class="backdrop"></div><div class="drawer"><h2>Quick note</h2><form id="notef" novalidate>
+         <label for="ntitle">Title</label><input id="ntitle" required>
+         <button type="submit">Save note</button></form><button id="x3">Cancel</button></div>` : ''}`);
+    // SEEDED BUG (a11y): these drawers have no role=dialog, do not take focus, and ignore Escape.
+    add.onclick = () => { state.drawer = 'add'; render(); };
+    note.onclick = () => { state.drawer = 'note'; render(); };
+    const x2 = document.getElementById('x2'); if (x2) x2.onclick = () => { state.drawer = null; render(); };
+    const x3 = document.getElementById('x3'); if (x3) x3.onclick = () => { state.drawer = null; render(); };
+    document.onkeydown = null;
+    const af = document.getElementById('addf'); if (af) af.onsubmit = async (e) => { e.preventDefault(); try { await api('POST', '/api/items', { name: iname.value.trim(), email: iemail.value }); state.drawer = null; render(); } catch (err) { adderr.textContent = 'Could not save the item.'; } };
+    // SEEDED BUGS (validation + silent failure): noValidate form that never checks its required title, and swallows save errors.
+    const nf = document.getElementById('notef'); if (nf) nf.onsubmit = async (e) => { e.preventDefault(); try { await api('POST', '/api/notes', { title: ntitle.value }); } catch (err) { /* nothing */ } };
+  } else if (path === '/live') {
+    root.innerHTML = shell(`<h1>Live</h1><label><input type="checkbox" id="auto" ${state.autoRefresh ? 'checked' : ''}> Auto-refresh</label><p id="count">polls: ${state.liveCount}</p>`);
+    auto.onchange = (e) => { state.autoRefresh = e.target.checked; render(); };
+    const poll = async () => { try { await api('GET', '/api/live'); state.liveCount++; const c = document.getElementById('count'); if (c) c.textContent = 'polls: ' + state.liveCount; } catch (e) {} };
+    poll();
+    // SEEDED BUG (lifecycle leak): this interval is stored where render() cannot clear it, so it keeps polling after navigation.
+    if (state.autoRefresh) { window.__leak = setInterval(poll, 15000); }
+  } else if (path === '/settings') {
+    let s = null, failed = false;
+    root.innerHTML = shell(`<h1>Settings</h1><p>Loading…</p>`);
+    try { s = (await api('GET', '/api/settings')).settings; } catch (e) { failed = true; }
+    if (location.pathname !== '/settings') return;
+    if (failed) {
+      root.innerHTML = shell(`<h1>Settings</h1><p role="alert">Could not load settings.</p><button id="retry">Retry</button>`);
+      retry.onclick = () => render();
+      return;
+    }
+    root.innerHTML = shell(`<h1>Settings</h1><form id="setf"><label for="tz">Timezone</label><input id="tz" value="${s.tz}" required>
+      <label for="iv">Interval minutes</label><input id="iv" type="number" min="1" max="60" value="${s.iv}" required><button type="submit">Save settings</button></form>`);
+    setf.onsubmit = async (e) => { e.preventDefault(); try { await api('PATCH', '/api/settings', { tz: tz.value, iv: Number(iv.value) }); toast('Settings saved'); } catch (err) { toast('Could not save settings.'); } };
+  } else if (path === '/profile') {
+    root.innerHTML = shell(`<h1>Profile</h1><form id="pf"><label for="fn">Full name</label><input id="fn" required value="Fixture User"><button type="submit">Save profile</button></form>`);
+    pf.onsubmit = async (e) => { e.preventDefault(); try { await api('PATCH', '/api/me', { name: fn.value }); toast('Profile saved'); } catch (err) { toast('Could not save profile.'); } };
+  } else {
+    history.replaceState({}, '', '/home'); return render();
+  }
+  root.querySelectorAll('a[data-link]').forEach((a) => a.onclick = (e) => { e.preventDefault(); go(a.getAttribute('href')); });
+  const lo = document.getElementById('logout');
+  // SEEDED BUG (session): the local token is only cleared if the server confirms the logout.
+  if (lo) lo.onclick = async () => { try { await api('POST', '/api/logout'); localStorage.removeItem(TOKEN); go('/login'); } catch (e) {} };
+}
+function stopLive() { /* intentionally does not clear window.__leak (seeded lifecycle bug) */ }
+render();
+</script>
+</body></html>
