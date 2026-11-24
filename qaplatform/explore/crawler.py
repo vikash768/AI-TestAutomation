@@ -60,6 +60,7 @@ class ObservedPage:
     console_errors: list[str] = field(default_factory=list)
     page_errors: list[str] = field(default_factory=list)
     failed_requests: list[dict] = field(default_factory=list)
+    third_party_errors: dict = field(default_factory=dict)
     viewports: dict = field(default_factory=dict)
     screenshot: str = ""
     state: dict = field(default_factory=dict)
@@ -153,6 +154,7 @@ def _capture_current(page, url: str, route: str, settings: Settings, shots_dir: 
         console_errors=snap["console_errors"],
         page_errors=snap["page_errors"],
         failed_requests=snap["failed_requests"],
+        third_party_errors={"console": snap.get("third_party_console", []), "failed": snap.get("third_party_failed", [])},
         screenshot=str(shot) if shot else "",
         state=state,
         api_requests=snap["api_requests"][:100],
@@ -175,7 +177,7 @@ def _capture_current(page, url: str, route: str, settings: Settings, shots_dir: 
     return observed
 
 
-def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: str, password: str, run_dir: Path, events: EventCb, routeless: bool = False) -> ExploreResult:
+def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: str, password: str, run_dir: Path, events: EventCb, routeless: bool = False, deep_public: bool = False) -> ExploreResult:
     result = ExploreResult(origin=f"{urlparse(live_url).scheme}://{urlparse(live_url).netloc}")
     shots_dir = run_dir / "screenshots"
     shots_dir.mkdir(parents=True, exist_ok=True)
@@ -187,7 +189,7 @@ def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: s
         # pass 1: unauthenticated guard checks
         ctx = session.new_context()
         page = ctx.new_page()
-        mon = attach_monitor(page)
+        mon = attach_monitor(page, live_url)
         events("explore", f"Checking {len(protected_routes)} protected routes without a session", 22)
         for r in protected_routes:
             url = base + r.path
@@ -203,15 +205,39 @@ def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: s
                 ))
             except Exception as exc:
                 result.warnings.append(f"guard check {r.path}: {type(exc).__name__}: {str(exc)[:120]}")
-        # public pages, unauthenticated — always include the live root (covers route-less / tab SPAs)
-        public_targets = list(dict.fromkeys([r.path for r in public_routes] + ["/"]))
-        for rp in public_targets:
-            url = base + rp
-            try:
-                observed = _capture_page(page, url, rp, settings, shots_dir, mon, protected=False)
+        # public pages, unauthenticated — always include the live root (covers route-less / tab SPAs).
+        start = list(dict.fromkeys([base + rp for rp in ([r.path for r in public_routes] + ["/"])]))
+        if deep_public:
+            # Tier 1 (live URL, no code): breadth-first over same-origin links so more than the home
+            # page is tested. Read-only — never follow logout, downloads, or destructive-looking links.
+            queue, seen = list(start), set()
+            SKIP = re.compile(r"logout|signout|sign-?out|log-?out|\b(delete|remove|destroy|deactivate)\b|\.(png|jpe?g|gif|webp|svg|pdf|zip|dmg|exe|mp4|mov|woff2?|css|js)$", re.I)
+            while queue and len(result.pages) < settings.max_pages:
+                url = queue.pop(0)
+                path = _norm_path(url)
+                if path in seen:
+                    continue
+                seen.add(path)
+                route = route_for(path, routes) or path
+                try:
+                    observed = _capture_page(page, url, route, settings, shots_dir, mon, protected=False)
+                except Exception as exc:
+                    result.warnings.append(f"public page {path}: {type(exc).__name__}: {str(exc)[:120]}")
+                    continue
                 result.pages.append(observed)
-            except Exception as exc:
-                result.warnings.append(f"public page {rp}: {type(exc).__name__}: {str(exc)[:120]}")
+                for el in observed.elements:
+                    if el.href and same_origin(el.href, base) and not el.download:
+                        p = _norm_path(el.href)
+                        if p not in seen and not SKIP.search(el.href):
+                            queue.append(urljoin(base + "/", p.lstrip("/")))
+            events("explore", f"Crawled {len(result.pages)} public page(s)", 28)
+        else:
+            for url in start:
+                rp = _norm_path(url)
+                try:
+                    result.pages.append(_capture_page(page, url, rp, settings, shots_dir, mon, protected=False))
+                except Exception as exc:
+                    result.warnings.append(f"public page {rp}: {type(exc).__name__}: {str(exc)[:120]}")
         ctx.close()
 
         # pass 2: login (only if credentials were supplied)
@@ -242,7 +268,7 @@ def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: s
             return result
         result.storage_state_path = result.login.storage_state_path
         page = ctx.new_page()
-        mon = attach_monitor(page)
+        mon = attach_monitor(page, live_url)
 
         queue: list[str] = []
         # Authenticated pass: do not treat public (unauthenticated) captures as "seen" —

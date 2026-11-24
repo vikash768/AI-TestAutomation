@@ -36,6 +36,12 @@ class Monitor:
     dialogs: list[dict] = field(default_factory=list)
     crashed: bool = False
     requests_seen: int = 0
+    # The page's own origin host, auto-detected from its main document. Errors and failed requests
+    # from OTHER hosts (Analytics, ads, fonts, chat widgets, Sentry) are the third party's, not the
+    # site's — reported as information, never as the site's bug.
+    origin: str = ""
+    third_party_console: list = field(default_factory=list)
+    third_party_failed: list = field(default_factory=list)
     # Native confirm() is dismissed by default (nothing is ever confirmed by accident). The
     # provision module sets this only around the Delete click on its own demo record.
     accept_confirm: bool = False
@@ -46,14 +52,26 @@ class Monitor:
         self.failed_requests.clear()
         self.api_requests.clear()
         self.dialogs.clear()
+        self.third_party_console.clear()
+        self.third_party_failed.clear()
         self.crashed = False
         self.requests_seen = 0
+
+    def first_party(self, url: str) -> bool:
+        if not self.origin:
+            return True  # origin not detected yet: be conservative, treat as the site's own
+        h = urlparse(url).hostname or ""
+        h = h[4:] if h.startswith("www.") else h
+        o = self.origin[4:] if self.origin.startswith("www.") else self.origin
+        return not h or h == o or h.endswith("." + o) or o.endswith("." + h)
 
     def snapshot(self) -> dict:
         return {
             "console_errors": list(dict.fromkeys(self.console_errors)),
             "page_errors": list(dict.fromkeys(self.page_errors)),
             "failed_requests": list(self.failed_requests),
+            "third_party_console": list(dict.fromkeys(self.third_party_console)),
+            "third_party_failed": list(self.third_party_failed),
             "api_requests": list(self.api_requests),
             "dialogs": list(self.dialogs),
             "crashed": self.crashed,
@@ -61,14 +79,23 @@ class Monitor:
         }
 
 
-def attach_monitor(page: Page) -> Monitor:
+def attach_monitor(page: Page, origin: str = "") -> Monitor:
     mon = Monitor()
+    if origin:
+        from urllib.parse import urlparse as _up
+        mon.origin = (_up(origin).hostname or origin) if "//" in origin else origin
 
     def on_console(msg):
         if msg.type in ("error",):
             text = msg.text[:300]
-            if not any(p.search(text) for p in NOISE_PATTERNS):
-                mon.console_errors.append(text)
+            if any(p.search(text) for p in NOISE_PATTERNS):
+                return
+            src = ""
+            try:
+                src = (msg.location or {}).get("url", "")
+            except Exception:
+                src = ""
+            (mon.console_errors if (not src or mon.first_party(src)) else mon.third_party_console).append(text)
 
     def on_page_error(err):
         mon.page_errors.append(str(err)[:300])
@@ -84,13 +111,18 @@ def attach_monitor(page: Page) -> Monitor:
             if "BLOCKED_BY_CLIENT" in text:
                 return
             if not any(p.search(req.url) or p.search(text) for p in NOISE_PATTERNS):
-                mon.failed_requests.append({"url": req.url[:300], "method": req.method, "status": None, "error": text[:120], "type": req.resource_type})
+                item = {"url": req.url[:300], "method": req.method, "status": None, "error": text[:120], "type": req.resource_type}
+                (mon.failed_requests if mon.first_party(req.url) else mon.third_party_failed).append(item)
 
     def on_response(resp):
         try:
-            if resp.status >= 400 and resp.request.resource_type in ("document", "xhr", "fetch", "script", "stylesheet", "image"):
+            rt = resp.request.resource_type
+            if rt == "document" and not mon.origin and (resp.frame.parent_frame is None):
+                mon.origin = urlparse(resp.url).hostname or ""  # the page's own origin, for first-party tagging
+            if resp.status >= 400 and rt in ("document", "xhr", "fetch", "script", "stylesheet", "image"):
                 if not any(p.search(resp.url) for p in NOISE_PATTERNS):
-                    mon.failed_requests.append({"url": resp.url[:300], "method": resp.request.method, "status": resp.status, "error": "", "type": resp.request.resource_type})
+                    item = {"url": resp.url[:300], "method": resp.request.method, "status": resp.status, "error": "", "type": rt}
+                    (mon.failed_requests if mon.first_party(resp.url) else mon.third_party_failed).append(item)
         except Exception:
             pass
 

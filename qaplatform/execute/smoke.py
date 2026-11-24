@@ -280,6 +280,16 @@ def page_tests(pages: list[ObservedPage], settings: Settings) -> tuple[list[Test
             findings.append(FindingRecord(fingerprint=fingerprint("net", route), route=route, category="stability", severity="medium",
                                           title=f"Network failures during load of {route}", description="\n".join(f"{r['method']} {r['url']} {r['error']}" for r in network[:5]),
                                           expected=t3.expected, observed=t3.observed, standard_ref="ISO/IEC 25010 Reliability", evidence=[{"type": "requests", "items": network[:10]}], test_key=t3.test_key))
+        # 3b. third-party errors — information, NOT the site's bug (Analytics, ads, fonts, widgets)
+        tp = getattr(p, "third_party_errors", {}) or {}
+        tp_console, tp_failed = tp.get("console", []), tp.get("failed", [])
+        if tp_console or tp_failed:
+            detail = [f"console: {m}" for m in tp_console[:3]] + [f"{r.get('method')} {r.get('url')} -> {r.get('status') or r.get('error')}" for r in tp_failed[:3]]
+            tests.append(TestRecord(test_key=f"thirdparty|{route}", name=f"Third-party resources on {route}", technique="page-load", category="information", route=route,
+                                    steps=[{"type": "OBSERVE", "value": "third-party network/console"}],
+                                    expected="Informational: errors from scripts the site loads from other companies (analytics, ads, fonts, chat)",
+                                    observed=f"{len(tp_console)} console error(s) and {len(tp_failed)} failed request(s) from other hosts — not caused by your site" + (": " + "; ".join(detail)[:200] if detail else ""),
+                                    status="pass", reproduced_n=1, reproduced_m=1))
         # 4. slow load
         if p.load_ms and p.load_ms > 5000:
             findings.append(FindingRecord(fingerprint=fingerprint("slow", route), route=route, category="performance", severity="low",
@@ -364,7 +374,7 @@ class SmokeRunner:
             if clock:
                 ctx.clock.install()
             self.page = ctx.new_page()
-            self.mon = attach_monitor(self.page)
+            self.mon = attach_monitor(self.page, self.live_url)
             # A reused session's token can go stale during the crawl (e.g. rotated),
             # leaving every page on the login screen. Verify we are signed in and
             # re-login once if not, so each module starts authenticated.
@@ -410,7 +420,7 @@ class SmokeRunner:
         with contextlib.suppress(Exception):
             self.page.close()
         self.page = self.ctx.new_page()
-        self.mon = attach_monitor(self.page)
+        self.mon = attach_monitor(self.page, self.live_url)
         self._dirty = True
 
     def _relogin(self, ctx) -> bool:
@@ -636,9 +646,13 @@ class SmokeRunner:
         else:
             out["expected"] = "Responds without errors"
 
+        # A navigational link (it has an href) or a path change means the browser loaded another
+        # page; that destination's console/network health is its own page-load test's concern, not
+        # something this click broke — so none of it is re-reported against the click.
+        nav = bool(comp.href) or comp.kind == "link" or bool(before.get("path") and after.get("path") and before.get("path") != after.get("path"))
         # Errors after a click count only when no write was intercepted: a blocked save
         # legitimately produces a failed request and usually an error message.
-        if out["status"] == "pass" and not writes and (errors or server or network or client):
+        if out["status"] == "pass" and not writes and not nav and (errors or server or network or client):
             out["status"] = "fail"
             out["category"] = "stability"
             out["ref"] = "ISO/IEC 25010 Reliability"
@@ -648,7 +662,7 @@ class SmokeRunner:
                 out["severity"], out["title"] = "medium", f"Console error after clicking '{label}' on {comp.route}"
             else:
                 out["severity"], out["title"] = "medium", f"Failed request after clicking '{label}' on {comp.route}"
-        elif out["status"] == "pass" and not writes and unauthorized:
+        elif out["status"] == "pass" and not writes and not nav and unauthorized:
             out.update(status="fail", severity="medium", category="security", ref="OWASP WSTG-ATHZ-02",
                        title=f"Unauthorized API response after clicking '{label}' on {comp.route}",
                        expected="An admin session is accepted by every endpoint the page calls")

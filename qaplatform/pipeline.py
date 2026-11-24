@@ -462,7 +462,7 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
         ctx.event("explore", f"Opening {live_url}", 20)
         max_pages = int(options.get("max_pages") or settings.max_pages)
         settings_local = Settings(**{**asdict(settings), "max_pages": max_pages})
-        ex = explore(settings_local, live_url, inv.routes, secrets.get("email", ""), secrets.get("password", ""), run_dir, ctx.event, routeless=getattr(inv, "routeless", False))
+        ex = explore(settings_local, live_url, inv.routes, secrets.get("email", ""), secrets.get("password", ""), run_dir, ctx.event, routeless=getattr(inv, "routeless", False), deep_public=(tier == "live"))
         for w in ex.warnings:
             ctx.event("explore", w, None, level="warn")
         if secrets.get("email") and ex.login is not None and not ex.login.success:
