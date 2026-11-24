@@ -647,10 +647,10 @@ class SmokeRunner:
         else:
             out["expected"] = "Responds without errors"
 
-        # A navigational link (it has an href) or a path change means the browser loaded another
-        # page; that destination's console/network health is its own page-load test's concern, not
-        # something this click broke — so none of it is re-reported against the click.
-        nav = bool(comp.href) or comp.kind == "link" or bool(before.get("path") and after.get("path") and before.get("path") != after.get("path"))
+        # Only a real navigation to another PATH loads a new document whose console/network health is
+        # its own page-load test's concern. A hash change or in-page SPA swap is NOT that — so an
+        # uncaught error thrown by clicking a hash/SPA link is still reported as this click's fault.
+        nav = bool(before.get("path") and after.get("path") and before.get("path") != after.get("path"))
         # Errors after a click count only when no write was intercepted: a blocked save
         # legitimately produces a failed request and usually an error message.
         if out["status"] == "pass" and not writes and not nav and (errors or server or network or client):

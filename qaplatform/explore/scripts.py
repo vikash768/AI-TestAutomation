@@ -50,6 +50,9 @@ COLLECT_INTERACTIVE_JS = r"""
     if (r.width <= 0 || r.height <= 0) return false;
     const cs = getComputedStyle(el);
     if (cs.visibility === 'hidden' || cs.display === 'none' || parseFloat(cs.opacity) === 0) return false;
+    // Screen-reader-only controls (a 1px box clipped to nothing — the "skip to content" pattern) are
+    // keyboard/AT-only, not mouse targets, so they are not "clickable" and must not be tested as such.
+    if ((r.width <= 2 || r.height <= 2) && (/rect\(0(px)?,? 0(px)?,? 0(px)?,? 0(px)?\)/.test(cs.clip) || /inset\(50%\)/.test(cs.clipPath))) return false;
     let p = el.parentElement;
     while (p) {
       const pcs = getComputedStyle(p);
@@ -204,8 +207,10 @@ LAYOUT_CHECK_JS = r"""
       const isField = (el) => ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName);
       const inside = (inner, outer) => inner.left >= outer.left - 1 && inner.right <= outer.right + 1 && inner.top >= outer.top - 1 && inner.bottom <= outer.bottom + 1;
       if ((isField(A) && !isField(B) && inside(b, a)) || (isField(B) && !isField(A) && inside(a, b))) continue;
+      // A visible overlap of >=6px on BOTH axes is a real collision (the paint check below confirms
+      // it is actually visible); a large proportional overlap also counts even if one control is small.
       const smaller = Math.min(a.width * a.height, b.width * b.height);
-      if (!(smaller > 0 && inter / smaller > 0.3)) continue;
+      if (!((ix >= 6 && iy >= 6) || (smaller > 0 && inter / smaller > 0.3))) continue;
       // VISUAL CONFIRM: at the collision centre one of the two must be the painted element, and both
       // must be painted somewhere. If a container/overlay sits on top, or either is invisible, the
       // eye sees no overlap — so the screenshot would show nothing and we do not report it.
@@ -236,22 +241,39 @@ LAYOUT_CHECK_JS = r"""
     }
   }
 
+  // Clipped TEXT: a single-line (white-space:nowrap/pre) text run cut off by an overflow:hidden box —
+  // the clip may be on the text element itself OR on an ancestor (e.g. a fixed-width ".ticker" around
+  // an <h1>). This deliberately ignores carousels/sliders/masks whose overflow crops BLOCKS, not a
+  // forced single line of text: there the text wraps normally and is not visibly cut.
+  const clipperOf = (el) => {
+    let p = el;
+    while (p && p !== document.body) {
+      const c = getComputedStyle(p);
+      if (/(hidden|clip)/.test(c.overflow) || /(hidden|clip)/.test(c.overflowX)) {
+        return c.textOverflow === 'ellipsis' ? null : p;  // ellipsis = intentional truncation
+      }
+      p = p.parentElement;
+    }
+    return null;
+  };
   const clipped = [];
   for (const el of all) {
     if (clipped.length >= 10) break;
-    const cs = getComputedStyle(el);
-    if (!/(hidden|clip)/.test(cs.overflow) && !/(hidden|clip)/.test(cs.overflowX)) continue;
-    if (cs.textOverflow === 'ellipsis') continue;
-    const r = el.getBoundingClientRect();
-    // Screen-reader-only text (".visually-hidden" / ".sr-only": a tiny box clipped to nothing) is hidden on purpose.
-    if (r.width <= 2 || r.height <= 2 || /rect\(0(px)?,? 0(px)?,? 0(px)?,? 0(px)?\)/.test(cs.clip) || /inset\(50%\)/.test(cs.clipPath)) continue;
-    if (el.children.length !== 0) continue;
+    if (el.children.length !== 0) continue;                 // text leaves only
     if (!(el.innerText || '').trim()) continue;
-    // Measure the rendered TEXT width, not scrollWidth (which padding and trailing whitespace
-    // inflate). Real clipping = the glyphs are genuinely wider than the content box by a visible
-    // margin AND the element is actually painted in the viewport.
-    if (textWidth(el) <= el.clientWidth + 4) continue;
-    if (!painted(el)) continue;
+    const cs = getComputedStyle(el);
+    if (!/(nowrap|pre)/.test(cs.whiteSpace)) continue;       // wrapping text can never be clipped this way
+    const clipper = clipperOf(el);
+    if (!clipper) continue;
+    const cr = clipper.getBoundingClientRect();
+    if (cr.width <= 2 || cr.height <= 2) continue;           // sr-only clipper
+    const r = el.getBoundingClientRect();
+    // The rendered text's right edge = the element's left + its content width (scrollWidth). A block
+    // heading is constrained to its parent's width, so its box does not grow — but its nowrap text
+    // overflows and is cut by the clipper. Compare that text edge to the clip box.
+    const textRight = r.left + el.scrollWidth;
+    const cut = textRight > cr.right + 4 || r.left < cr.left - 4;
+    if (!cut || !painted(el)) continue;
     clipped.push(desc(el));
   }
 
@@ -282,6 +304,14 @@ PAGE_STATE_JS = r"""
   for (const el of document.body ? document.body.querySelectorAll('img, svg, canvas, video, picture, [style*="background-image"], input, button, a[href], [role=img]') : []) {
     const rr = el.getBoundingClientRect();
     if (rr.width >= 8 && rr.height >= 8 && rr.top < vcH && rr.bottom > 0 && rr.left < vcW && rr.right > 0) { visibleContent += 1; if (visibleContent >= 3) break; }
+  }
+  if (visibleContent < 1) {
+    // Content may live in Shadow DOM, a <canvas> or an iframe (not reachable by the query above).
+    // Check what is actually PAINTED at a few viewport points — a real element there means not empty.
+    for (const [x, y] of [[vcW / 2, vcH * 0.12], [vcW / 2, vcH / 2], [vcW / 2, vcH * 0.3], [vcW * 0.3, vcH * 0.5], [vcW * 0.7, vcH * 0.5], [vcW * 0.25, vcH * 0.12]]) {
+      const t = document.elementFromPoint(x, y);
+      if (t && t !== document.body && t !== document.documentElement) { visibleContent = 1; break; }
+    }
   }
   return {
     url: location.href,

@@ -13,7 +13,7 @@ FINE = """<!doctype html><html><body style="margin:0">
   </div>
   <a href="#" style="display:inline-block;padding:14px;font-size:8px">x</a>                          <!-- small text, padded hit area >=24 -->
   <span class="sr-only" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">Menu</span>
-  <div style="overflow:hidden;width:100px"><div style="width:600px;height:10px">wide child, clipped by parent</div></div>
+  <div style="overflow:hidden;width:100px"><div style="width:600px;height:10px;background:#ccc"></div></div>
   <div style="position:relative;height:120px">
     <button style="position:absolute;left:10px;top:3000px;width:80px;height:40px">C</button>         <!-- overlapping pair far below the fold -->
     <button style="position:absolute;left:30px;top:3000px;width:80px;height:40px">D</button>
@@ -95,3 +95,75 @@ def test_truly_empty_page_is_still_flagged(page):
     page.set_content('<!doctype html><body style="margin:0"></body>')
     page.wait_for_timeout(50)
     assert _blank(page.evaluate(PAGE_STATE_JS))
+
+
+# --- battery-derived regressions: complex frontends must not false-positive, real bugs must be caught ---
+
+def test_text_clipped_by_a_parent_is_caught(page):
+    # fixed-width overflow:hidden + white-space:nowrap around a heading (clipped-heading bug)
+    page.set_content('<!doctype html><body style="margin:0"><div style="width:120px;overflow:hidden;white-space:nowrap"><h1 style="margin:0;font-size:16px">This heading is far too long to fit in the narrow ticker box</h1></div></body>')
+    page.wait_for_timeout(50)
+    r = page.evaluate(LAYOUT_CHECK_JS, {"checkTargets": False})
+    assert len(r["clipped"]) >= 1, r["clipped"]
+
+
+def test_carousel_track_is_not_clipped_text(page):
+    # overflow:hidden track with wrapping slide text — not a clipped-text bug
+    page.set_content('<!doctype html><body style="margin:0"><div style="width:300px;overflow:hidden"><div style="display:flex;width:900px">'
+                     '<p style="width:300px">Slide one with a normal paragraph of wrapping text here.</p>'
+                     '<p style="width:300px">Slide two also wraps its words across lines normally.</p>'
+                     '<p style="width:300px">Slide three stays perfectly readable and wraps.</p></div></div></body>')
+    page.wait_for_timeout(50)
+    assert page.evaluate(LAYOUT_CHECK_JS, {"checkTargets": False})["clipped"] == []
+
+
+def test_real_overlap_under_30_percent_is_still_caught(page):
+    page.set_content('<!doctype html><body style="margin:0"><div style="position:relative;height:80px">'
+                     '<button style="position:absolute;left:0;top:0;width:160px;height:48px">Pay now</button>'
+                     '<button style="position:absolute;left:120px;top:0;width:150px;height:48px">Back</button></div></body>')
+    page.wait_for_timeout(50)
+    assert len(page.evaluate(LAYOUT_CHECK_JS, {"checkTargets": True})["overlaps"]) >= 1
+
+
+def test_shadow_dom_page_is_not_empty():
+    from qaplatform.explore.scripts import PAGE_STATE_JS
+    from playwright.sync_api import sync_playwright
+    import pytest as _pt
+    pw = sync_playwright().start()
+    try:
+        try:
+            b = pw.chromium.launch(headless=True)
+        except Exception as exc:  # pragma: no cover
+            _pt.skip(f"chromium unavailable: {exc}")
+        pg = b.new_page()
+        pg.set_content('<!doctype html><body style="margin:0"><profile-card></profile-card>'
+                       '<script>customElements.define("profile-card",class extends HTMLElement{connectedCallback(){'
+                       'this.attachShadow({mode:"open"}).innerHTML="<div style=\\"padding:40px;font-size:20px\\">Jane Doe — Admin</div>";}});</script></body>')
+        pg.wait_for_timeout(80)
+        st = pg.evaluate(PAGE_STATE_JS)
+        assert int(st.get("visibleContent", 0)) >= 1  # shadow content counts as visible
+        b.close()
+    finally:
+        pw.stop()
+
+
+def test_sr_only_control_is_not_collected_as_clickable():
+    from qaplatform.explore.scripts import COLLECT_INTERACTIVE_JS
+    from playwright.sync_api import sync_playwright
+    import pytest as _pt
+    pw = sync_playwright().start()
+    try:
+        try:
+            b = pw.chromium.launch(headless=True)
+        except Exception as exc:  # pragma: no cover
+            _pt.skip(f"chromium unavailable: {exc}")
+        pg = b.new_page()
+        pg.set_content('<!doctype html><body><a class="sk" href="#main" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">Skip to content</a>'
+                       '<button>Real button</button></body>')
+        pg.wait_for_timeout(50)
+        els = pg.evaluate(COLLECT_INTERACTIVE_JS, 50)
+        names = [e.get("name") for e in els if e.get("visible")]
+        assert "Real button" in names and "Skip to content" not in names
+        b.close()
+    finally:
+        pw.stop()
