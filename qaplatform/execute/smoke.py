@@ -231,7 +231,7 @@ def page_tests(pages: list[ObservedPage], settings: Settings) -> tuple[list[Test
         route = p.route
         shot = {"type": "screenshot", "path": p.screenshot} if p.screenshot else None
         # 1. document status / blank page
-        blank = bool(p.state.get("rootEmpty")) or int(p.state.get("bodyTextLength", 0)) < 30
+        blank = bool(p.state.get("rootEmpty")) or (int(p.state.get("bodyTextLength", 0)) < 30 and int(p.state.get("visibleContent", 0)) < 1)
         bad_status = p.status_code is not None and p.status_code >= 400
         t = TestRecord(test_key=f"load|{route}", name=f"{route} renders", technique="page-load", category="stability", route=route,
                        steps=[{"type": "NAVIGATE", "value": p.url}], expected="Document returns < 400 and renders visible content",
@@ -566,7 +566,7 @@ class SmokeRunner:
         layers_after = after.get("dialogs", 0) + after.get("menus", 0) + after.get("overlays", 0)
         opened = layers_after > layers_before
         changed = url_changed or opened or after.get("domHash") != before.get("domHash")
-        blank = bool(after.get("rootEmpty")) or int(after.get("bodyTextLength", 0)) < 30
+        blank = bool(after.get("rootEmpty")) or (int(after.get("bodyTextLength", 0)) < 30 and int(after.get("visibleContent", 0)) < 1)
         to_login = "/login" in str(after.get("path", "")) and protected
         label = comp.label or comp.name
         parts = []

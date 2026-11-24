@@ -143,11 +143,13 @@ LAYOUT_CHECK_JS = r"""
     const r = el.getBoundingClientRect();
     return { tag: el.tagName.toLowerCase(), id: el.id || null, cls: (el.className && typeof el.className === 'string') ? el.className.split(/\s+/).slice(0, 3).join('.') : '', text: clean(el.innerText || el.textContent), bbox: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] };
   };
-  const inScrollContainer = (el) => {
+  const ancestorClips = (el) => {
+    // An ancestor with overflow hidden/clip/auto/scroll visually crops the child, so the child is
+    // not actually spilling past the page — it is clipped by its container.
     let p = el.parentElement;
     while (p && p !== document.body) {
       const cs = getComputedStyle(p);
-      if (/(auto|scroll)/.test(cs.overflowX) || /(auto|scroll)/.test(cs.overflow)) return true;
+      if (/(hidden|clip|auto|scroll)/.test(cs.overflowX) || /(hidden|clip|auto|scroll)/.test(cs.overflow)) return true;
       p = p.parentElement;
     }
     return false;
@@ -158,17 +160,30 @@ LAYOUT_CHECK_JS = r"""
     const cs = getComputedStyle(el);
     return cs.visibility !== 'hidden' && cs.display !== 'none' && parseFloat(cs.opacity) !== 0;
   };
+  // THE key precision gate: is `el` actually the painted (top, visible) element at a point inside
+  // its own box? A geometric issue the eye cannot see — because the element is covered, transparent
+  // behind something, or below the captured viewport — is not a bug a screenshot would show.
+  const W = window.innerWidth, Hh = window.innerHeight;
+  const topAt = (x, y) => (x >= 1 && y >= 1 && x < W - 1 && y < Hh - 1) ? document.elementFromPoint(x, y) : null;
+  const hits = (el, t) => !!t && (t === el || el.contains(t) || t.contains(el));
+  const painted = (el) => {
+    const r = el.getBoundingClientRect();
+    return hits(el, topAt(r.left + r.width / 2, r.top + r.height / 2))
+      || hits(el, topAt(r.left + 3, r.top + 3)) || hits(el, topAt(r.right - 3, r.bottom - 3))
+      || hits(el, topAt(r.right - 3, r.top + 3)) || hits(el, topAt(r.left + 3, r.bottom - 3));
+  };
+  const textWidth = (el) => { try { const rg = document.createRange(); rg.selectNodeContents(el); return rg.getBoundingClientRect().width; } catch (e) { return 0; } };
 
   const all = Array.from(document.body.querySelectorAll('*'));
   const overflowing = [];
   for (const el of all) {
     if (overflowing.length >= 10) break;
     const r = el.getBoundingClientRect();
-    if (r.width <= 0) continue;
+    if (r.width <= 1 || r.height <= 1) continue;
     const cs = getComputedStyle(el);
     if (cs.position === 'fixed') continue;
-    if (r.right > docW + 2 || r.left < -2) {
-      if (inScrollContainer(el)) continue;
+    if (r.right > docW + 3 || r.left < -3) {
+      if (ancestorClips(el)) continue;   // visually cropped by a container, not spilling off the page
       overflowing.push(desc(el));
     }
   }
@@ -176,9 +191,9 @@ LAYOUT_CHECK_JS = r"""
   const interactive = Array.from(document.querySelectorAll('a[href], button, input:not([type=hidden]), select, textarea, [role=button], [role=link], [role=tab], [role=menuitem], [role=switch]')).filter(visible).slice(0, 150);
   const overlaps = [];
   for (let i = 0; i < interactive.length && overlaps.length < 10; i++) {
-    const a = interactive[i].getBoundingClientRect();
+    const A = interactive[i], a = A.getBoundingClientRect();
     for (let j = i + 1; j < interactive.length; j++) {
-      const A = interactive[i], B = interactive[j];
+      const B = interactive[j];
       if (A.contains(B) || B.contains(A)) continue;
       const b = B.getBoundingClientRect();
       const ix = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
@@ -190,10 +205,16 @@ LAYOUT_CHECK_JS = r"""
       const inside = (inner, outer) => inner.left >= outer.left - 1 && inner.right <= outer.right + 1 && inner.top >= outer.top - 1 && inner.bottom <= outer.bottom + 1;
       if ((isField(A) && !isField(B) && inside(b, a)) || (isField(B) && !isField(A) && inside(a, b))) continue;
       const smaller = Math.min(a.width * a.height, b.width * b.height);
-      if (smaller > 0 && inter / smaller > 0.3) {
-        overlaps.push({ a: desc(A), b: desc(B) });
-        break;
-      }
+      if (!(smaller > 0 && inter / smaller > 0.3)) continue;
+      // VISUAL CONFIRM: at the collision centre one of the two must be the painted element, and both
+      // must be painted somewhere. If a container/overlay sits on top, or either is invisible, the
+      // eye sees no overlap — so the screenshot would show nothing and we do not report it.
+      const cx = (Math.max(a.left, b.left) + Math.min(a.right, b.right)) / 2;
+      const cy = (Math.max(a.top, b.top) + Math.min(a.bottom, b.bottom)) / 2;
+      const top = topAt(cx, cy);
+      if (!(hits(A, top) || hits(B, top)) || !painted(A) || !painted(B)) continue;
+      overlaps.push({ a: desc(A), b: desc(B) });
+      break;
     }
   }
 
@@ -205,7 +226,13 @@ LAYOUT_CHECK_JS = r"""
       if (el.tagName === 'A' && el.closest('p, li, td, span')) continue;
       // WCAG 2.5.8 exempts controls whose size the user agent sets (native checkbox / radio).
       if (el.tagName === 'INPUT' && ['checkbox', 'radio'].includes((el.type || '').toLowerCase())) continue;
-      if (r.width < 24 || r.height < 24) smallTargets.push(desc(el));
+      if (r.width >= 24 && r.height >= 24) continue;
+      if (!painted(el)) continue;   // covered or off the captured viewport — not a visible target
+      // The real tap area may come from a wrapping control with padding around a small child.
+      const host = el.closest('a[href], button, [role=button]') || el;
+      const hr = host.getBoundingClientRect();
+      if (hr.width >= 24 && hr.height >= 24) continue;
+      smallTargets.push(desc(el));
     }
   }
 
@@ -213,15 +240,19 @@ LAYOUT_CHECK_JS = r"""
   for (const el of all) {
     if (clipped.length >= 10) break;
     const cs = getComputedStyle(el);
-    if (cs.overflow !== 'hidden' && cs.overflowX !== 'hidden') continue;
+    if (!/(hidden|clip)/.test(cs.overflow) && !/(hidden|clip)/.test(cs.overflowX)) continue;
     if (cs.textOverflow === 'ellipsis') continue;
-    // Screen-reader-only text (".visually-hidden" / ".sr-only": a 1px box clipped to nothing) is
-    // hidden on purpose, not cut off by a layout bug.
     const r = el.getBoundingClientRect();
+    // Screen-reader-only text (".visually-hidden" / ".sr-only": a tiny box clipped to nothing) is hidden on purpose.
     if (r.width <= 2 || r.height <= 2 || /rect\(0(px)?,? 0(px)?,? 0(px)?,? 0(px)?\)/.test(cs.clip) || /inset\(50%\)/.test(cs.clipPath)) continue;
-    if (el.scrollWidth > el.clientWidth + 2 && el.clientWidth > 0 && (el.innerText || '').trim().length > 0 && el.children.length === 0) {
-      clipped.push(desc(el));
-    }
+    if (el.children.length !== 0) continue;
+    if (!(el.innerText || '').trim()) continue;
+    // Measure the rendered TEXT width, not scrollWidth (which padding and trailing whitespace
+    // inflate). Real clipping = the glyphs are genuinely wider than the content box by a visible
+    // margin AND the element is actually painted in the viewport.
+    if (textWidth(el) <= el.clientWidth + 4) continue;
+    if (!painted(el)) continue;
+    clipped.push(desc(el));
   }
 
   return { docW, scrollW, horizontalOverflow: scrollW > docW + 2, overflowing, overlaps, smallTargets, clipped };
@@ -244,11 +275,20 @@ PAGE_STATE_JS = r"""
     const r = el.getBoundingClientRect();
     if (r.width * r.height >= 0.4 * vw * vh) overlays += 1;
   }
+  // A page can be visually full (images, canvas, icons, media) with little text, so text length
+  // alone must never decide "empty". Count painted visual content inside the viewport.
+  let visibleContent = 0;
+  const vcW = window.innerWidth, vcH = window.innerHeight;
+  for (const el of document.body ? document.body.querySelectorAll('img, svg, canvas, video, picture, [style*="background-image"], input, button, a[href], [role=img]') : []) {
+    const rr = el.getBoundingClientRect();
+    if (rr.width >= 8 && rr.height >= 8 && rr.top < vcH && rr.bottom > 0 && rr.left < vcW && rr.right > 0) { visibleContent += 1; if (visibleContent >= 3) break; }
+  }
   return {
     url: location.href,
     path: location.pathname,
     title: document.title,
     bodyTextLength: text.trim().length,
+    visibleContent,
     rootEmpty: !root || root.children.length === 0,
     overlays,
     dialogs: document.querySelectorAll('[role=dialog], [role=alertdialog], [aria-modal="true"]').length,
