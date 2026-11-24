@@ -492,11 +492,12 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
         # A read token proves repo access, not that the entered live URL is this repo's deployment.
         # Best-effort check: does the repo reference the live host anywhere (config, docs, env example)?
         # This corroborates, it does not prove ownership; the strong binding (deploy nonce) comes later.
+        url_repo_link = ""
         if repos:
             host = urlparse(live_url).hostname or ""
             linked = _repo_mentions_host([r["info"].path for r in repos], host) if host else False
             stats_link = "corroborated" if linked else "unconfirmed"
-            options["url_repo_link"] = stats_link
+            url_repo_link = stats_link
             if linked:
                 ctx.event("ingest", f"Repo references the live host '{host}' — URL↔repo link corroborated", 13)
             else:
@@ -547,7 +548,7 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
             "pages": len(ex.pages), "routes": len(inv.routes), "tests": len(tests),
             "tests_by_status": {s: sum(1 for t in tests if t.status == s) for s in {t.status for t in tests}},
             "components_by_status": {s: sum(1 for c in components if c.status == s) for s in {c.status for c in components}},
-            "findings_by_bucket": bucket_counts,
+            "findings_by_bucket": bucket_counts, "url_repo_link": url_repo_link,
             "duration_seconds": round(time.time() - t0, 1),
         }
         with session(settings.database_url) as db:

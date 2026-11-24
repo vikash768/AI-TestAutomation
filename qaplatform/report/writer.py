@@ -45,7 +45,7 @@ def persist(db: Session, run: Run, pages: list[ObservedPage], components: list[C
         seen.add(f.fingerprint)
         db.add(Finding(run_id=run.id, test_id=test_ids.get(f.test_key or ""), component_id=comp_ids.get(f.component_key or ""), fingerprint=f.fingerprint, route=f.route, category=f.category,
                        severity=f.severity, title=f.title, description=f.description, expected=f.expected, observed=f.observed, standard_ref=f.standard_ref, viewport=f.viewport,
-                       confidence=f.confidence, reproduced_n=f.reproduced_n, reproduced_m=f.reproduced_m, status=f.status, evidence=f.evidence))
+                       confidence=f.confidence, reproduced_n=f.reproduced_n, reproduced_m=f.reproduced_m, status=f.status, bucket=(f.bucket or 'problem'), evidence=f.evidence))
         if f.status == "reported":
             counts[f.severity] = counts.get(f.severity, 0) + 1
         else:

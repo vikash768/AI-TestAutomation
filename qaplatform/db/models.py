@@ -143,6 +143,7 @@ class Finding(Base):
     reproduced_n: Mapped[int] = mapped_column(Integer, default=0)
     reproduced_m: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="reported", index=True)
+    bucket: Mapped[str] = mapped_column(String(10), default="problem", index=True)
     evidence: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 

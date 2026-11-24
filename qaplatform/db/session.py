@@ -24,7 +24,21 @@ def get_engine(database_url: str) -> Engine:
 def init_db(database_url: str) -> Engine:
     engine = get_engine(database_url)
     Base.metadata.create_all(engine)
+    _add_missing_columns(engine)
     return engine
+
+
+def _add_missing_columns(engine: Engine) -> None:
+    """Tiny forward-only migration for columns added after a table already exists (no Alembic here).
+    create_all never ALTERs an existing table, so add new columns idempotently."""
+    from sqlalchemy import text
+    adds = [("findings", "bucket", "VARCHAR(10) DEFAULT 'problem'")]
+    for table, col, decl in adds:
+        with engine.begin() as conn:
+            try:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {decl}"))
+            except Exception:
+                pass  # already exists (or table absent on a brand-new DB that create_all just made correctly)
 
 
 def session(database_url: str) -> Session:
