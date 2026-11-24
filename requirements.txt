@@ -13,3 +13,7 @@ prometheus-client==0.26.0
 cryptography==50.0.2
 httpx==0.28.1
 pytest==9.1.1
+# Tier 2 static analysis (SAST/SCA). gitleaks/trivy are separate binaries (installed in the image).
+bandit==1.9.4
+pip-audit==2.10.1
+semgrep==1.186.0

@@ -164,6 +164,7 @@ def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path,
     from qaplatform.execute.security import detect_api_base, run_security
     from qaplatform.execute.load import run_load
     from qaplatform.execute.unit import run_unit
+    from qaplatform.execute.sast import run_sast
     from qaplatform.execute.provision import run_provision
     from qaplatform.execute.smoke import TestRecord
     from qaplatform.execute.state import run_state
@@ -178,6 +179,8 @@ def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path,
     stats: dict = {"modules": {}}
     api_base = detect_api_base(inv, live_url)
     default_enabled = set(PHASE2_MODULES) | {"security"}
+    if repo_path is not None and options.get("tier", "full") in ("backend", "full"):
+        default_enabled.add("sast")  # read the code for security weaknesses (Tier 2/3)
     if options.get("load") and options.get("load_authorized"):
         default_enabled.add("load")
     if options.get("unit"):
@@ -220,6 +223,7 @@ def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path,
     # Creds-independent: security assessment and the codebase's own unit tests run with or without a login.
     _run("security", lambda: run_security(settings, live_url, inv, ex.pages, api_base, events))
     if repo_path is not None:
+        _run("sast", lambda: run_sast(repo_path, events))
         _run("unit", lambda: run_unit(repo_path, tag, events, env={"DATABASE_URL": settings.database_url.replace("+psycopg", "").replace("@localhost", "@postgres")} if options.get("unit_db") else None))
 
     events("execute", f"{len(tests)} checks done; starting smoke clicks", 60)
