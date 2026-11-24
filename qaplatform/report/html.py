@@ -10,6 +10,37 @@ from qaplatform.explore.crawler import ObservedPage
 
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
+BUCKET_LABEL = {
+    "problem": "Problems — reproduced issues visible on the page",
+    "review": "Worth a look — may be intentional; check against the screenshot",
+    "info": "Information — context, not a bug (third-party scripts, performance, headers)",
+}
+
+
+_FINDINGS_HEAD = "<thead><tr><th>Severity</th><th>Status</th><th>Category</th><th>Route</th><th>Finding</th><th>Expected</th><th>Observed</th><th>Standard</th><th>Confidence</th><th>Evidence</th></tr></thead>"
+
+
+def _findings_sections(buckets: dict) -> str:
+    out = []
+    for key in ("problem", "review", "info"):
+        rows = buckets.get(key, [])
+        body = "".join(rows) if rows else '<tr><td colspan="10">None.</td></tr>'
+        out.append(f"<h2>{html.escape(BUCKET_LABEL[key])} ({len(rows)})</h2><table>{_FINDINGS_HEAD}<tbody>{body}</tbody></table>")
+    return "\n".join(out)
+
+
+def finding_bucket(f: FindingRecord) -> str:
+    """Which section a finding belongs in. Only 'problem' is a headline bug; the report counts
+    these separately so low-value heuristics never dilute the real findings."""
+    cat = (f.category or "").lower()
+    title = (f.title or "").lower()
+    if cat == "information" or title.startswith("third-party") or cat == "performance":
+        return "info"
+    if cat in ("ui-responsive", "accessibility", "ux"):
+        # a page that literally scrolls sideways is a visible defect; keep it a problem.
+        return "problem" if "horizontal overflow" in title else "review"
+    return "problem"
+
 
 def _e(s) -> str:
     return html.escape(str(s if s is not None else ""))
@@ -30,7 +61,7 @@ def write_report(run_dir: Path, run_id: str, meta: dict, stats: dict, pages: lis
             seen.add(f.fingerprint)
             uniq.append(f)
     uniq.sort(key=lambda f: (0 if f.status == "reported" else 1, SEV_ORDER.get(f.severity, 9), f.route))
-    rows = []
+    buckets = {"problem": [], "review": [], "info": []}
     for f in uniq:
         ev = []
         for item in f.evidence:
@@ -42,11 +73,12 @@ def write_report(run_dir: Path, run_id: str, meta: dict, stats: dict, pages: lis
                 ev.append("<details><summary>requests</summary><pre>" + _e("\n".join(f"{r.get('method')} {r.get('url')} -> {r.get('status') or r.get('error')}" for r in item.get("items", []))) + "</pre></details>")
             elif item.get("type") == "layout":
                 ev.append("<details><summary>layout</summary><pre>" + _e(json.dumps({k: v for k, v in item.items() if k != "type"}, indent=1)[:2000]) + "</pre></details>")
-        rows.append(
+        row = (
             f"<tr class='sev-{_e(f.severity)} st-{_e(f.status)}'><td>{_e(f.severity)}</td><td>{_e(f.status)}</td><td>{_e(f.category)}</td><td>{_e(f.route)}</td>"
             f"<td><b>{_e(f.title)}</b><br><small>{_e(f.description[:400])}</small></td><td>{_e(f.expected)}</td><td>{_e(f.observed)}</td>"
             f"<td>{_e(f.standard_ref)}</td><td>{f.confidence:.2f} ({f.reproduced_n}/{f.reproduced_m})</td><td>{' '.join(ev)}</td></tr>"
         )
+        buckets.get(f.bucket or finding_bucket(f), buckets["problem"]).append(row)
     comp_rows = []
     for c in sorted(components, key=lambda c: (c.route, c.kind, c.label or c.name)):
         via = " > ".join(s.get("name") or "?" for s in (c.reveal or []))
@@ -76,10 +108,9 @@ def write_report(run_dir: Path, run_id: str, meta: dict, stats: dict, pages: lis
 <div class="stat"><b>{stats.get('tested_ratio', 0) * 100:.0f}%</b>of found components tested</div>
 <div class="stat"><b>{len(pages)}</b>pages explored</div>
 <div class="stat"><b>{len(tests)}</b>tests ({', '.join(f'{k} {v}' for k, v in sorted(test_counts.items()))})</div>
-<div class="stat"><b>{sum(1 for f in uniq if f.status == 'reported')}</b>findings reported ({sum(1 for f in uniq if f.status != 'reported')} need review)</div>
+<div class="stat"><b>{len(buckets['problem'])}</b>problems ({len(buckets['review'])} worth a look, {len(buckets['info'])} info)</div>
 </div>
-<h2>Findings</h2>
-<table><thead><tr><th>Severity</th><th>Status</th><th>Category</th><th>Route</th><th>Finding</th><th>Expected</th><th>Observed</th><th>Standard</th><th>Confidence</th><th>Evidence</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="10">No findings.</td></tr>'}</tbody></table>
+{_findings_sections(buckets)}
 <h2>Pages</h2>
 <table><thead><tr><th>Route</th><th>Title</th><th>HTTP</th><th>Controls</th><th>Console errors</th><th>Failed requests</th><th>Layout issues</th><th>Load</th><th>Screenshots</th></tr></thead><tbody>{''.join(page_rows)}</tbody></table>
 <h2>Tests by technique</h2>

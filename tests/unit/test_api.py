@@ -74,3 +74,27 @@ def test_live_tier_excludes_backend_modules():
     enabled -= {"security", "provision", "load", "unit", "forms", "auth"}
     assert "security" not in enabled and "forms" not in enabled and "auth" not in enabled
     assert {"reveal", "state", "lifecycle", "faults", "destructive"} <= enabled
+
+
+def test_finding_bucket_tiers():
+    from qaplatform.execute.smoke import FindingRecord
+    from qaplatform.report.html import finding_bucket
+    def f(cat, title="x", sev="medium"):
+        return FindingRecord(fingerprint=title, route="/", category=cat, severity=sev, title=title)
+    assert finding_bucket(f("stability", "Server error during load of /")) == "problem"
+    assert finding_bucket(f("ui-responsive", "Tap targets under 24px")) == "review"
+    assert finding_bucket(f("accessibility", "Clipped text on /")) == "review"
+    assert finding_bucket(f("ui-responsive", "Horizontal overflow on / at mobile")) == "problem"  # page scrolls sideways: visible
+    assert finding_bucket(f("information", "Third-party resources on /")) == "info"
+    assert finding_bucket(f("performance", "/ took 6000 ms to load")) == "info"
+
+
+def test_live_quick_depth_disables_phase2(client):
+    from qaplatform.db.models import Run
+    from qaplatform.db.session import session
+    r = client.post("/runs", data={"tier": "live", "live_url": "https://example.com", "owner_attested": "true", "depth": "quick"}, follow_redirects=False)
+    assert r.status_code == 303
+    rid = r.headers["location"].rsplit("/", 1)[-1]
+    with session(os.environ["DATABASE_URL"]) as db:
+        run = db.get(Run, rid)
+        assert run.options["depth"] == "quick" and run.options["phase2"] is False

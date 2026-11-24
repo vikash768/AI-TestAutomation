@@ -486,10 +486,14 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
             if state_file and state_file.exists():
                 state_file.unlink()  # holds a live refresh token; never keep it after the run
         # findings that are not click-based are deterministic single observations
+        from qaplatform.report.html import finding_bucket
         for f in findings:
             if f.reproduced_m == 0:
                 f.reproduced_n, f.reproduced_m = 1, 1
-        ctx.event("judge", f"{len(tests)} tests, {len({f.fingerprint for f in findings})} candidate findings; {sum(1 for f in findings if f.status != 'reported')} held for review", 92)
+            f.bucket = finding_bucket(f)  # problem (headline) / review / info
+        uniq_f = {f.fingerprint: f for f in findings}.values()
+        bucket_counts = {b: sum(1 for f in uniq_f if f.bucket == b) for b in ("problem", "review", "info")}
+        ctx.event("judge", f"{len(tests)} tests, {bucket_counts['problem']} problems ({bucket_counts['review']} worth a look, {bucket_counts['info']} info); {sum(1 for f in findings if f.status != 'reported')} held for review", 92)
 
         # 6. report ---------------------------------------------------------
         finished = datetime.now(timezone.utc)
@@ -499,6 +503,7 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
             "pages": len(ex.pages), "routes": len(inv.routes), "tests": len(tests),
             "tests_by_status": {s: sum(1 for t in tests if t.status == s) for s in {t.status for t in tests}},
             "components_by_status": {s: sum(1 for c in components if c.status == s) for s in {c.status for c in components}},
+            "findings_by_bucket": bucket_counts,
             "duration_seconds": round(time.time() - t0, 1),
         }
         with session(settings.database_url) as db:

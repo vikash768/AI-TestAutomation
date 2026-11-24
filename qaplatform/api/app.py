@@ -63,11 +63,12 @@ def create_run(
     github_token: str = Form(""), max_pages: int = Form(60), llm_intent: bool = Form(False), phase2: bool = Form(False), load: bool = Form(False), unit: bool = Form(False), provision: bool = Form(False), branch: str = Form(""),
     load_authorized: bool = Form(False), load_users: str = Form(""), load_seconds: str = Form(""), load_p95_ms: str = Form(""),
     load_mode: str = Form("ramp"), load_max_users: str = Form(""), load_step_seconds: str = Form(""), load_expected_users: str = Form(""),
-    tier: str = Form("full"), owner_attested: bool = Form(False),
+    tier: str = Form("full"), owner_attested: bool = Form(False), depth: str = Form("thorough"),
     db: Session = Depends(db_session),
 ):
     import re as _re
     tier = tier if tier in ("live", "backend", "full") else "full"
+    depth = depth if depth in ("quick", "thorough") else "thorough"
     repos = [u.strip() for u in _re.split(r"[\s,]+", repo_url.strip()) if u.strip()]
     if not live_url.strip():
         raise HTTPException(400, "a live URL is required")
@@ -76,6 +77,8 @@ def create_run(
         if not owner_attested:
             raise HTTPException(400, "tick the box confirming you own or are authorised to test this site")
         repos = []
+        # Quick = page health + crawl + responsive + safe clicks; Thorough adds reload/timer/fault checks.
+        phase2 = depth == "thorough"
     elif not repos:
         raise HTTPException(400, "the backend and full tiers need at least one GitHub repo URL")
     try:
@@ -83,7 +86,7 @@ def create_run(
     except ValueError as e:
         raise HTTPException(400, str(e))
     run = Run(project=project.strip() or "default", repo_url=repos[0] if repos else "", live_url=live_url.strip(), status="queued", stage="queued",
-              options={"tier": tier, "owner_attested": owner_attested, "repos": repos, "max_pages": max_pages, "llm_intent": llm_intent, "phase2": phase2, **load_opts, "unit": unit, "provision": provision, "branch": branch.strip()},
+              options={"tier": tier, "depth": depth, "owner_attested": owner_attested, "repos": repos, "max_pages": max_pages, "llm_intent": llm_intent, "phase2": phase2, **load_opts, "unit": unit, "provision": provision, "branch": branch.strip()},
               secrets=encrypt_secrets(settings.secret_key, {"email": email, "password": password, "github_token": github_token}))
     db.add(run)
     db.commit()

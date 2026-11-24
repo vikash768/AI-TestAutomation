@@ -8,6 +8,11 @@
 <label style="display:block;margin:3px 0"><input type="radio" name="tier" value="live" checked> <b>Live URL</b> — paste a link, we check the live site's pages and clicks. No code, read-only.</label>
 <label style="display:block;margin:3px 0"><input type="radio" name="tier" value="backend"> <b>Backend</b> — reads your code (GitHub token) for flaws and tests custom behaviour.</label>
 <label style="display:block;margin:3px 0"><input type="radio" name="tier" value="full"> <b>Full</b> — both of the above, plus deeper checks.</label>
+<div id="depth-field" style="margin-top:8px;font-size:13px;color:var(--muted)">
+Depth:
+<label style="margin-left:6px"><input type="radio" name="depth" value="quick"> Quick (pages, links, layout, safe clicks)</label>
+<label style="margin-left:10px"><input type="radio" name="depth" value="thorough" checked> Thorough (adds reload, timer and failure-handling checks)</label>
+</div>
 </div>
 <div class="grid">
 <div id="repo-field" style="grid-column:1/-1"><label for="repo_url">Codebase repo URL(s) — one per line (e.g. frontend and backend)</label><textarea id="repo_url" name="repo_url" rows="2" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--line);border-radius:6px;font-size:14px;font-family:ui-monospace,monospace" placeholder="https://github.com/org/frontend.git&#10;https://github.com/org/backend.git">{{ defaults.repo_url }}</textarea></div>
@@ -98,6 +103,7 @@
     document.getElementById('repo_url').required = !live;
     document.getElementById('attest-field').style.display = live ? '' : 'none';
     document.getElementById('owner_attested').required = live;
+    document.getElementById('depth-field').style.display = live ? '' : 'none';
   }
   document.querySelectorAll('input[name=tier]').forEach(function(r){ r.addEventListener('change', syncTier); });
   syncTier();

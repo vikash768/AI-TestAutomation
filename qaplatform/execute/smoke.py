@@ -145,6 +145,7 @@ class FindingRecord:
     reproduced_n: int = 0
     reproduced_m: int = 0
     status: str = "reported"
+    bucket: str = ""  # problem | review | info — set before the report (see report.html.finding_bucket)
     evidence: list = field(default_factory=list)
     component_key: str | None = None
     test_key: str | None = None
