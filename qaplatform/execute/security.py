@@ -159,7 +159,13 @@ def run_security(settings, live_url: str, inv: CodeInventory, pages, api_base: s
             checked += 1
             protected = r.status in (401, 403)
             not_found = r.status == 404
-            leaked = r.status == 200 and len(r.body_sample) > 2
+            # A real broken-access leak returns structured DATA (JSON). A 200 with an HTML body is
+            # almost always the SPA's index.html served as a fallback for an unknown path, not a leak.
+            ctype = r.headers.get("content-type", "")
+            body = (r.body_sample or "").lstrip()
+            looks_json = "json" in ctype or body[:1] in ("{", "[")
+            is_html = "html" in ctype or body[:15].lower().startswith(("<!doctype", "<html"))
+            leaked = r.status == 200 and len(r.body_sample) > 2 and looks_json and not is_html
             route = concrete
             t = _test(f"authz|{concrete}", f"Anonymous GET {concrete} is refused", route, "A protected data endpoint returns 401/403 without a session", f"HTTP {r.status}", "pass" if protected else ("skip" if not_found else "fail"))
             if not_found:
@@ -167,8 +173,9 @@ def run_security(settings, live_url: str, inv: CodeInventory, pages, api_base: s
                 t.observed = "404 (endpoint not deployed at this path)"
             tests.append(t)
             if leaked:
-                findings.append(_finding(f"authz-{concrete}", route, "critical", f"{concrete} returns data without authentication", t.expected, f"HTTP 200 with a body of {len(r.body_sample)} chars to an anonymous request", "OWASP WSTG-ATHZ-02 / Broken Access Control (OWASP Top 10 A01)",
-                                         desc="A sensitive endpoint the code gates behind auth answered an anonymous request with data."))
+                findings.append(_finding(f"authz-{concrete}", route, "critical", f"{concrete} may return data without authentication", t.expected, f"HTTP 200 with a JSON body of {len(r.body_sample)} chars to an anonymous request", "OWASP WSTG-ATHZ-02 / Broken Access Control (OWASP Top 10 A01)",
+                                         conf=0.6, status="needs_review",
+                                         desc="A sensitive endpoint the code gates behind auth answered an anonymous request with JSON data. Confirm it is not intentionally public."))
             if checked >= 25:
                 break
 

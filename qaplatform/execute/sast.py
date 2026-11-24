@@ -74,7 +74,8 @@ def _bandit(exe: str, repo: Path) -> list[FindingRecord]:
 
 
 def _semgrep(exe: str, repo: Path) -> list[FindingRecord]:
-    data = _run_json([exe, "scan", "--config", "auto", "--json", "--quiet", "--timeout", "0", str(repo)])
+    cfg = __import__("os").environ.get("SEMGREP_CONFIG", "auto")  # pin a ruleset to avoid the registry if needed
+    data = _run_json([exe, "scan", "--config", cfg, "--json", "--quiet", "--timeout", "0", str(repo)])
     out = []
     for r in (data or {}).get("results", []):
         extra = r.get("extra", {})
@@ -109,7 +110,8 @@ def _pip_audit(exe: str, repo: Path) -> list[FindingRecord]:
 def _gitleaks(exe: str, repo: Path) -> list[FindingRecord]:
     rpt = repo / ".qa-gitleaks.json"
     try:
-        subprocess.run([exe, "detect", "--source", str(repo), "--report-format", "json", "--report-path", str(rpt), "--no-banner", "--redact"],
+        # gitleaks v8: "dir" scans a directory (the old "detect --source" is gone).
+        subprocess.run([exe, "dir", str(repo), "--report-format", "json", "--report-path", str(rpt), "--no-banner", "--redact", "--exit-code", "0"],
                        capture_output=True, text=True, timeout=TIMEOUT)
         data = json.loads(rpt.read_text()) if rpt.exists() else []
     except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as exc:
@@ -125,13 +127,31 @@ def _gitleaks(exe: str, repo: Path) -> list[FindingRecord]:
     return out
 
 
+def _trivy(exe: str, repo: Path) -> list[FindingRecord]:
+    # Cross-language dependency CVEs (npm, pip, go, gem, cargo, ...) from lockfiles/manifests.
+    data = _run_json([exe, "fs", "--quiet", "--format", "json", "--scanners", "vuln", str(repo)])
+    out = []
+    for res in (data or {}).get("Results", []) or []:
+        by_pkg: dict = {}
+        for v in res.get("Vulnerabilities", []) or []:
+            by_pkg.setdefault((v.get("PkgName"), v.get("InstalledVersion")), []).append(v)
+        for (pkg, ver), vulns in by_pkg.items():
+            ids = ", ".join(dict.fromkeys(v.get("VulnerabilityID", "") for v in vulns))[:120]
+            fix = next((v.get("FixedVersion") for v in vulns if v.get("FixedVersion")), "")
+            sev = max((v.get("Severity", "LOW") for v in vulns), key=lambda s: ["LOW", "MEDIUM", "HIGH", "CRITICAL"].index(s) if s in ("LOW", "MEDIUM", "HIGH", "CRITICAL") else 0)
+            out.append(_finding("trivy", f"{pkg}@{ver}", _rel(res.get("Target", ""), repo), 0, sev,
+                                f"{pkg} {ver} has {len(vulns)} known vulnerabilit{'y' if len(vulns) == 1 else 'ies'}",
+                                f"{(vulns[0].get('Title') or '')[:220]}" + (f" Upgrade to {fix}." if fix else ""), ref=ids, conf=0.9))
+    return out
+
+
 def _first(v):
     if isinstance(v, list):
         return v[0] if v else ""
     return v or ""
 
 
-_RUNNERS = {"semgrep": _semgrep, "bandit": _bandit, "pip-audit": _pip_audit, "gitleaks": _gitleaks}
+_RUNNERS = {"semgrep": _semgrep, "bandit": _bandit, "pip-audit": _pip_audit, "gitleaks": _gitleaks, "trivy": _trivy}
 
 
 def run_sast(repo_path, events, tools: list[str] | None = None) -> tuple[list[TestRecord], list[FindingRecord], dict]:
@@ -169,5 +189,13 @@ def run_sast(repo_path, events, tools: list[str] | None = None) -> tuple[list[Te
             continue
         seen.add(f.fingerprint)
         uniq.append(f)
-    events("sast", f"Static analysis: {len(uniq)} finding(s) from {len(ran)} tool(s)", 18)
+    # Never imply the code is secure: state what ran and that a clean result is not a guarantee.
+    scanned = ", ".join(f"{k} ({v})" for k, v in ran.items()) or "no scanners available"
+    uniq.append(FindingRecord(
+        fingerprint=fingerprint("sast", "coverage"), route="(codebase)", category="information", severity="low",
+        title="Static-analysis coverage (not a security guarantee)",
+        description=f"Scanned with: {scanned}. These tools find known weakness patterns and vulnerable dependencies. "
+                    "A clean result does not prove the code is secure — it was not exhaustively tested, and logic/business-rule flaws are out of scope.",
+        expected="", observed=f"{len(uniq)} finding(s)", confidence=1.0, reproduced_n=1, reproduced_m=1, status="reported", bucket="info"))
+    events("sast", f"Static analysis: {len(uniq) - 1} finding(s) from {len(ran)} tool(s)", 18)
     return tests, uniq, {"sast_tools": ran}

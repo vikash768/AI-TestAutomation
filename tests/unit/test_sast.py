@@ -37,12 +37,28 @@ def test_pip_audit_reports_one_finding_per_vulnerable_package(repo):
 
 def test_missing_tool_is_blocked_not_failed(tmp_path):
     tests, findings, stats = run_sast(tmp_path, lambda *a, **k: None, tools=["definitely-not-a-real-tool"])
-    # unknown tool name is ignored; a known-but-absent tool records a blocked test
-    assert findings == []
+    # unknown tool name is ignored; only the informational coverage note is produced
+    assert [f for f in findings if f.bucket != "info"] == []
 
 
 def test_absent_known_tool_records_blocked(tmp_path, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name: None)
     tests, findings, stats = run_sast(tmp_path, lambda *a, **k: None, tools=["bandit", "semgrep", "gitleaks"])
-    assert findings == [] and all(t.status == "blocked" for t in tests)
+    assert [f for f in findings if f.bucket != "info"] == [] and all(t.status == "blocked" for t in tests)
     assert "not installed" in tests[0].observed
+
+
+@pytest.mark.skipif(not shutil.which("gitleaks"), reason="gitleaks not installed")
+def test_gitleaks_flags_a_committed_secret(tmp_path):
+    (tmp_path / "config.py").write_text('stripe_key = "sk_live_51H8xQ2eZvKYlo2CabcdefghijklmnopQRSTUV"\n')
+    _, findings, stats = run_sast(tmp_path, lambda *a, **k: None, tools=["gitleaks"])
+    secrets = [f for f in findings if f.bucket != "info"]
+    assert stats["sast_tools"]["gitleaks"] == 1
+    assert secrets and secrets[0].severity == "critical" and "secret" in secrets[0].title.lower()
+
+
+def test_coverage_note_is_always_present_and_honest():
+    tests, findings, stats = run_sast(".", lambda *a, **k: None, tools=["nonexistent-tool"])
+    note = [f for f in findings if f.bucket == "info"]
+    assert note and "not a security guarantee" in note[0].title.lower()
+    assert "does not prove the code is secure" in note[0].description.lower()
