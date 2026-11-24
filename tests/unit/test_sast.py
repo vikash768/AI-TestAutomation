@@ -62,3 +62,40 @@ def test_coverage_note_is_always_present_and_honest():
     note = [f for f in findings if f.bucket == "info"]
     assert note and "not a security guarantee" in note[0].title.lower()
     assert "does not prove the code is secure" in note[0].description.lower()
+
+
+def test_finding_bucket_demotes_low_severity_security(monkeypatch):
+    from qaplatform.execute.smoke import FindingRecord
+    from qaplatform.report.html import finding_bucket
+    def f(sev):
+        return FindingRecord(fingerprint="x", route="(codebase)", category="security", severity=sev, title="t")
+    assert finding_bucket(f("low")) == "review"        # "you used subprocess" style notes
+    assert finding_bucket(f("high")) == "problem" and finding_bucket(f("critical")) == "problem"
+
+
+@pytest.mark.skipif(not shutil.which("bandit"), reason="bandit not installed")
+def test_battery_python_vulns_are_headline_problems(tmp_path):
+    from qaplatform.report.html import finding_bucket
+    (tmp_path / "a.py").write_text("import os, hashlib\ndef h(r):\n    os.system('ping ' + r)\ndef d(x):\n    return hashlib.md5(x).hexdigest()\n")
+    _, findings, _ = run_sast(tmp_path, lambda *a, **k: None, tools=["bandit"])
+    problems = [f for f in findings if (f.bucket or finding_bucket(f)) == "problem"]
+    assert any("os.system" in f.title or "Starting a process with a shell" in f.title or "shell" in f.title.lower() for f in problems)
+    assert any("md5" in f.title.lower() or "MD5" in f.title for f in problems)
+
+
+@pytest.mark.skipif(not shutil.which("bandit"), reason="bandit not installed")
+def test_battery_safe_subprocess_is_not_a_headline_problem(tmp_path):
+    from qaplatform.report.html import finding_bucket
+    (tmp_path / "a.py").write_text("import subprocess\ndef r(args):\n    subprocess.run(args, shell=False)\n")
+    _, findings, _ = run_sast(tmp_path, lambda *a, **k: None, tools=["bandit"])
+    problems = [f for f in findings if (f.bucket or finding_bucket(f)) == "problem"]
+    assert problems == []  # low-severity "you used subprocess" notes are Worth-a-look, not headline bugs
+
+
+@pytest.mark.skipif(not shutil.which("semgrep"), reason="semgrep not installed")
+def test_custom_frontend_rules_are_valid():
+    import subprocess
+    from pathlib import Path
+    rules = Path("qaplatform/execute/sast_rules/frontend.yml")
+    p = subprocess.run(["semgrep", "--validate", "--config", str(rules)], capture_output=True, text=True, timeout=120)
+    assert p.returncode == 0, p.stderr[-400:]

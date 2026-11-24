@@ -1,0 +1,34 @@
+# High-value client-side (DOM) security patterns Semgrep's default packs under-cover.
+# Each matches a non-literal (tainted-capable) value, so static strings don't false-positive.
+rules:
+  - id: dom-innerhtml-assignment
+    languages: [javascript, typescript]
+    message: "Assigning a non-literal value to innerHTML/outerHTML can introduce DOM-based XSS. Use textContent, or sanitize the value."
+    severity: WARNING
+    metadata:
+      cwe: "CWE-79: Cross-site Scripting"
+      owasp: "A03:2021 Injection"
+    patterns:
+      - pattern-either:
+          - pattern: "$EL.innerHTML = $X"
+          - pattern: "$EL.outerHTML = $X"
+      - pattern-not: '$EL.innerHTML = "..."'
+      - pattern-not: '$EL.outerHTML = "..."'
+  - id: dom-document-write
+    languages: [javascript, typescript]
+    message: "document.write with a non-literal value can introduce XSS."
+    severity: WARNING
+    metadata:
+      cwe: "CWE-79: Cross-site Scripting"
+    patterns:
+      - pattern: "document.write($X)"
+      - pattern-not: 'document.write("...")'
+  - id: dom-insert-adjacent-html
+    languages: [javascript, typescript]
+    message: "insertAdjacentHTML with a non-literal value can introduce XSS."
+    severity: WARNING
+    metadata:
+      cwe: "CWE-79: Cross-site Scripting"
+    patterns:
+      - pattern: "$EL.insertAdjacentHTML($POS, $X)"
+      - pattern-not: '$EL.insertAdjacentHTML($POS, "...")'

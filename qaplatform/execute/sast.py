@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -74,8 +75,12 @@ def _bandit(exe: str, repo: Path) -> list[FindingRecord]:
 
 
 def _semgrep(exe: str, repo: Path) -> list[FindingRecord]:
-    cfg = __import__("os").environ.get("SEMGREP_CONFIG", "auto")  # pin a ruleset to avoid the registry if needed
-    data = _run_json([exe, "scan", "--config", cfg, "--json", "--quiet", "--timeout", "0", str(repo)])
+    rules_dir = Path(__file__).parent / "sast_rules"           # our high-value client-side rules
+    cmd = [exe, "scan", "--config", str(rules_dir), "--json", "--quiet", "--timeout", "0", str(repo)]
+    cfg = os.environ.get("SEMGREP_CONFIG", "auto")             # plus the registry/community ruleset
+    if cfg:
+        cmd[4:4] = ["--config", cfg]
+    data = _run_json(cmd)
     out = []
     for r in (data or {}).get("results", []):
         extra = r.get("extra", {})

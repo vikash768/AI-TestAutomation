@@ -39,6 +39,8 @@ def finding_bucket(f: FindingRecord) -> str:
     if cat in ("ui-responsive", "accessibility", "ux"):
         # a page that literally scrolls sideways is a visible defect; keep it a problem.
         return "problem" if "horizontal overflow" in title else "review"
+    if cat == "security" and f.severity == "low":
+        return "review"   # low-severity static notes (e.g. "you used subprocess") are not headline bugs
     return "problem"
 
 
