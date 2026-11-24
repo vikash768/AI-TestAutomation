@@ -190,6 +190,11 @@ def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path,
         enabled -= set(PHASE2_MODULES)
     if not options.get("load_authorized"):
         enabled.discard("load")  # load traffic needs the operator's explicit authorisation, however modules were chosen
+    if options.get("tier") == "live":
+        # Tier 1 (live URL, no source code): read-only health + safe clicks only.
+        # No backend security probes, no create-then-delete writes, no load traffic, no repo unit tests.
+        # forms/auth submit to the backend (login attempts, form posts); Tier 1 stays read-only.
+        enabled -= {"security", "provision", "load", "unit", "forms", "auth"}
 
     def _run(name, fn):
         if name not in enabled:
@@ -218,8 +223,8 @@ def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path,
         _run("unit", lambda: run_unit(repo_path, tag, events, env={"DATABASE_URL": settings.database_url.replace("+psycopg", "").replace("@localhost", "@postgres")} if options.get("unit_db") else None))
 
     events("execute", f"{len(tests)} checks done; starting smoke clicks", 60)
-    if not (ex.storage_state_path or secrets.get("email")):
-        # No test account: public endpoints can still be load-tested, unauthenticated.
+    if not (ex.storage_state_path or secrets.get("email") or options.get("tier") == "live"):
+        # No test account (and not a live-URL run): public endpoints can still be load-tested.
         _run("load", lambda: run_load(settings, live_url, ex.pages, api_base, {}, events, **_load_kwargs(options), auth_kind="none"))
         return tests, findings, finalize_categories(stats, tests, findings)
     runner = SmokeRunner(settings, live_url, ex.storage_state_path, run_dir, secrets, events)
@@ -408,7 +413,15 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
     t0 = time.time()
     try:
         # 1. ingest (one or more repos) -------------------------------------
-        repo_urls = [u for u in (options.get("repos") or [repo_url]) if u]
+        # Tier 1 "live URL" runs with NO source code: an empty inventory flows through the rest
+        # of the pipeline, so reconcile matches nothing and every live control is tested as an
+        # "observed, not declared in code" component — the path that already exists.
+        from qaplatform.ingest.js_parser import CodeInventory
+        repo_urls = [u for u in (options.get("repos") or ([repo_url] if repo_url else [])) if u]
+        tier = options.get("tier") or ("live" if not repo_urls else "full")
+        options["tier"] = tier  # so execute_all gates modules by tier even when inferred
+        if tier == "live":
+            repo_urls = []  # a live-URL run never reads source code, even if a repo was supplied
         token = settings.github_token or secrets.get("github_token")
         repos = []
         for i, url in enumerate(repo_urls):
@@ -418,23 +431,29 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
             one = build_inventory(info.path, info.framework)
             ctx.event("ingest", f"{name}: {info.framework} ({info.router or 'no router'}) @ {info.commit_sha[:10]} — {one.files_parsed} files, {len(one.routes)} routes, {len([e for e in one.elements if e.kind in INTERACTIVE_KINDS])} components, {len(one.api_calls)} API calls", 6)
             repos.append({"url": url, "name": name, "info": info, "inv": one})
-        primary = repos[0]["info"]
-        inv = repos[0]["inv"] if len(repos) == 1 else merge_inventories([(r["inv"], r["name"]) for r in repos])
-        primary_path = repos[0]["info"].path
-        api_index = _api_index(inv)
-        intents = {el.key: build_intent(el, inv, api_index) for el in inv.elements}
-        interactive = [e for e in inv.elements if e.kind in INTERACTIVE_KINDS]
-        ctx.event("ingest", f"Parsed {len(repos)} repo(s): {inv.files_parsed} files, {len(inv.routes)} routes, {len(interactive)} interactive components, {len(inv.api_calls)} API calls", 12)
-        if settings.llm_intent and settings.gemini_api_key and options.get("llm_intent", True):
-            ctx.event("ingest", f"Summarising page intent with {settings.gemini_model}", 14)
-            for r in repos:
-                enrichment = enrich_with_llm(r["inv"], r["info"].path, settings.artifacts_dir / "cache" / "intent", settings.gemini_api_key, settings.gemini_model, fallback_model=settings.gemini_fallback_model)
-                enrichment.pop("__failures__", None)
-                apply_enrichment([e for e in inv.elements if e.file.startswith(r["name"] + "/")], intents, {f"{r['name']}/{k}": v for k, v in enrichment.items()})
-        (run_dir / "inventory.json").write_text(json.dumps({**inv.to_dict(), "intents": intents, "repos": [r["url"] for r in repos]}, indent=1, default=str), encoding="utf-8")
+        if repos:
+            primary = repos[0]["info"]
+            inv = repos[0]["inv"] if len(repos) == 1 else merge_inventories([(r["inv"], r["name"]) for r in repos])
+            primary_path = repos[0]["info"].path
+            api_index = _api_index(inv)
+            intents = {el.key: build_intent(el, inv, api_index) for el in inv.elements}
+            interactive = [e for e in inv.elements if e.kind in INTERACTIVE_KINDS]
+            ctx.event("ingest", f"Parsed {len(repos)} repo(s): {inv.files_parsed} files, {len(inv.routes)} routes, {len(interactive)} interactive components, {len(inv.api_calls)} API calls", 12)
+            if settings.llm_intent and settings.gemini_api_key and options.get("llm_intent", True):
+                ctx.event("ingest", f"Summarising page intent with {settings.gemini_model}", 14)
+                for r in repos:
+                    enrichment = enrich_with_llm(r["inv"], r["info"].path, settings.artifacts_dir / "cache" / "intent", settings.gemini_api_key, settings.gemini_model, fallback_model=settings.gemini_fallback_model)
+                    enrichment.pop("__failures__", None)
+                    apply_enrichment([e for e in inv.elements if e.file.startswith(r["name"] + "/")], intents, {f"{r['name']}/{k}": v for k, v in enrichment.items()})
+            (run_dir / "inventory.json").write_text(json.dumps({**inv.to_dict(), "intents": intents, "repos": [r["url"] for r in repos]}, indent=1, default=str), encoding="utf-8")
+        else:
+            # Live-only: no code to read.
+            primary, primary_path, intents = None, None, {}
+            inv = CodeInventory(framework="(live URL only — no source code)")
+            ctx.event("ingest", "Live-URL test: no repository given, so the site's own pages and controls are tested directly (no source code to compare against)", 12)
         with session(settings.database_url) as db:
             r = db.get(Run, run_id)
-            r.commit_sha = primary.commit_sha
+            r.commit_sha = primary.commit_sha if primary else ""
             r.framework = inv.framework
             db.commit()
         repo = primary
@@ -494,7 +513,7 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
             r.message = f"{extra['findings_total']} findings; {stats['coverage_interaction'] * 100:.0f}% of code components found, {stats['tested_ratio'] * 100:.0f}% tested"
             r.secrets = None
             db.commit()
-        report_path = write_report(run_dir, run_id, {"live_url": live_url, "repo_url": repo_url, "commit_sha": repo.commit_sha, "framework": repo.framework, "finished_at": finished.isoformat()}, stats, ex.pages, components, tests, findings)
+        report_path = write_report(run_dir, run_id, {"live_url": live_url, "repo_url": repo_url, "commit_sha": repo.commit_sha if repo else "", "framework": repo.framework if repo else inv.framework, "finished_at": finished.isoformat()}, stats, ex.pages, components, tests, findings)
         ctx.event("done", f"Report written: {report_path}", 100)
     except Exception as exc:
         logger.exception("run %s failed", run_id)

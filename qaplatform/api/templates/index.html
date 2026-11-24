@@ -3,14 +3,20 @@
 <h1>Test an application</h1>
 <div class="card">
 <form method="post" action="/runs">
+<div style="margin-bottom:12px">
+<p style="font-size:13px;color:var(--muted);margin:0 0 6px">What kind of test?</p>
+<label style="display:block;margin:3px 0"><input type="radio" name="tier" value="live" checked> <b>Live URL</b> — paste a link, we check the live site's pages and clicks. No code, read-only.</label>
+<label style="display:block;margin:3px 0"><input type="radio" name="tier" value="backend"> <b>Backend</b> — reads your code (GitHub token) for flaws and tests custom behaviour.</label>
+<label style="display:block;margin:3px 0"><input type="radio" name="tier" value="full"> <b>Full</b> — both of the above, plus deeper checks.</label>
+</div>
 <div class="grid">
-<div style="grid-column:1/-1"><label for="repo_url">Codebase repo URL(s) — one per line (e.g. frontend and backend)</label><textarea id="repo_url" name="repo_url" required rows="2" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--line);border-radius:6px;font-size:14px;font-family:ui-monospace,monospace" placeholder="https://github.com/org/frontend.git&#10;https://github.com/org/backend.git">{{ defaults.repo_url }}</textarea></div>
+<div id="repo-field" style="grid-column:1/-1"><label for="repo_url">Codebase repo URL(s) — one per line (e.g. frontend and backend)</label><textarea id="repo_url" name="repo_url" rows="2" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--line);border-radius:6px;font-size:14px;font-family:ui-monospace,monospace" placeholder="https://github.com/org/frontend.git&#10;https://github.com/org/backend.git">{{ defaults.repo_url }}</textarea></div>
 <div><label for="live_url">Live URL</label><input type="url" id="live_url" name="live_url" required value="{{ defaults.live_url }}" placeholder="https://app.example.com"></div>
 <div><label for="project">Project name</label><input type="text" id="project" name="project" value="{{ defaults.project }}"></div>
 <div><label for="branch">Branch (optional)</label><input type="text" id="branch" name="branch" placeholder="main"></div>
 <div><label for="email">Test account email</label><input type="email" id="email" name="email" value="{{ defaults.email }}"></div>
 <div><label for="password">Test account password</label><input type="password" id="password" name="password"></div>
-<div><label for="github_token">Git token for private repos (optional)</label><input type="password" id="github_token" name="github_token"></div>
+<div id="token-field"><label for="github_token">Git token for private repos (optional)</label><input type="password" id="github_token" name="github_token"></div>
 <div><label for="max_pages">Max pages to explore</label><input type="number" id="max_pages" name="max_pages" value="60" min="1" max="500"></div>
 </div>
 <label><input type="checkbox" name="llm_intent" value="true" checked> Summarise page intent with the LLM (source code only; credentials never leave this machine)</label>
@@ -77,9 +83,26 @@
 <p style="margin-top:6px">A public repo needs no token. The token is used only to clone, encrypted at rest, and wiped when the run finishes.</p>
 </div>
 </details>
+<label id="attest-field"><input type="checkbox" id="owner_attested" name="owner_attested" value="true"> I own this site or am authorised to test it</label>
 <button type="submit">Start run</button>
 <p><small>Every write the browser tries to make (POST, PUT, PATCH, DELETE) is intercepted and never reaches the server; only sign-in, token refresh and the logout test go through. Destructive actions only have their confirmation opened and cancelled. Credentials are encrypted at rest and wiped when the run finishes.</small></p>
 </form>
+<script>
+(function(){
+  // Live tier: no code, so hide the repo + token fields and require the authorisation tick instead.
+  function syncTier(){
+    var tier = (document.querySelector('input[name=tier]:checked')||{}).value || 'live';
+    var live = tier === 'live';
+    document.getElementById('repo-field').style.display = live ? 'none' : '';
+    document.getElementById('token-field').style.display = live ? 'none' : '';
+    document.getElementById('repo_url').required = !live;
+    document.getElementById('attest-field').style.display = live ? '' : 'none';
+    document.getElementById('owner_attested').required = live;
+  }
+  document.querySelectorAll('input[name=tier]').forEach(function(r){ r.addEventListener('change', syncTier); });
+  syncTier();
+})();
+</script>
 </div>
 
 <h2>Recent runs</h2>

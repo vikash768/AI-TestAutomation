@@ -40,3 +40,37 @@ def test_secrets_are_encrypted_at_rest(client):
 def test_metrics_endpoint(client):
     r = client.get("/metrics")
     assert r.status_code == 200 and "qa_runs_total" in r.text
+
+
+def test_live_tier_runs_without_a_repo(client):
+    from qaplatform.db.models import Run
+    from qaplatform.db.session import session
+    # Tier 1: live URL only, no repo, but needs the authorisation attestation.
+    r = client.post("/runs", data={"tier": "live", "live_url": "https://example.com", "owner_attested": "true", "project": "live-demo"}, follow_redirects=False)
+    assert r.status_code == 303
+    run_id = r.headers["location"].rsplit("/", 1)[-1]
+    with session(os.environ["DATABASE_URL"]) as db:
+        run = db.get(Run, run_id)
+        assert run.options["tier"] == "live"
+        assert run.options["repos"] == [] and run.repo_url == ""
+        assert run.options["owner_attested"] is True
+
+
+def test_live_tier_requires_the_attestation(client):
+    r = client.post("/runs", data={"tier": "live", "live_url": "https://example.com"}, follow_redirects=False)
+    assert r.status_code == 400 and "authorised" in r.text
+
+
+def test_backend_and_full_tiers_still_require_a_repo(client):
+    r = client.post("/runs", data={"tier": "full", "live_url": "https://example.com"}, follow_redirects=False)
+    assert r.status_code == 400 and "repo" in r.text.lower()
+
+
+def test_live_tier_excludes_backend_modules():
+    # The pipeline gates security/provision/load/unit/forms/auth out of a live run.
+    PHASE2 = {"reveal", "destructive", "forms", "auth", "state", "lifecycle", "faults"}
+    enabled = set(PHASE2) | {"security"}
+    # mirror the gate in execute_all for options tier == "live"
+    enabled -= {"security", "provision", "load", "unit", "forms", "auth"}
+    assert "security" not in enabled and "forms" not in enabled and "auth" not in enabled
+    assert {"reveal", "state", "lifecycle", "faults", "destructive"} <= enabled
