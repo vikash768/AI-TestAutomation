@@ -363,6 +363,32 @@ class RunContext:
 
 
 
+def _repo_mentions_host(repo_paths: list, host: str) -> bool:
+    """Does any repo reference the live host (config, docs, env example, deploy files)? Corroborates
+    that the code deploys to the entered URL — not proof, but better than the token alone."""
+    host = (host or "").lower()
+    if not host:
+        return False
+    bare = host[4:] if host.startswith("www.") else host
+    names = ("readme", ".env", "config", "package.json", "vercel.json", "netlify.toml", "wrangler.toml",
+             "capacitor.config", "app.json", "manifest", ".yml", ".yaml", ".toml", ".ini", ".conf")
+    for root in repo_paths:
+        try:
+            for p in Path(root).rglob("*"):
+                if not p.is_file() or any(part in ("node_modules", ".git", "dist", "build") for part in p.parts):
+                    continue
+                if p.stat().st_size > 512_000 or not any(n in p.name.lower() for n in names):
+                    continue
+                try:
+                    if bare in p.read_text(errors="ignore").lower():
+                        return True
+                except OSError:
+                    continue
+        except Exception:
+            continue
+    return False
+
+
 def _short_repo_name(url: str) -> str:
     base = url.rstrip("/").split("/")[-1]
     return base[:-4] if base.endswith(".git") else base or "repo"
@@ -461,6 +487,20 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
             r.framework = inv.framework
             db.commit()
         repo = primary
+
+        # 1b. URL <-> repo corroboration -------------------------------------
+        # A read token proves repo access, not that the entered live URL is this repo's deployment.
+        # Best-effort check: does the repo reference the live host anywhere (config, docs, env example)?
+        # This corroborates, it does not prove ownership; the strong binding (deploy nonce) comes later.
+        if repos:
+            host = urlparse(live_url).hostname or ""
+            linked = _repo_mentions_host([r["info"].path for r in repos], host) if host else False
+            stats_link = "corroborated" if linked else "unconfirmed"
+            options["url_repo_link"] = stats_link
+            if linked:
+                ctx.event("ingest", f"Repo references the live host '{host}' — URL↔repo link corroborated", 13)
+            else:
+                ctx.event("ingest", f"Could not confirm this repo deploys to {host} (no mention of the host in the code). Proceeding on your authorisation; findings assume the two belong together.", 13, level="warn")
 
         # 2. explore --------------------------------------------------------
         ctx.event("explore", f"Opening {live_url}", 20)

@@ -17,7 +17,7 @@ def client():
 def test_index_and_create_run(client):
     r = client.get("/")
     assert r.status_code == 200 and "Start run" in r.text
-    r = client.post("/runs", data={"repo_url": "https://github.com/x/y.git", "live_url": "https://example.com", "email": "a@b.c", "password": "Plaintext-Probe-9f3c", "project": "demo"}, follow_redirects=False)
+    r = client.post("/runs", data={"repo_url": "https://github.com/x/y.git", "live_url": "https://example.com", "email": "a@b.c", "password": "Plaintext-Probe-9f3c", "project": "demo", "owner_attested": "true"}, follow_redirects=False)
     assert r.status_code == 303
     run_id = r.headers["location"].rsplit("/", 1)[-1]
     j = client.get(f"/api/runs/{run_id}").json()
@@ -98,3 +98,16 @@ def test_live_quick_depth_disables_phase2(client):
     with session(os.environ["DATABASE_URL"]) as db:
         run = db.get(Run, rid)
         assert run.options["depth"] == "quick" and run.options["phase2"] is False
+
+
+def test_backend_tier_requires_attestation(client):
+    r = client.post("/runs", data={"tier": "backend", "live_url": "https://example.com", "repo_url": "https://github.com/x/y.git"}, follow_redirects=False)
+    assert r.status_code == 400 and "authorised" in r.text
+
+
+def test_url_repo_corroboration(tmp_path):
+    from qaplatform.pipeline import _repo_mentions_host
+    (tmp_path / "README.md").write_text("Live at https://app.example.com")
+    assert _repo_mentions_host([tmp_path], "app.example.com") is True
+    assert _repo_mentions_host([tmp_path], "www.app.example.com") is True
+    assert _repo_mentions_host([tmp_path], "victim.com") is False

@@ -79,8 +79,11 @@ def create_run(
         repos = []
         # Quick = page health + crawl + responsive + safe clicks; Thorough adds reload/timer/fault checks.
         phase2 = depth == "thorough"
-    elif not repos:
-        raise HTTPException(400, "the backend and full tiers need at least one GitHub repo URL")
+    else:
+        if not repos:
+            raise HTTPException(400, "the backend and full tiers need at least one GitHub repo URL")
+        if not owner_attested:
+            raise HTTPException(400, "tick the box confirming you own or are authorised to test this site and read this code")
     try:
         load_opts = _load_options(load, load_authorized, load_users, load_seconds, load_p95_ms, load_mode, load_max_users, load_step_seconds, load_expected_users)
     except ValueError as e:

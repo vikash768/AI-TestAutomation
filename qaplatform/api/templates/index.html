@@ -101,8 +101,8 @@ Depth:
     document.getElementById('repo-field').style.display = live ? 'none' : '';
     document.getElementById('token-field').style.display = live ? 'none' : '';
     document.getElementById('repo_url').required = !live;
-    document.getElementById('attest-field').style.display = live ? '' : 'none';
-    document.getElementById('owner_attested').required = live;
+    document.getElementById('attest-field').style.display = '';  // authorisation required for every tier
+    document.getElementById('owner_attested').required = true;
     document.getElementById('depth-field').style.display = live ? '' : 'none';
   }
   document.querySelectorAll('input[name=tier]').forEach(function(r){ r.addEventListener('change', syncTier); });
