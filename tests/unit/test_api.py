@@ -66,14 +66,28 @@ def test_backend_and_full_tiers_still_require_a_repo(client):
     assert r.status_code == 400 and "repo" in r.text.lower()
 
 
-def test_live_tier_excludes_backend_modules():
-    # The pipeline gates security/provision/load/unit/forms/auth out of a live run.
+def _live_enabled(has_creds):
+    # mirror the Tier-1 gate in execute_all
     PHASE2 = {"reveal", "destructive", "forms", "auth", "state", "lifecycle", "faults"}
     enabled = set(PHASE2) | {"security"}
-    # mirror the gate in execute_all for options tier == "live"
-    enabled -= {"security", "provision", "load", "unit", "forms", "auth"}
+    drop = {"security", "provision", "load", "unit"}
+    if not has_creds:
+        drop |= {"forms", "auth"}
+    return enabled - drop
+
+
+def test_anonymous_live_tier_excludes_login_and_form_submission():
+    enabled = _live_enabled(has_creds=False)
     assert "security" not in enabled and "forms" not in enabled and "auth" not in enabled
     assert {"reveal", "state", "lifecycle", "faults", "destructive"} <= enabled
+
+
+def test_live_tier_with_credentials_runs_the_login_suite():
+    # With credentials + attestation, Tier 1 runs auth (login security) and forms, but still no
+    # backend probes / writes / load.
+    enabled = _live_enabled(has_creds=True)
+    assert "auth" in enabled and "forms" in enabled
+    assert "security" not in enabled and "provision" not in enabled and "load" not in enabled
 
 
 def test_finding_bucket_tiers():

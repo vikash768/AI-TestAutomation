@@ -196,8 +196,14 @@ def execute_all(settings: Settings, live_url: str, secrets: dict, run_dir: Path,
     if options.get("tier") == "live":
         # Tier 1 (live URL, no source code): read-only health + safe clicks only.
         # No backend security probes, no create-then-delete writes, no load traffic, no repo unit tests.
-        # forms/auth submit to the backend (login attempts, form posts); Tier 1 stays read-only.
-        enabled -= {"security", "provision", "load", "unit", "forms", "auth"}
+        drop = {"security", "provision", "load", "unit"}
+        # forms/auth submit to the backend (login attempts, form posts). Anonymous Tier 1 stays
+        # read-only, but when the user supplies credentials AND attests ownership, the login test
+        # suite (masking, no-enumeration, wrong-password, logout) and form validation are run — it is
+        # their own site, and the write guard still blocks every real mutation.
+        if not (secrets.get("email") and options.get("owner_attested")):
+            drop |= {"forms", "auth"}
+        enabled -= drop
 
     def _run(name, fn):
         if name not in enabled:
