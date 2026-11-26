@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+from zipfile import ZipFile
 from pathlib import Path
 
 import pytest
@@ -103,7 +104,7 @@ def test_parse_sources():
 def test_native_run_with_two_sources_and_web_with_one(client):
     from qaplatform.db.models import Run
     from qaplatform.db.session import session
-    r = client.post("/runs", data={"platform": "android", "repo_url": "https://github.com/o/mobile.git\n/home/me/backend", "app_path": "/tmp/app.apk",
+    r = client.post("/runs", data={"platform": "macos", "repo_url": "https://github.com/o/mobile.git\n/home/me/backend", "app_path": "/tmp/Fixture.app",
                                    "journeys": "true", "load_test": "true", "load_test_base_url": "https://api.example.net"}, follow_redirects=False)
     assert r.status_code == 303
     run_id = r.headers["location"].rsplit("/", 1)[-1]
@@ -113,7 +114,7 @@ def test_native_run_with_two_sources_and_web_with_one(client):
         assert run.options["codebase_sources"] == [{"role": "frontend", "source": "https://github.com/o/mobile.git"}, {"role": "backend", "source": "/home/me/backend"}]
         assert run.options["load_test"] is True and run.options["journeys"] is True and run.options["remote_qa_data"] is False
     # single source native: unchanged shape
-    r = client.post("/runs", data={"platform": "android", "repo_url": "/home/me/mobile", "app_path": "com.x"}, follow_redirects=False)
+    r = client.post("/runs", data={"platform": "macos", "repo_url": "/home/me/mobile", "app_path": "com.x"}, follow_redirects=False)
     run_id = r.headers["location"].rsplit("/", 1)[-1]
     with session(os.environ["DATABASE_URL"]) as db:
         assert db.get(Run, run_id).options["codebase_sources"] == [{"role": "frontend", "source": "/home/me/mobile"}]
@@ -123,7 +124,7 @@ def test_native_run_with_two_sources_and_web_with_one(client):
     with session(os.environ["DATABASE_URL"]) as db:
         assert set(db.get(Run, run_id).options) == {"max_pages", "llm_intent", "phase2", "branch", "clean_start"}
     assert client.post("/runs", data={"repo_url": "a\nb", "live_url": "https://example.com"}).status_code == 400
-    assert client.post("/runs", data={"platform": "android", "repo_url": "a\nb\nc", "app_path": "x"}).status_code == 400
+    assert client.post("/runs", data={"platform": "macos", "repo_url": "a\nb\nc", "app_path": "x"}).status_code == 400
     page = client.get("/").text
     assert "Codebase URL(s) (git) or local path(s)" in page and "<textarea" in page
 
@@ -157,16 +158,28 @@ def test_report_links_resolve_and_cannot_escape(tmp_path):
     assert artifact_href(str(outside), run_dir, run_id) == ""  # outside the run folder
     assert artifact_href("../../../etc/passwd", run_dir, run_id) == ""  # traversal
     assert artifact_href(str(run_dir / "screenshots" / "missing.png"), run_dir, run_id) == ""  # no misleading link
-    finding = FindingRecord(fingerprint="f1", route="Home", category="functional", severity="high", title="Broken", evidence=[{"type": "screenshot", "path": str(shot), "viewport": "device"},
+    finding = FindingRecord(fingerprint="f1", route="Home", category="functional", severity="high", title="Broken <control>", evidence=[{"type": "screenshot", "path": str(shot), "viewport": "device"},
                                                                                                                               {"type": "screenshot", "path": str(outside)}])
     page = ObservedPage(route="Home", url="app://x/Home", viewports={"device": {"screenshot": str(shot)}}, screenshot=str(shot))
     test = TestRecord(test_key="t", name="Journey: x", technique="journey", category="functional", route="Home", status="fail", evidence=[{"type": "screenshot", "path": str(shot)}],
-                      qa_data="qa_x", cleanup="qa_x: cleaned", steps=[{"action": "type", "target": "Test ID", "value": "qa_x", "result": "typed"}])
-    write_report(run_dir, run_id, {"live_url": "android: com.x"}, _native_stats(), [page], [], [test], [finding])
+                      expected="Shows <sample details>", observed="Loading stopped", duration_ms=42, code_ref="Sample.tsx:12", qa_data="qa_x", cleanup="qa_x: cleaned",
+                      steps=[{"action": "type", "target": "Test ID", "value": "qa_x", "result": "typed"}])
+    passing_test = TestRecord(test_key="t2", name="Passing sample check", technique="journey", category="functional", route="Home")
+    write_report(run_dir, run_id, {"live_url": "android: com.x"}, _native_stats(), [page], [], [passing_test, test], [finding])
     html = (run_dir / "report.html").read_text()
-    hrefs = set(re.findall(r'href="([^"]+)"', html))
-    assert hrefs and all(h.startswith(f"/artifacts/runs/{run_id}/") for h in hrefs)
-    assert str(outside) not in html and "screenshot missing" in html
+    hrefs = set(re.findall(r'href="(/artifacts/[^"]+)"', html))
+    assert hrefs == {f"/artifacts/runs/{run_id}/screenshots/001%20home%20screen.png"}
+    for section_id in ("findings", "tests", "screens"):
+        assert f'href="#{section_id}"' in html
+        assert f'id="{section_id}"' in html
+    assert 'name="viewport"' in html and 'class="finding-card' in html
+    assert 'id="finding-search"' in html and 'id="finding-severity"' in html
+    assert "Broken &lt;control&gt;" in html and "Broken <control>" not in html
+    assert str(outside) not in html and "Screenshot missing" in html
+    failed_test = html.split('<details class="test-result">', 2)[1]
+    assert "Journey: x" in failed_test and "functional · journey · Home" in failed_test
+    for detail in ("Shows &lt;sample details&gt;", "Loading stopped", "42 ms", "Sample.tsx:12", "qa_x: cleaned", "type Test ID qa_x → typed", "/screenshots/001%20home%20screen.png"):
+        assert detail in failed_test
     from fastapi.testclient import TestClient
     from qaplatform.api import app as app_module
     c = TestClient(app_module.app)
@@ -254,12 +267,17 @@ export const api = {
 # -- load test ------------------------------------------------------------------------------------------
 class _H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
-        code, delay = {"/api/health": (200, 0), "/api/slow": (200, 0.25), "/api/err": (500, 0), "/api/private": (401, 0)}.get(self.path, (404, 0))
+        body = b"{}"
+        if self.path == "/fixture-record":
+            code, delay = (200 if self.headers.get("Authorization") == "Bearer fixture-api-token" else 401), 0
+            body = b'{"record": {"available": true}, "other": "fixture-only-body"}'
+        else:
+            code, delay = {"/api/health": (200, 0), "/api/slow": (200, 0.25), "/api/err": (500, 0), "/api/private": (401, 0)}.get(self.path, (404, 0))
         time.sleep(delay)
         self.send_response(code)
-        self.send_header("Content-Length", "2")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b"{}")
+        self.wfile.write(body)
 
     def log_message(self, *a):
         pass
@@ -484,6 +502,251 @@ class PipelineDevice(FakeDevice):
     def background(self, seconds=3): pass
     def keys(self, keys): pass
     def undo(self): pass
+
+
+@pytest.mark.parametrize(("mode", "unavailable", "expected_value"), [
+    ("backend", "", "true"), ("backend", "", "false"), ("full", "", "true"),
+    ("full", "checkout", "true"), ("full", "device", "true"),
+])
+def test_android_modes_report_requested_scope(client, tmp_path, monkeypatch, api_server, mode, unavailable, expected_value):
+    from qaplatform.api import app as app_module
+    from qaplatform.app import pipeline as app_pipeline
+    from qaplatform.config import Settings
+    from qaplatform.db.models import Component, Page, Run, Test
+    from qaplatform.db.session import init_db, session
+    from qaplatform.ingest.repo import RepoInfo
+    from qaplatform.worker import claim_next, execute
+
+    repo_url = "https://github.com/example/backend.git"
+    git_token = "fixture-per-run-token"
+    backend = _write(tmp_path / "backend", BACKEND)
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'run.db'}",
+        artifacts_dir=tmp_path / "artifacts",
+        secret_key="fixture-mode-key",
+    )
+    init_db(settings.database_url)
+    for key in ("database_url", "artifacts_dir", "secret_key"):
+        monkeypatch.setattr(app_module.settings, key, getattr(settings, key))
+    monkeypatch.setenv("GITHUB_TOKEN", "ignored-global-token")
+    monkeypatch.setenv("LOAD_TEST_ENABLED", "true")
+    monkeypatch.setenv("LOAD_TEST_BASE_URL", "https://fixture-never-request.invalid")
+
+    fetches = []
+
+    def fetch_fixture(source, dest, *, token, branch):
+        assert source == repo_url and token == git_token and branch == "review"
+        fetches.append(dest)
+        if unavailable == "checkout":
+            raise RuntimeError(f"Git rejected {token}")
+        return RepoInfo(path=backend, commit_sha="a" * 40)
+
+    class UnavailableDevice(PipelineDevice):
+        def start(self):
+            raise RuntimeError("Fixture Appium is unavailable")
+
+    def unexpected_device(*args, **kwargs):
+        pytest.fail("Backend testing must complete without preparing or starting a mobile device")
+
+    def disabled_load_only(config, *args):
+        assert config.enabled is False
+        assert not config.bearer_token
+        return run_load_test(config, *args)
+
+    monkeypatch.setattr(app_pipeline, "fetch_repo", fetch_fixture)
+    monkeypatch.setattr(app_pipeline, "run_load_test", disabled_load_only)
+    device = UnavailableDevice if unavailable == "device" else PipelineDevice
+    monkeypatch.setattr(app_pipeline, "AppDevice", device if mode == "full" else unexpected_device)
+    if mode == "backend":
+        monkeypatch.setattr(app_pipeline, "resolve_build", unexpected_device)
+
+    target = {"app_path": "com.example.rn", "ui_expected_text": "Home"} if mode == "full" else {}
+    api_token = "fixture-api-token"
+    response = client.post("/runs", data={
+        "platform": "android", "test_mode": mode, "project": "Android QA", "repo_url": repo_url, "github_token": git_token,
+        "branch": "review", "api_base_url": api_server, "api_path": "/fixture-record", "api_json_field": "record.available",
+        "api_expected_value": expected_value, "api_token": api_token, **target,
+    }, follow_redirects=False)
+    assert response.status_code == 303, response.text
+    run_id = response.headers["location"].rsplit("/", 1)[-1]
+    assert claim_next(settings.database_url, ("android",)) == (run_id, "android")
+    with session(settings.database_url) as db:
+        run = db.get(Run, run_id)
+        assert git_token not in run.secrets and api_token not in run.secrets and api_token not in str(run.options)
+
+    execute(run_id, "android", settings)
+
+    with session(settings.database_url) as db:
+        run = db.get(Run, run_id)
+        assert run.status == "completed", (run.error, run.message)
+        assert run.secrets is None
+        assert run.commit_sha == ("" if unavailable == "checkout" else "a" * 40)
+        assert run.stats["test_mode"] == mode and run.stats["code_available"] is False
+        assert run.stats["load_test"]["status"] == "disabled"
+        assert (run.stats["backend"]["routes"] >= 6) == (unavailable != "checkout")
+        api_status = "pass" if expected_value == "true" else "fail"
+        assert run.stats["legs"]["backend"]["status"] == ("blocked" if unavailable == "checkout" else api_status)
+        assert [src["role"] for src in run.stats["sources"]] == ["backend"]
+        tests = db.query(Test).filter_by(run_id=run_id).all()
+        by_key = {t.test_key: t for t in tests}
+        assert by_key["backend|route-inventory"].status == ("blocked" if unavailable == "checkout" else "pass")
+        assert by_key["assertion|api"].status == api_status
+        assert all(t.technique != "load" for t in tests)
+        pages = db.query(Page).filter_by(run_id=run_id).all()
+        components = db.query(Component).filter_by(run_id=run_id).all()
+        if mode == "full" and unavailable != "device":
+            assert pages and components
+            assert all(c.source == "observed" and not c.code_file for c in components)
+            assert any(t.technique == "smoke" for t in tests)
+            assert by_key["assertion|ui"].status == "pass"
+            assert by_key["full|assertions"].status == "pass"
+            assert run.stats["legs"]["frontend"]["status"] != "blocked"
+        elif mode == "full":
+            assert not pages and not components
+            assert run.stats["legs"]["frontend"]["status"] == "blocked"
+            assert by_key["assertion|ui"].status == by_key["full|assertions"].status == "blocked"
+        else:
+            assert not pages and not components
+            assert "frontend" not in run.stats["legs"]
+    assert len(fetches) == 1
+    checkout = fetches[0]
+    assert checkout.name == "backend" and checkout.parent.parent == tmp_path / ".artifacts-repos"
+    assert not checkout.parent.exists()
+
+    run_dir = settings.artifacts_dir / "runs" / run_id
+    backend_inventory = (run_dir / "backend.json").read_text()
+    html = (run_dir / "report.html").read_text()
+    assert ('"/api/health"' in backend_inventory) == (unavailable != "checkout")
+    run_view = client.get(f"/runs/{run_id}").text
+    for private_value in (git_token, api_token, "fixture-only-body"):
+        assert all(private_value not in artifact for artifact in (backend_inventory, html, run_view))
+    assert f"{mode.capitalize()} testing" in html
+    assert "Backend source review" in html and "Open backend route inventory" in html
+    assert ("<h2>Screens</h2>" in html) == (mode == "full" and unavailable != "device")
+
+
+@pytest.mark.parametrize("kind", ["apk", "installed", "upload"])
+def test_native_pipeline_without_source_reports_device_findings(tmp_path, monkeypatch, kind):
+    from prometheus_client import generate_latest
+
+    from qaplatform.app import build, buildcheck, pipeline as app_pipeline
+    from qaplatform.app.uploads import apk_upload_path
+    from qaplatform.config import Settings
+    from qaplatform.db.models import Component, Finding, Run, Test
+    from qaplatform.db.session import init_db, session
+    from qaplatform.report.metrics import build_registry
+
+    class DefectiveDevice(PipelineDevice):
+        def snapshot(self, settle=0.0):
+            observed = super().snapshot(settle)
+            if self.screen == "Home":
+                observed.texts.append("Last test: Invalid Date")
+            return observed
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Source-free Android runs should skip Git and source-based planning")
+
+    monkeypatch.setattr(app_pipeline, "AppDevice", DefectiveDevice)
+    monkeypatch.setattr(app_pipeline, "fetch_repo", unexpected)
+    monkeypatch.setattr(app_pipeline, "plan_from_code", unexpected)
+    monkeypatch.setattr(app_pipeline.native_ai, "plan", unexpected)
+    monkeypatch.setattr(build, "_aapt2", lambda: None)
+    monkeypatch.setattr(buildcheck, "_aapt2", lambda: None)
+    target = "com.example.rn"
+    if kind == "apk":
+        apk = tmp_path / "app-release.apk"
+        with ZipFile(apk, "w") as bundle:
+            bundle.writestr("assets/index.android.bundle", "console.log('fixture');")
+        target = str(apk)
+
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'run.db'}",
+        artifacts_dir=tmp_path / "artifacts",
+        gemini_api_key="fixture-key",
+        llm_intent=True,
+    )
+    init_db(settings.database_url)
+    with session(settings.database_url) as db:
+        run = Run(
+            project="source-free",
+            platform="android",
+            repo_url="",
+            live_url="uploaded-release.apk" if kind == "upload" else target,
+            status="claimed",
+            options={"phase2": True, "modules": ["rotation"], "journeys": True,
+                     "llm_intent": True, "load_test": True, "uploaded_apk": kind == "upload"},
+        )
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+    if kind == "upload":
+        uploaded = apk_upload_path(settings.artifacts_dir, run_id)
+        uploaded.parent.mkdir()
+        with ZipFile(uploaded, "w") as bundle:
+            bundle.writestr("assets/index.android.bundle", "console.log('fixture');")
+    app_pipeline.run_app_pipeline(run_id, settings)
+    if kind == "upload":
+        assert not uploaded.exists()
+
+    with session(settings.database_url) as db:
+        run = db.get(Run, run_id)
+        assert run.status == "completed", (run.error, run.message)
+        assert run.stats["code_available"] is False and run.stats["sources"] == []
+        assert run.stats["build"]["kind"] == ("installed" if kind == "installed" else "apk")
+        assert run.stats["screens"] > 0 and run.stats["journeys"]["total"] == 0
+        assert run.stats["load_test"]["status"] == "disabled"
+        components = db.query(Component).filter_by(run_id=run_id).all()
+        assert components and all(c.source == "observed" and not c.code_file for c in components)
+        tests = db.query(Test).filter_by(run_id=run_id).all()
+        assert any(t.technique == "content" and t.status == "fail" for t in tests)
+        assert any(t.technique == "build" for t in tests) == (kind != "installed")
+        finding = db.query(Finding).filter(Finding.run_id == run_id, Finding.title.contains("Invalid Date")).one()
+        assert finding.category == "functional" and not finding.code_ref
+        assert any(evidence["type"] == "screenshot" for evidence in finding.evidence)
+
+    run_dir = settings.artifacts_dir / "runs" / run_id
+    html = (run_dir / "report.html").read_text()
+    assert "Source coverage unavailable" in html and "Invalid Date" in html
+    assert not (run_dir / "journeys.json").exists()
+    metrics = generate_latest(build_registry(settings.database_url)).decode()
+    assert 'qa_latest_coverage_ratio{project="source-free"}' not in metrics
+    assert 'qa_latest_tested_ratio{project="source-free"}' in metrics
+
+
+@pytest.mark.parametrize("error", [RuntimeError, SystemExit])
+def test_android_upload_cleanup_preserves_interrupted_runs(tmp_path, monkeypatch, error):
+    from qaplatform.app import pipeline as app_pipeline
+    from qaplatform.app.uploads import apk_upload_path
+    from qaplatform.config import Settings
+    from qaplatform.db.models import Run
+    from qaplatform.db.session import init_db, session
+
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'run.db'}", artifacts_dir=tmp_path / "artifacts")
+    init_db(settings.database_url)
+    with session(settings.database_url) as db:
+        run = Run(platform="android", repo_url="", live_url="release.apk", options={"uploaded_apk": True})
+        db.add(run)
+        db.commit()
+        run_id = run.id
+    uploaded = apk_upload_path(settings.artifacts_dir, run_id)
+    uploaded.parent.mkdir()
+    uploaded.write_bytes(b"fixture")
+
+    def fail_to_resolve(spec, platform):
+        assert Path(spec) == uploaded and platform == "android"
+        raise error("fixture")
+
+    monkeypatch.setattr(app_pipeline, "resolve_build", fail_to_resolve)
+    if error is SystemExit:
+        with pytest.raises(SystemExit):
+            app_pipeline.run_app_pipeline(run_id, settings)
+    else:
+        app_pipeline.run_app_pipeline(run_id, settings)
+
+    with session(settings.database_url) as db:
+        assert db.get(Run, run_id).status == ("running" if error is SystemExit else "failed")
+    assert uploaded.exists() == (error is SystemExit)
 
 
 def test_native_pipeline_two_sources_journeys_cleanup_and_load(tmp_path, monkeypatch, api_server):

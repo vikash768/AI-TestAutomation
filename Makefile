@@ -5,6 +5,7 @@
 
 ## Build images and start every service (Postgres, API, worker, Prometheus, Grafana)
 up:
+	@mkdir -p -m 700 .artifacts-uploads
 	docker compose up -d --build
 	@echo ""
 	@echo "  UI:         http://localhost:$${API_PORT:-8000}"
@@ -37,7 +38,7 @@ test:
 ## Run one pipeline from the terminal inside the worker container:
 ##   make run REPO=https://github.com/org/app.git LIVE=https://app.example.com
 run:
-	docker compose exec worker python -m qaplatform.cli run --repo "$(REPO)" --live "$(LIVE)" --project "$${PROJECT_NAME:-default}"
+	docker compose exec worker python -m qaplatform.cli run --repo "$(REPO)" --live "$(LIVE)" --project "$(PROJECT)"
 
 ## Native app runs (Android / iOS / macOS) need this machine's Appium server, emulator and build
 ## files, so they run in a worker on the host, next to the dockerised web worker:
@@ -73,15 +74,15 @@ appium:
 	appium --address 127.0.0.1 --port 4723
 
 ## One native run from the terminal, on the host:
-##   make run-android REPO=https://github.com/org/mobile.git APP=/path/app-release.apk
+##   make run-android APP=/path/app-release.apk PROJECT=my-android-app
 ##   make run-desktop REPO=https://github.com/jgraph/drawio-desktop APP=/Applications/draw.io.app
 run-android:
 	set -a; . ./.env; set +a; DATABASE_URL=postgresql+psycopg://$${POSTGRES_USER:-qa}:$${POSTGRES_PASSWORD:-qa}@localhost:$${POSTGRES_PORT:-5434}/$${POSTGRES_DB:-qa} \
-		.venv/bin/python -m qaplatform.cli run --platform android --repo "$(or $(REPO),$${ANDROID_REPO_URL})" --app "$(or $(APP),$${ANDROID_APP_PATH})" --project "$${ANDROID_PROJECT_NAME:-android}" --email "$${ANDROID_USER_EMAIL:-}" --password "$${ANDROID_USER_PASSWORD:-}"
+		.venv/bin/python -m qaplatform.cli run --platform android --repo "$(REPO)" --app "$(APP)" --project "$(PROJECT)" --email "$${ANDROID_USER_EMAIL:-}" --password "$${ANDROID_USER_PASSWORD:-}"
 
 run-desktop:
 	set -a; . ./.env; set +a; DATABASE_URL=postgresql+psycopg://$${POSTGRES_USER:-qa}:$${POSTGRES_PASSWORD:-qa}@localhost:$${POSTGRES_PORT:-5434}/$${POSTGRES_DB:-qa} \
-		.venv/bin/python -m qaplatform.cli run --platform macos --repo "$(or $(REPO),$${DESKTOP_REPO_URL})" --app "$(or $(APP),$${DESKTOP_APP_PATH})" --project "$${DESKTOP_PROJECT_NAME:-desktop}"
+		.venv/bin/python -m qaplatform.cli run --platform macos --repo "$(REPO)" --app "$(or $(APP),$${DESKTOP_APP_PATH})" --project "$(PROJECT)"
 
 ## Check the repository for tracked secrets, builds and generated artifacts
 security-check:
@@ -99,5 +100,5 @@ clean:
 reset-runs:
 	@ids=$$(docker compose exec -T postgres psql -U $${POSTGRES_USER:-qa} -d $${POSTGRES_DB:-qa} -qAtc \
 		"DELETE FROM runs $(if $(PROJECT),WHERE project = '$(PROJECT)') RETURNING id") || exit 1; \
-	for id in $$ids; do rm -rf artifacts/runs/$$id artifacts/repos/$$id; done; \
+	for id in $$ids; do rm -rf artifacts/runs/$$id artifacts/repos/$$id; rm -f .artifacts-uploads/$$id.apk; done; \
 	echo "Deleted $$(echo $$ids | wc -w | tr -d ' ') run(s)$(if $(PROJECT), for project $(PROJECT))"

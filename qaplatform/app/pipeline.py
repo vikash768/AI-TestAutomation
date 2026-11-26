@@ -21,10 +21,12 @@ import os
 import re
 import time
 import traceback
+from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import datetime, timezone
 
 from qaplatform.app import ai as native_ai
+from qaplatform.app.assertions import check_api_assertion, check_ui_assertion
 from qaplatform.app.backend import BackendRoute, ClientEndpoint, backend_routes, base_urls, client_endpoints, summarize
 from qaplatform.app.build import resolve_build
 from qaplatform.app.buildcheck import build_checks
@@ -35,9 +37,10 @@ from qaplatform.app.explore import SKIP_SETUP_RE, AppExplorer, Screen
 from qaplatform.app.journeys import JourneyRunner, journeys_from_ai, plan_dump, plan_from_code, to_tests, validate
 from qaplatform.app.journeys import summary as journey_summary
 from qaplatform.app.loadtest import LoadConfig, run_load_test
-from qaplatform.app.testdata import QADataRegistry
 from qaplatform.app.remedy import explain
-from qaplatform.execute.smoke import FindingRecord, fingerprint
+from qaplatform.app.testdata import QADataRegistry
+from qaplatform.app.uploads import apk_upload_path
+from qaplatform.execute.smoke import FindingRecord, TestRecord, fingerprint
 from qaplatform.config import Settings
 from qaplatform.db.models import Run, RunEvent
 from qaplatform.db.session import session
@@ -45,6 +48,7 @@ from qaplatform.explore.crawler import ObservedPage
 from qaplatform.explore.safety import classify_action
 from qaplatform.ingest.js_parser import CodeInventory
 from qaplatform.ingest.repo import fetch_repo
+from qaplatform.ingest.workspace import repository_workspace
 from qaplatform.pipeline import RunContext, build_components, coverage_after
 from qaplatform.reconcile.matcher import INTERACTIVE_KINDS, normalize, reconcile
 from qaplatform.report.html import write_report
@@ -53,7 +57,6 @@ from qaplatform.secrets import decrypt_secrets
 
 logger = logging.getLogger(__name__)
 
-TOKEN_ENV = {"android": "ANDROID_GITHUB_TOKEN", "ios": "IOS_GITHUB_TOKEN", "macos": "DESKTOP_GITHUB_TOKEN"}
 APP_MODULES = ("launch", "rotation", "resume", "relaunch", "offline", "inputs", "auth", "perf")
 CLASS_ORDER = ["safe", "download", "external", "system", "mutating", "session_ending", "destructive"]
 HELD_REASON = {"mutating": "changes or sends data", "destructive": "deletes or resets data", "session_ending": "signs the user out", "external": "leaves the app",
@@ -146,6 +149,56 @@ def to_pages(screens: list[Screen], app_id: str, protected_routes: set[str], sig
     return pages
 
 
+def _persist_results(ctx: RunContext, stats: dict, pages: list, components: list, tests: list, findings: list, summary: str) -> datetime:
+    ctx.event("judge", f"{len(tests)} tests, {len({f.fingerprint for f in findings})} candidate findings; {sum(1 for f in findings if f.status != 'reported')} held for review", 92)
+    finished = datetime.now(timezone.utc)
+    stats.update(tests=len(tests), tests_by_status={status: sum(t.status == status for t in tests) for status in {t.status for t in tests}})
+    with session(ctx.settings.database_url) as db:
+        run = db.get(Run, ctx.run_id)
+        stats.update(persist(db, run, pages, components, tests, findings))
+        run.stats, run.status, run.finished_at, run.progress, run.stage = stats, "completed", finished, 100, "done"
+        run.message = f"{stats['findings_total']} findings; {summary}"
+        run.secrets = None
+        db.commit()
+    return finished
+
+
+def _leg_result(tests: list[TestRecord], required: list[TestRecord]) -> dict:
+    failed = sum(t.status in ("fail", "flaky") for t in tests)
+    passed = sum(t.status == "pass" for t in tests)
+    blocked = sum(t.status == "blocked" for t in tests)
+    status = "fail" if failed else "blocked" if not passed or any(t.status == "blocked" for t in required) else "pass"
+    detail = f"{passed} passed, {failed} failed, {blocked} blocked"
+    if (unavailable := next((t for t in required if t.status == "blocked"), None)) is not None:
+        detail += f". {unavailable.observed}"
+    return {"status": status, "detail": detail}
+
+
+def _blocked_check(key: str, name: str, technique: str, route: str, reason: str) -> TestRecord:
+    return TestRecord(test_key=key, name=name, technique=technique, category="functional", route=route,
+                      observed=reason, status="blocked")
+
+
+def _append_assertion(test: TestRecord, tests: list[TestRecord], findings: list[FindingRecord]) -> None:
+    tests.append(test)
+    if test.status == "fail":
+        findings.append(FindingRecord(
+            fingerprint=fingerprint(test.route, "functional", "expected result", test.test_key), route=test.route,
+            category="functional", severity="medium", title=f"Expected result failed: {test.name}",
+            expected=test.expected, observed=test.observed, standard_ref="User-defined expectation", confidence=0.8,
+            viewport="device" if test.route != "backend" else "backend", status="needs_review",
+            evidence=test.evidence, steps=test.steps, test_key=test.test_key,
+        ))
+
+
+def _combined_assertion(ui: TestRecord, api: TestRecord) -> TestRecord:
+    statuses = {ui.status, api.status}
+    status = "fail" if "fail" in statuses else "blocked" if "blocked" in statuses else "pass"
+    return TestRecord(test_key="full|assertions", name="Combined app and API expectations", technique="functional", category="functional",
+                      route="full", expected="Both submitted expectations pass", observed=f"App check: {ui.status}. API check: {api.status}.",
+                      status=status, evidence=ui.evidence)
+
+
 def run_app_pipeline(run_id: str, settings: Settings) -> None:
     ctx = RunContext(settings, run_id)
     with session(settings.database_url) as db:
@@ -157,6 +210,10 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
         repo_url, build_spec, options, platform = run.repo_url, run.live_url, dict(run.options or {}), run.platform
         secrets = decrypt_secrets(settings.secret_key, run.secrets)
 
+    test_mode = options.get("test_mode") if platform == "android" else None
+    backend_required = test_mode in ("backend", "full")
+    build_only = platform == "android" and (test_mode == "frontend" or not repo_url)
+    uploaded_apk = apk_upload_path(settings.artifacts_dir, run_id) if platform == "android" and options.get("uploaded_apk") else None
     run_dir = settings.artifacts_dir / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -164,18 +221,31 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
     runner: JourneyRunner | None = None
     registry = QADataRegistry(run_id, run_dir / "qa_data.json")
     completed = False
+    terminal = False
+    checkouts = ExitStack()
+    legs: dict = {}
+    assertions = options.get("assertions", {}) if test_mode else {}
+    api_result = ui_result = None
+    frontend_pending = False
+    frontend_stage = "Prepare the Android build"
+    pages, components, tests, findings = [], [], [], []
     try:
         # 1. ingest ---------------------------------------------------------
         inv, texts_by_screen, commit_sha, framework, repo_path = CodeInventory(), {}, "", "", None
-        tokens = [secrets.get("github_token") or "", os.environ.get(TOKEN_ENV.get(platform, "")) or "", settings.github_token or ""]
-        backend_tokens = [secrets.get("github_token") or "", os.environ.get(TOKEN_ENV.get(platform, "").replace("_GITHUB", "_BACKEND_GITHUB")) or "",
-                          os.environ.get(TOKEN_ENV.get(platform, "")) or "", settings.github_token or ""]
+        token = secrets.get("github_token")
         sources = [dict(s) for s in options.get("codebase_sources") or ([{"role": "frontend", "source": repo_url}] if repo_url else [])]
-        if repo_url:
-            ctx.event("ingest", f"Fetching codebase {repo_url}", 3)
+        if test_mode == "frontend":
+            sources = []
+        elif backend_required:
+            sources = [src for src in sources if src["role"] == "backend"]
+        checkout_dir = None
+        frontend = next((src for src in sources if src["role"] == "frontend"), None)
+        if frontend:
+            ctx.event("ingest", f"Fetching codebase {frontend['source']}", 3)
             try:
-                repo = fetch_repo(repo_url, settings.artifacts_dir / "repos" / run_id, token=tokens, branch=options.get("branch") or None)
-                sources[0]["commit_sha"] = repo.commit_sha
+                checkout_dir = checkouts.enter_context(repository_workspace(settings.artifacts_dir))
+                repo = fetch_repo(frontend["source"], checkout_dir / "frontend", token=token, branch=options.get("branch") or None)
+                frontend["commit_sha"] = repo.commit_sha
                 commit_sha, repo_path = repo.commit_sha, repo.path
                 inv, texts_by_screen = build_app_inventory(repo.path, platform)
                 framework = inv.framework
@@ -183,37 +253,112 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
             except Exception as exc:
                 # The build can still be tested; coverage against the code is then unavailable.
                 ctx.event("ingest", f"Codebase unavailable, testing the build only: {str(exc)[:400]}", 12, level="warn")
-                sources[0]["note"] = f"unavailable: {str(exc)[:160]}"
+                frontend["note"] = f"unavailable: {str(exc)[:160]}"
         # the backend (optional second source): API routes for journey planning and load-test targets, kept out of UI coverage
         api_routes: list[BackendRoute] = []
         backend_path = None
-        for src in sources[1:2]:
+        backend_blocked = "Provide a backend Git URL and token" if backend_required and not sources else ""
+        for src in (source for source in sources if source["role"] == "backend"):
             ctx.event("ingest", f"Fetching backend codebase {src['source']}", 12)
             try:
-                brepo = fetch_repo(src["source"], settings.artifacts_dir / "repos" / f"{run_id}-backend", token=backend_tokens)
+                branch = (options.get("branch") or None) if backend_required else None
+                if backend_required and not token:
+                    raise ValueError("Missing Git token")
+                if checkout_dir is None:
+                    checkout_dir = checkouts.enter_context(repository_workspace(settings.artifacts_dir))
+                brepo = fetch_repo(src["source"], checkout_dir / "backend", token=token, branch=branch)
                 backend_path, src["commit_sha"] = brepo.path, brepo.commit_sha
+                if backend_required:
+                    commit_sha = brepo.commit_sha
                 api_routes = backend_routes(brepo.path)
-                src["note"] = f"{len(api_routes)} API routes ({sum(1 for r in api_routes if r.auth)} behind sign-in)"
+                src["note"] = f"{len(api_routes)} API routes ({sum(1 for r in api_routes if r.auth)} with an auth guard hint)"
                 ctx.event("ingest", f"Backend: {src['note']}", 13)
             except Exception as exc:
-                src["note"] = f"unavailable: {str(exc)[:160]}"
-                ctx.event("ingest", f"Backend codebase unavailable, continuing with the app's code only: {str(exc)[:300]}", 13, level="warn")
+                if backend_required:
+                    backend_blocked = ("The backend source could not be checked out. Check the repository URL, branch, and token access."
+                                       if backend_path is None else "The backend checkout could not be parsed for routes.")
+                    src["note"] = backend_blocked
+                    ctx.event("ingest", backend_blocked, 13, level="warn")
+                else:
+                    src["note"] = f"unavailable: {str(exc)[:160]}"
+                    ctx.event("ingest", f"Backend codebase unavailable, continuing with the app's code only: {str(exc)[:300]}", 13, level="warn")
         client_eps: list[ClientEndpoint] = client_endpoints(repo_path) if repo_path else []
-        api_bases = (base_urls(repo_path) if repo_path else []) + [u for u in (base_urls(backend_path) if backend_path else []) if u not in (base_urls(repo_path) if repo_path else [])]
+        api_bases = []
+        if not backend_required:
+            client_bases = base_urls(repo_path) if repo_path else []
+            backend_bases = base_urls(backend_path) if backend_path else []
+            api_bases = list(dict.fromkeys(client_bases + backend_bases))
         if client_eps or api_routes:
             ctx.event("ingest", f"API: the app calls {len(client_eps)} endpoint(s); backend declares {len(api_routes)} route(s); base URL(s) in the code: {', '.join(api_bases) or 'none'}", 13)
         (run_dir / "backend.json").write_text(json.dumps({**summarize(api_routes, client_eps), "base_urls": api_bases, "sources": sources}, indent=1), encoding="utf-8")
+        backend_stats = {"routes": len(api_routes), "client_endpoints": len(client_eps), "base_urls": api_bases}
+        backend_tests, backend_findings = [], []
+        if backend_required:
+            inventory_test = TestRecord(
+                test_key="backend|route-inventory", name="Identify backend API routes", technique="backend-source", category="functional",
+                route="backend", expected="Discover API route declarations in the backend repository",
+                observed=backend_blocked or (f"Found {len(api_routes)} route declarations" if api_routes else "No supported route declarations found"),
+                status="pass" if api_routes and not backend_blocked else "blocked",
+            )
+            backend_tests.append(inventory_test)
+        load_config = LoadConfig.from_env(options)
+        if build_only:
+            load_config.enabled = False
+        elif backend_required:
+            load_config.enabled = bool(options.get("load_test") and options.get("load_test_base_url"))
+            load_config.bearer_token = ""
+
+        if backend_required:
+            if assertions.get("api"):
+                ctx.event("backend", "Checking the submitted API expectation", 14)
+                try:
+                    api_result = check_api_assertion(assertions["api"], secrets.get("api_token", ""))
+                except Exception as exc:
+                    reason = f"The submitted API check stopped ({type(exc).__name__})."
+                    api_result = _blocked_check("backend|api-assertion-error", "API expectation", "api-assertion", "backend", reason)
+                _append_assertion(api_result, backend_tests, backend_findings)
+            try:
+                load_summary, load_tests, load_findings = run_load_test(load_config, api_routes, client_eps, ctx.event, run_id, api_bases)
+            except Exception as exc:
+                reason = f"The API load test stopped ({type(exc).__name__})."
+                ctx.event("backend", reason, 14, level="warn")
+                load_summary = {"status": "blocked", "reason": reason}
+                load_tests = [_blocked_check("load|error", "Backend API load test", "load", "backend", reason)]
+                load_findings = []
+            backend_tests += load_tests
+            backend_findings += load_findings
+            legs["backend"] = _leg_result(backend_tests, backend_tests)
+            backend_report = {"platform": platform, "test_mode": test_mode, "code_available": False, "sources": sources,
+                              "backend": backend_stats, "load_test": load_summary, "legs": legs}
+            with session(settings.database_url) as db:
+                r = db.get(Run, run_id)
+                r.commit_sha, r.framework = commit_sha, "backend"
+                db.commit()
+
+        if test_mode == "backend":
+            stats = {**backend_report, "duration_seconds": round(time.time() - t0, 1)}
+            finished = _persist_results(ctx, stats, [], [], backend_tests, backend_findings, f"Backend checks {legs['backend']['status']}")
+            report_path = write_report(run_dir, run_id, {"live_url": build_spec, "repo_url": repo_url, "commit_sha": commit_sha,
+                                                       "finished_at": finished.isoformat(), "sources": sources}, stats, [], [], backend_tests, backend_findings)
+            ctx.event("done", f"Report written: {report_path}", 100)
+            return
+
+        frontend_pending = test_mode == "full"
         intents = {el.key: app_intent(el) for el in inv.elements}
+        code_available = bool(inv.files_parsed)
         (run_dir / "inventory.json").write_text(json.dumps({**inv.to_dict(), "intents": intents}, indent=1, default=str), encoding="utf-8")
 
         ctx.event("ingest", f"Inspecting build {build_spec}", 14)
-        build = resolve_build(build_spec, platform)
+        if uploaded_apk is not None and not uploaded_apk.is_file():
+            raise FileNotFoundError("Uploaded APK is missing from the host worker's shared upload directory")
+        build = resolve_build(str(uploaded_apk) if uploaded_apk is not None else build_spec, platform)
         framework = framework or build.framework
         ctx.event("ingest", f"{build.kind} {build.app_id or ''} {build.version or ''} ({build.framework or 'unknown framework'}){' sha256 ' + build.sha256[:12] if build.sha256 else ''}", 16)
         static_tests, static_findings = build_checks(build)
         t, f = code_checks(inv)
         static_tests += t
         static_findings += f
+        tests, findings = static_tests, static_findings
         if static_tests:
             ctx.event("ingest", f"Build and code checks: {sum(1 for t in static_tests if t.status == 'pass')}/{len(static_tests)} passed"
                       + (f"; {len(static_findings)} finding(s): " + "; ".join(x.title for x in static_findings[:4]) if static_findings else ""), 17)
@@ -223,12 +368,15 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
             db.commit()
 
         # 2. explore --------------------------------------------------------
+        frontend_stage = "Start the Android Appium session"
         ctx.event("explore", f"Starting Appium session on {platform}" + (" (clean start: app data cleared)" if options.get("clean_start") else ""), 18)
         dev = AppDevice(settings, build, run_dir, ctx.event, clean_start=bool(options.get("clean_start")))
         dev.start()
+        frontend_stage = "Explore the Android app"
         ctx.event("explore", f"App launched in {dev.launch_seconds}s", 22)
         lc = label_classes(inv, intents)
-        explorer = AppExplorer(dev, ctx.event, max_screens=int(options.get("max_pages") or settings.max_screens), label_class=lc,
+        max_screens = settings.max_screens if test_mode else int(options.get("max_pages") or settings.max_screens)
+        explorer = AppExplorer(dev, ctx.event, max_screens=max_screens, label_class=lc,
                                code_menu_items={normalize(e.label) for e in inv.elements if e.kind == "menuitem" and e.label})
         explorer.skip_labels = sorted({e.label for e in inv.elements if e.label and SKIP_SETUP_RE.search(e.label)}) or ["Skip for now", "Skip", "Not now"]
         first = explorer.settled(15.0)  # past splash and loading screens
@@ -273,7 +421,7 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
         protected_routes = {r.path for r in inv.routes if r.protected}
         pages = to_pages(explorer.screens, build.app_id or build.label, protected_routes, signed_in, platform, explorer.taps)
         rec = reconcile(inv.elements, pages, sorted(protected_routes), "")
-        components = build_components(rec, intents)
+        components = build_components(rec, intents, code_available=code_available)
         by_screen_el = {}
         for c in components:
             if c.page_url and "#" in c.page_url and c.selector:
@@ -282,9 +430,16 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
                                                                        "elements": [asdict(e) for e in s.snap.elements], "texts": s.snap.texts[:80]} for s in explorer.screens],
                                                           "taps": [{**{k: v for k, v in asdict(t).items() if k != "element"}, "element": t.element.name, "selector": t.element.selector} for t in explorer.taps]},
                                                          indent=1, default=str), encoding="utf-8")
-        ctx.event("reconcile", f"Matched {rec.stats['matched']}/{rec.stats['code_interactive']} code controls on the device ({rec.coverage * 100:.0f}%); {rec.stats['observed_unmatched_visible']} controls on screen have no code declaration", 60)
+        if code_available:
+            ctx.event("reconcile", f"Matched {rec.stats['matched']}/{rec.stats['code_interactive']} code controls on the device ({rec.coverage * 100:.0f}%); {rec.stats['observed_unmatched_visible']} controls on screen have no code declaration", 60)
+        else:
+            ctx.event("reconcile", f"{rec.stats['observed_unmatched_visible']} controls observed on the device. Source coverage unavailable.", 60)
+        if assertions.get("ui"):
+            ui_result = check_ui_assertion(explorer.screens, assertions["ui"])
+            _append_assertion(ui_result, tests, findings)
 
         # 4-5. execute + judge ----------------------------------------------
+        frontend_stage = "Run the Android device checks"
         failing = [t for t in explorer.taps if t.result in ("crash", "anr", "error")]
         if failing:
             ctx.event("judge", f"Reproducing {len(failing)} failing taps from a fresh launch", 62)
@@ -295,15 +450,15 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
             density = float(dev.driver.capabilities.get("deviceScreenDensity") or 0)
         except Exception:
             pass
-        tests, findings = screen_checks(explorer.screens, density, platform)
+        t1, f1 = screen_checks(explorer.screens, density, platform)
         t2, f2 = tap_results(explorer, by_screen_el)
-        tests += t2 + extra_tests + static_tests
-        findings += f2 + extra_findings + static_findings
+        tests += t1 + t2 + extra_tests
+        findings += f1 + f2 + extra_findings
         # journeys with QA test data: planned from the code (and the LLM), validated by the safety rules, run, cleaned up
         ai_info: dict = {"used": False}
         journey_stats: dict = {"planner": "off", "total": 0, "completed": 0, "items": [], "actions": 0}
         journey_held: list[dict] = []
-        if options.get("journeys", True) and options.get("phase2", True):
+        if options.get("journeys", True) and options.get("phase2", True) and (platform != "android" or code_available):
             ai_plan = None
             if native_ai.enabled(settings, options):
                 ctx.event("journey", f"Asking {settings.gemini_model} for screen intent, journeys and validation cases (no credentials are sent)", 64)
@@ -348,41 +503,69 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
         tests += active.tests
         findings += active.findings
 
-        # backend API load test (HTTP, bounded, GET only; never Appium sessions)
-        load_summary, lt_tests, lt_findings = run_load_test(LoadConfig.from_env(options), api_routes, client_eps, ctx.event, run_id, api_bases)
-        tests += lt_tests
-        findings += lt_findings
+        if test_mode:
+            legs["frontend"] = _leg_result(tests, [ui_result] if ui_result else [])
+        if not backend_required:
+            # Existing load test for source-assisted native runs. Frontend testing disables it.
+            load_summary, lt_tests, lt_findings = run_load_test(load_config, api_routes, client_eps, ctx.event, run_id, api_bases)
+            tests += lt_tests
+            findings += lt_findings
         explain(findings, inv=inv, components=components, screens=explorer.screens, build=build, signed_in=signed_in, repo=repo_path)
-        ctx.event("judge", f"{len(tests)} tests, {len({f.fingerprint for f in findings})} candidate findings; {sum(1 for f in findings if f.status != 'reported')} held for review", 92)
 
         # 6. report ---------------------------------------------------------
-        finished = datetime.now(timezone.utc)
         stats = {
             **rec.stats, "coverage": round(rec.coverage, 4), "coverage_unconditional": round(rec.coverage_unconditional, 4), **coverage_after(components),
-            "platform": platform, "build": {k: v for k, v in asdict(build).items() if k in ("kind", "app_id", "version", "framework", "sha256", "label")},
-            "code_available": bool(inv.files_parsed), "pages": len(pages), "screens": len(explorer.screens), "routes": len(inv.routes), "tests": len(tests),
+            "platform": platform, "test_mode": test_mode, "build": {k: v for k, v in asdict(build).items() if k in ("kind", "app_id", "version", "framework", "sha256", "label")},
+            "code_available": code_available, "pages": len(pages), "screens": len(explorer.screens), "routes": len(inv.routes),
             "taps": tapped, "held_back": sum(1 for t in explorer.taps if t.result == "skipped" and t.action_class != "safe") + len(journey_held),
             "held_actions": held_actions(explorer) + journey_held, "safe_actions": tapped + journey_stats.get("actions", 0),
             "journeys": journey_stats, "qa_data": registry.summary(), "load_test": load_summary, "ai": ai_info, "sources": sources,
-            "backend": {"routes": len(api_routes), "client_endpoints": len(client_eps), "base_urls": api_bases},
-            "tests_by_status": {s: sum(1 for t in tests if t.status == s) for s in {t.status for t in tests}},
+            "backend": backend_stats,
             "components_by_status": {s: sum(1 for c in components if c.status == s) for s in {c.status for c in components}},
             "duration_seconds": round(time.time() - t0, 1),
         }
-        with session(settings.database_url) as db:
-            r = db.get(Run, run_id)
-            extra = persist(db, r, pages, components, tests, findings)
-            stats.update(extra)
-            r.stats, r.status, r.finished_at, r.progress, r.stage = stats, "completed", finished, 100, "done"
-            r.message = f"{extra['findings_total']} findings; {len(explorer.screens)} screens, {tapped} controls tapped" + (f", {stats['coverage_interaction'] * 100:.0f}% of code controls found" if inv.files_parsed else " (no codebase)")
-            r.secrets = None
-            db.commit()
+        if legs:
+            stats["legs"] = legs
+        summary = f"{len(explorer.screens)} screens, {tapped} controls tapped"
+        if backend_required:
+            summary += f"; Frontend checks {legs['frontend']['status']}; Backend checks {legs['backend']['status']}"
+        summary += f", {stats['coverage_interaction'] * 100:.0f}% of code controls found" if code_available else " (source coverage unavailable)"
+        frontend_pending = False
+        tests += backend_tests
+        findings += backend_findings
+        if ui_result and api_result:
+            tests.append(_combined_assertion(ui_result, api_result))
+        finished = _persist_results(ctx, stats, pages, components, tests, findings, summary)
+        terminal = True
         report_path = write_report(run_dir, run_id, {"live_url": f"{platform}: {build.app_id or build_spec}", "repo_url": repo_url, "commit_sha": commit_sha, "framework": framework, "finished_at": finished.isoformat(),
                                                      "sources": sources},
                                    stats, pages, components, tests, findings)
         completed = True
         ctx.event("done", f"Report written: {report_path}", 100)
     except Exception as exc:
+        if frontend_pending:
+            reason = f"{frontend_stage} did not complete ({type(exc).__name__}). Review the Android worker and Appium logs."
+            ctx.event("explore", reason, None, level="warn")
+            device_result = _blocked_check("frontend|device", "Android device checks", "device", "frontend", reason)
+            tests.append(device_result)
+            if assertions.get("ui") and ui_result is None:
+                ui_result = _blocked_check("assertion|ui", "Expected text on app screen", "ui_assertion", "frontend", reason)
+                tests.append(ui_result)
+            legs["frontend"] = _leg_result(tests, [device_result])
+            combined = [_combined_assertion(ui_result, api_result)] if ui_result and api_result else []
+            partial_tests, partial_findings = tests + backend_tests + combined, findings + backend_findings
+            stats = {**backend_report, "pages": len(pages), "screens": len(pages), "duration_seconds": round(time.time() - t0, 1)}
+            summary = f"Frontend checks {legs['frontend']['status']}; Backend checks {legs['backend']['status']}"
+            try:
+                finished = _persist_results(ctx, stats, pages, components, partial_tests, partial_findings, summary)
+                report_path = write_report(run_dir, run_id, {"live_url": build_spec, "repo_url": repo_url, "commit_sha": commit_sha,
+                                                           "finished_at": finished.isoformat(), "sources": sources},
+                                           stats, pages, components, partial_tests, partial_findings)
+                ctx.event("done", f"Report written: {report_path}", 100)
+                terminal = True
+                return
+            except Exception as report_exc:
+                exc = report_exc
         logger.exception("app run %s failed", run_id)
         with session(settings.database_url) as db:
             r = db.get(Run, run_id)
@@ -394,6 +577,7 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
                     r.message += f"; QA data created before the failure is listed in qa_data.json ({len(registry.records)} item(s))"
                 db.add(RunEvent(run_id=run_id, level="error", stage=r.stage, message=r.message))
                 db.commit()
+                terminal = True
     finally:
         if runner is not None and registry.pending() and dev is not None:
             try:
@@ -406,5 +590,13 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
                 ctx.event("cleanup", f"QA data left over ({len(leftover)}): " + "; ".join(leftover)[:900], None, level="warn")
             except Exception:
                 pass
-        if dev is not None:
-            dev.stop()
+        try:
+            if dev is not None:
+                dev.stop()
+        finally:
+            checkouts.close()
+            if uploaded_apk is not None and terminal:
+                try:
+                    uploaded_apk.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("could not remove uploaded APK for run %s", run_id, exc_info=True)

@@ -1,8 +1,14 @@
 {% extends "base.html" %}
 {% block body %}
 <h1>Test an application</h1>
+<style>
+#run-form [hidden]{display:none}
+#clear-apk{margin:4px 0 0;padding:3px 8px;background:transparent;color:var(--accent);border:1px solid var(--line)}
+#run-form fieldset{border:1px solid var(--line);border-radius:6px;margin:12px 0;padding:0 12px 12px}
+#run-form legend{font-size:12px;font-weight:600;color:var(--muted)}
+</style>
 <div class="card">
-<form method="post" action="/runs" id="run-form">
+<form method="post" action="/runs" enctype="multipart/form-data" id="run-form">
 <div class="grid">
 <div><label for="platform">Platform</label><select id="platform" name="platform">
 <option value="web">Web (Playwright)</option>
@@ -10,27 +16,63 @@
 <option value="ios">iOS app (Appium)</option>
 <option value="macos">macOS desktop app (Appium)</option>
 </select></div>
-<div><label for="repo_url">Codebase URL(s) (git) or local path(s)</label><textarea id="repo_url" name="repo_url" rows="2" required placeholder="https://github.com/org/frontend.git">{{ defaults.web.repo_url }}</textarea>
-<small data-for="app" hidden>One per line: the app's code first, then (optional) its backend API.</small></div>
-<div data-for="web"><label for="live_url">Live URL</label><input type="url" id="live_url" name="live_url" required value="{{ defaults.web.live_url }}" placeholder="https://app.example.com"></div>
-<div data-for="app" hidden><label for="app_path">App build: file path or installed app id</label><input type="text" id="app_path" name="app_path" value="" placeholder="/path/app-release.apk · /Applications/App.app · com.example.app"></div>
-<div><label for="project">Project name</label><input type="text" id="project" name="project" value="{{ defaults.web.project }}"></div>
-<div><label for="branch">Branch (optional)</label><input type="text" id="branch" name="branch" placeholder="main"></div>
-<div><label for="email">Test account email or username</label><input type="text" id="email" name="email" autocomplete="username" value="{{ defaults.web.email }}"></div>
-<div><label for="password">Test account password</label><input type="password" id="password" name="password"></div>
-<div><label for="github_token">Git token for private repos (optional)</label><input type="password" id="github_token" name="github_token" autocomplete="new-password" placeholder="leave empty to use the token in .env"></div>
-<div><label for="max_pages" id="max_pages_label">Max pages to explore</label><input type="number" id="max_pages" name="max_pages" value="60" min="1" max="500"></div>
+<div data-for="android" hidden>
+<label for="test_mode">Testing mode</label>
+<select id="test_mode" name="test_mode" disabled>
+<option value="frontend">Frontend testing</option>
+<option value="backend">Backend testing</option>
+<option value="full">Full testing</option>
+</select>
 </div>
-<label><input type="checkbox" name="llm_intent" value="true" checked> <span data-for="web">Summarise page intent with the LLM (source code only; credentials never leave this machine)</span><span data-for="app" hidden>Use the LLM to describe each screen and plan user journeys and validation cases (code, screen texts and control labels only; credentials never leave this machine; the safety rules still decide every action)</span></label>
-<label><input type="checkbox" name="phase2" value="true" checked> <span data-for="web">Interaction tests: open menus, drawers and tabs; forms, validation, persistence, timers, failure handling</span><span data-for="app" hidden>Device tests: sign-in negatives, rotation, background / resume, relaunch, offline, input bounds</span></label>
-<label data-for="app" hidden><input type="checkbox" name="clean_start" value="true"> Clean start: clear the app's data on the device first (deletes anything stored only on the device)</label>
-<label data-for="app" hidden><input type="checkbox" name="journeys" value="true" checked> Full journeys with QA test data: fill forms with <code>qa_&lt;run&gt;_&lt;time&gt;</code> values, submit, verify, then clean up only what this run created</label>
-<label data-for="app" hidden><input type="checkbox" name="remote_qa_data" value="true"> Let journeys create QA records on the backend (off: stop before any step that would upload or sync; records that cannot be deleted are listed as leftovers)</label>
-<div data-for="app" hidden class="grid"><label><input type="checkbox" name="load_test" value="true" id="load_test" {{ 'checked' if defaults.load_test.enabled }}> Backend API load test (GET only, bounded by LOAD_TEST_* settings)</label>
-<div><label for="load_test_base_url">Backend API base URL for the load test (optional; else found in the code)</label><input type="url" id="load_test_base_url" name="load_test_base_url" value="{{ defaults.load_test.base_url }}" placeholder="https://api.example.com"></div></div>
+<div data-for="non-android"><label for="repo_url">Codebase URL(s) (git) or local path(s)</label><textarea id="repo_url" name="repo_url" rows="2" required placeholder="https://github.com/org/frontend.git"></textarea>
+<small data-for="native-source" hidden>Enter the app's code first and its optional backend API on the next line.</small></div>
+<div data-for="android-backend" hidden>
+<label for="backend_repo_url">Backend Git URL</label>
+<input type="url" id="backend_repo_url" name="repo_url" pattern="https://.+" placeholder="https://github.com/org/backend.git" title="Enter an HTTPS Git repository URL" disabled>
+</div>
+<div data-for="web"><label for="live_url">Live URL</label><input type="url" id="live_url" name="live_url" required value="{{ defaults.web.live_url }}" placeholder="https://app.example.com"></div>
+<div data-for="android-device" hidden>
+<label for="apk_file">Upload APK</label>
+<input type="file" id="apk_file" name="apk_file" accept=".apk,application/vnd.android.package-archive" aria-describedby="apk-help" disabled>
+<button type="button" id="clear-apk" hidden>Remove selected APK</button>
+<small id="apk-help">Choose an APK or enter its path on the worker. The worker installs the APK before testing.</small>
+</div>
+<div data-for="device" hidden><label for="app_path" id="app_path_label">App build path or installed app ID</label><input type="text" id="app_path" name="app_path" placeholder="/path/to/app.ipa or com.example.app" disabled></div>
+<div><label for="project">Project name</label><input type="text" id="project" name="project" maxlength="80"></div>
+<div data-for="git"><label for="branch">Branch (optional)</label><input type="text" id="branch" name="branch" placeholder="main"></div>
+<div data-for="interactions"><label for="email">Test account email or username</label><input type="text" id="email" name="email" autocomplete="username" value="{{ defaults.web.email }}"></div>
+<div data-for="interactions"><label for="password">Test account password</label><input type="password" id="password" name="password"></div>
+<div data-for="git"><label for="github_token">Git access token<span data-for="non-android"> (optional)</span></label><input type="password" id="github_token" name="github_token" autocomplete="new-password"></div>
+<div data-for="non-android"><label for="max_pages" id="max_pages_label">Max pages to explore</label><input type="number" id="max_pages" name="max_pages" value="{{ defaults.web.max_pages }}" min="1" max="500"></div>
+</div>
+<label data-for="non-android"><input type="checkbox" name="llm_intent" value="true" checked> <span data-for="web">Summarise page intent with the LLM (source code only; credentials never leave this machine)</span><span data-for="native-source" hidden>Use the LLM to describe each screen and plan user journeys and validation cases (code, screen texts and control labels only; credentials never leave this machine; the safety rules still decide every action)</span></label>
+<label data-for="interactions"><input type="checkbox" name="phase2" value="true" checked> <span data-for="web">Interaction tests: open menus, drawers and tabs; forms, validation, persistence, timers, failure handling</span><span data-for="device" hidden>Device tests: sign-in negatives, rotation, background / resume, relaunch, offline, input bounds</span></label>
+<label data-for="device" hidden><input type="checkbox" name="clean_start" value="true" disabled> Clean start: clear the app's data on the device first (deletes anything stored only on the device)</label>
+<label data-for="native-source" hidden><input type="checkbox" name="journeys" value="true" checked disabled> Full journeys with QA test data: fill forms with <code>qa_&lt;run&gt;_&lt;time&gt;</code> values, submit, verify, then clean up only what this run created</label>
+<label data-for="native-source" hidden><input type="checkbox" name="remote_qa_data" value="true" disabled> Let journeys create QA records on the backend (off: stop before any step that would upload or sync; records that cannot be deleted are listed as leftovers)</label>
+<fieldset data-for="android-device" hidden>
+<legend>UI assertion (optional)</legend>
+<div class="grid">
+<div><label for="ui_path">Control labels to tap</label><textarea id="ui_path" name="ui_path" rows="2" aria-describedby="ui-path-help" disabled></textarea><small id="ui-path-help">Enter one exact label per line. Leave blank to check the initial screen.</small></div>
+<div><label for="ui_expected_text">Expected visible text</label><input type="text" id="ui_expected_text" name="ui_expected_text" disabled></div>
+</div>
+</fieldset>
+<fieldset data-for="android-backend" hidden>
+<legend>API assertion (optional)</legend>
+<div class="grid">
+<div><label for="api_base_url">Backend API base URL</label><input type="url" id="api_base_url" name="api_base_url" placeholder="https://api.example.com" aria-describedby="api-base-help" disabled><small id="api-base-help">Required for an API assertion or a load test.</small></div>
+<div><label for="api_path">Relative GET endpoint</label><input type="text" id="api_path" name="api_path" placeholder="/api/health" disabled></div>
+<div><label for="api_expected_status">Expected HTTP status</label><input type="number" id="api_expected_status" name="api_expected_status" min="100" max="599" placeholder="200" aria-describedby="api-status-help" disabled><small id="api-status-help">Defaults to 200 when an endpoint is entered.</small></div>
+<div><label for="api_token">API bearer token (optional)</label><input type="password" id="api_token" name="api_token" autocomplete="new-password" disabled></div>
+<div><label for="api_json_field">JSON field (optional)</label><input type="text" id="api_json_field" name="api_json_field" placeholder="service.ready" disabled></div>
+<div><label for="api_expected_value">Expected JSON field value</label><input type="text" id="api_expected_value" name="api_expected_value" aria-describedby="api-value-help" disabled><small id="api-value-help">Enter JSON or plain text. Use JSON quotes for literal strings such as <code>"true"</code> or <code>"123"</code>.</small></div>
+</div>
+</fieldset>
+<div data-for="backend-test" hidden class="grid"><label><input type="checkbox" name="load_test" value="true" id="load_test" {{ 'checked' if defaults.load_test.enabled }} disabled> Backend API load test (GET only, bounded by LOAD_TEST_* settings)</label>
+<div data-for="native-source"><label for="load_test_base_url">Backend API base URL (optional)</label><input type="url" id="load_test_base_url" name="load_test_base_url" value="{{ defaults.load_test.base_url }}" placeholder="https://api.example.com" disabled></div></div>
 <button type="submit">Start run</button>
 <p data-for="web"><small>Every write the browser tries to make (POST, PUT, PATCH, DELETE) is intercepted and never reaches the server; only sign-in, token refresh and the logout test go through. Destructive actions only have their confirmation opened and cancelled. Credentials are encrypted at rest and wiped when the run finishes.</small></p>
-<p data-for="app" hidden><small>Native runs go to the host worker (<code>make app-worker-start</code>), which drives Appium on this machine: Android via UiAutomator2 on a connected device or emulator, macOS via Mac2. Only controls classed safe from their label and the code are tapped: anything that saves, uploads, syncs, deletes, signs out or leaves the app is held back and listed. Typed test input is never submitted and the original value is put back. Credentials are encrypted at rest and wiped when the run finishes.</small></p>
+<p data-for="device" hidden><small>Device tests go to the host worker (<code>make app-worker-start</code>), which drives Appium on this machine. Exploration classifies controls using their labels and any supplied source. Controls identified as saving, uploading, syncing, deleting, signing out or leaving the app are listed as held back. Field probes during exploration are restored. Credentials are encrypted at rest and wiped when the run finishes.</small></p>
 </form>
 </div>
 
@@ -51,28 +93,95 @@
   const defaults = {{ defaults | tojson }};
   const form = document.getElementById("run-form");
   const platform = document.getElementById("platform");
-  const fields = {repo_url: "repo_url", live_url: "live_url", app_path: "app_path", project: "project", email: "email"};
+  const testMode = document.getElementById("test_mode");
+  const appPath = document.getElementById("app_path");
+  const apkFile = document.getElementById("apk_file");
+  const clearApk = document.getElementById("clear-apk");
+  const loadTest = document.getElementById("load_test");
+  const uiPath = document.getElementById("ui_path");
+  const uiExpectedText = document.getElementById("ui_expected_text");
+  const apiBaseUrl = document.getElementById("api_base_url");
+  const apiPath = document.getElementById("api_path");
+  const apiExpectedStatus = document.getElementById("api_expected_status");
+  const apiJsonField = document.getElementById("api_json_field");
+  const apiExpectedValue = document.getElementById("api_expected_value");
+  const apiToken = document.getElementById("api_token");
+  const apiInputs = [apiPath, apiExpectedStatus, apiJsonField, apiExpectedValue, apiToken];
+  const loadPreferences = {android: false, other: loadTest.checked};
+  const regions = form.querySelectorAll("[data-for]");
+  const defaultFields = ["live_url", "app_path", "email", "max_pages"];
   let current = "web";
-  function apply(next) {
-    const isApp = next !== "web";
-    form.querySelectorAll("[data-for=web]").forEach(el => el.hidden = isApp);
-    form.querySelectorAll("[data-for=app]").forEach(el => el.hidden = !isApp);
-    document.getElementById("live_url").required = !isApp;
-    document.getElementById("app_path").required = isApp;
-    document.getElementById("max_pages_label").textContent = isApp ? "Max screens to explore" : "Max pages to explore";
-    const mp = document.getElementById("max_pages");
-    if (mp.value === String((defaults[current] || {}).max_pages)) mp.value = (defaults[next] || {}).max_pages;
-    // swap in the new platform's defaults unless the user typed something of their own
-    for (const [key, id] of Object.entries(fields)) {
-      const input = document.getElementById(id);
-      const prev = (defaults[current] || {})[key] || "";
-      if (input.value === prev) input.value = (defaults[next] || {})[key] || "";
+  function applyDefaults(next) {
+    for (const name of defaultFields) {
+      const input = document.getElementById(name);
+      if (input.value === String(defaults[current]?.[name] ?? "")) {
+        input.value = defaults[next]?.[name] ?? "";
+      }
     }
+    const previousLoadGroup = current === "android" ? "android" : "other";
+    const nextLoadGroup = next === "android" ? "android" : "other";
+    loadPreferences[previousLoadGroup] = loadTest.checked;
+    loadTest.checked = loadPreferences[nextLoadGroup];
     current = next;
   }
-  // the browser restores the select after a reload or Back without firing "change": follow whatever it shows
-  function sync() { if (platform.value !== current) apply(platform.value); }
+
+  function sync() {
+    if (platform.value !== current) applyDefaults(platform.value);
+    const android = platform.value === "android";
+    const web = platform.value === "web";
+    const androidBackend = android && testMode.value !== "frontend";
+    const device = !web && (!android || testMode.value !== "backend");
+    const nativeSource = !web && !android;
+    const uploading = android && device && apkFile.files.length > 0;
+    const apiAssertion = androidBackend && apiInputs.some(input => input.value.trim() !== "");
+    const visible = {
+      android,
+      web,
+      device,
+      git: !android || androidBackend,
+      interactions: web || device,
+      "non-android": !android,
+      "android-backend": androidBackend,
+      "android-device": android && device,
+      "native-source": nativeSource,
+      "backend-test": nativeSource || androidBackend,
+    };
+    for (const region of regions) {
+      region.hidden = !visible[region.dataset.for];
+      region.querySelectorAll("input, select, textarea").forEach(input => input.disabled = region.hidden);
+    }
+    clearApk.hidden = !uploading;
+    appPath.disabled = !device || uploading;
+    appPath.required = device && !uploading;
+    document.getElementById("app_path_label").textContent = android ? "APK path or installed package ID" : "App build path or installed app ID";
+    appPath.placeholder = android ? "artifacts/builds/app-release.apk or com.example.app" : "/path/to/app.ipa or com.example.app";
+    document.getElementById("project").required = android;
+    document.getElementById("live_url").required = web;
+    document.getElementById("repo_url").required = !android;
+    document.getElementById("backend_repo_url").required = androidBackend;
+    document.getElementById("github_token").required = androidBackend;
+    uiExpectedText.required = android && device && uiPath.value.trim() !== "";
+    apiBaseUrl.required = apiAssertion || (androidBackend && loadTest.checked);
+    apiPath.required = apiAssertion;
+    apiJsonField.required = androidBackend && apiExpectedValue.value.trim() !== "";
+    apiExpectedValue.required = androidBackend && apiJsonField.value.trim() !== "";
+    document.getElementById("max_pages_label").textContent = web ? "Max pages to explore" : "Max screens to explore";
+  }
+
   platform.addEventListener("change", sync);
+  testMode.addEventListener("change", sync);
+  loadTest.addEventListener("change", sync);
+  for (const input of [uiPath, ...apiInputs]) input.addEventListener("input", sync);
+  form.addEventListener("formdata", event => {
+    if (!apiExpectedStatus.value) event.formData.delete("api_expected_status");
+  });
+  apkFile.addEventListener("change", sync);
+  clearApk.addEventListener("click", () => {
+    apkFile.value = "";
+    sync();
+    apkFile.focus();
+  });
+  // The browser can restore a selection on Back without firing change.
   window.addEventListener("pageshow", sync);
   if (platform.value === "web" && defaults.platform && defaults.platform !== "web") platform.value = defaults.platform;
   sync();

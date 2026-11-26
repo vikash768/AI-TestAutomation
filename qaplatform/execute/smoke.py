@@ -332,7 +332,7 @@ class SmokeRunner:
     def _relogin(self, ctx) -> bool:
         cm = self.guard.suspended() if self.guard else contextlib.nullcontext()
         with cm:
-            res = login(ctx, self.live_url, self.secrets.get("email", ""), self.secrets.get("password", ""), self.settings, self.run_dir, save_state=False)
+            res = login(ctx, self.live_url, self.secrets.get("email", ""), self.secrets.get("password", ""), self.settings)
         return res.success
 
     # -- helpers -----------------------------------------------------------

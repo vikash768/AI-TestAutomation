@@ -1,5 +1,7 @@
 """Native app pipeline: code extraction, UI tree parsing, safety, screen checks, routing."""
+from io import BytesIO
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 
@@ -193,11 +195,11 @@ def test_api_creates_app_run(tmp_path):
     from qaplatform.worker import claim_next
 
     client = TestClient(app)
-    r = client.post("/runs", data={"platform": "android", "repo_url": "https://github.com/x/app.git", "app_path": "com.example.app", "project": "mobile"}, follow_redirects=False)
+    r = client.post("/runs", data={"platform": "android", "app_path": "com.example.app", "project": "mobile"}, follow_redirects=False)
     assert r.status_code == 303
     run_id = r.headers["location"].rsplit("/", 1)[1]
     assert client.get(f"/api/runs/{run_id}").json()["platform"] == "android"
-    assert client.post("/runs", data={"platform": "android", "repo_url": "x"}).status_code == 400
+    assert client.post("/runs", data={"platform": "android", "project": "mobile", "repo_url": "x"}).status_code == 400
     assert client.post("/runs", data={"platform": "tv", "repo_url": "x", "app_path": "y"}).status_code == 400
     # a web-only worker never claims it; an app worker does
     import os
@@ -209,6 +211,216 @@ def test_api_creates_app_run(tmp_path):
     assert claimed == (run_id, "android")
     with session(db_url) as db:
         assert db.get(Run, run_id).status == "claimed"
+
+
+@pytest.fixture
+def submission_client(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from qaplatform.api import app as app_module
+    from qaplatform.db.session import init_db
+
+    database_url = f"sqlite:///{tmp_path / 'submissions.db'}"
+    init_db(database_url)
+    monkeypatch.setattr(app_module.settings, "database_url", database_url)
+    monkeypatch.setattr(app_module.settings, "artifacts_dir", tmp_path / "artifacts")
+    with TestClient(app_module.app) as client:
+        yield client, database_url
+
+
+@pytest.mark.parametrize(("repo_fields", "target"), [
+    ({}, "/tmp/fixture app.apk"),
+    ({"repo_url": ""}, "com.example.app"),
+    ({"repo_url": " \n\t"}, "/tmp/fixture.apk"),
+    ({"repo_url": "https://github.com/example/backend.git", "github_token": "fixture-token", "branch": "develop"}, "/tmp/fixture.apk"),
+])
+def test_api_accepts_android_without_source(submission_client, repo_fields, target):
+    from qaplatform.api.app import settings
+    from qaplatform.db.models import Run
+    from qaplatform.db.session import session
+    from qaplatform.secrets import decrypt_secrets
+
+    client, database_url = submission_client
+    response = client.post(
+        "/runs",
+        data={"platform": "android", "project": " Mobile QA ", "app_path": target, **repo_fields,
+              "llm_intent": True, "journeys": True, "remote_qa_data": True,
+              "load_test": True, "load_test_base_url": "https://api.example.com",
+              "phase2": True, "max_pages": 999},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, response.text
+    run_id = response.headers["location"].rsplit("/", 1)[-1]
+    with session(database_url) as db:
+        run = db.get(Run, run_id)
+        assert (run.status, run.platform, run.live_url) == ("queued", "android", target)
+        assert run.project == "Mobile QA"
+        assert run.repo_url == ""
+        assert run.options["test_mode"] == "frontend"
+        assert run.options["codebase_sources"] == []
+        assert run.options["max_pages"] == settings.max_screens
+        assert run.options["branch"] == ""
+        assert run.options["llm_intent"] is False
+        assert run.options["journeys"] is False
+        assert run.options["remote_qa_data"] is False
+        assert run.options["load_test"] is False and run.options["load_test_base_url"] == ""
+        assert run.options["phase2"] is True
+        assert decrypt_secrets(settings.secret_key, run.secrets)["github_token"] == ""
+
+
+@pytest.mark.parametrize("mode", ["backend", "full"])
+def test_api_queues_android_backend_modes(submission_client, mode):
+    from qaplatform.api.app import settings
+    from qaplatform.db.models import Run
+    from qaplatform.db.session import session
+    from qaplatform.secrets import decrypt_secrets
+
+    client, database_url = submission_client
+    repo = "https://github.com/example/backend.git"
+    app = "com.example.app" if mode == "full" else ""
+    load_options = {"load_test": True, "load_test_base_url": "https://api.example.com"} if mode == "full" else {}
+    response = client.post("/runs", data={
+        "platform": "android", "test_mode": mode, "project": "Mobile QA", "repo_url": repo, "github_token": " fixture-token ",
+        "app_path": app, "phase2": True, "clean_start": True, "email": "fixture@example.com", "password": "fixture-login",
+        "llm_intent": True, "journeys": True, "remote_qa_data": True, **load_options,
+    }, follow_redirects=False)
+    assert response.status_code == 303, response.text
+    run_id = response.headers["location"].rsplit("/", 1)[-1]
+    run_response = client.get(f"/api/runs/{run_id}")
+    assert run_response.json()["test_mode"] == mode
+    assert "fixture-token" not in run_response.text
+    with session(database_url) as db:
+        run = db.get(Run, run_id)
+        assert (run.status, run.platform, run.live_url) == ("queued", "android", app or "Backend source review")
+        assert run.repo_url == repo
+        assert run.options["codebase_sources"] == [{"role": "backend", "source": repo}]
+        assert all(run.options[key] is False for key in ("llm_intent", "journeys", "remote_qa_data"))
+        assert run.options["load_test"] == (mode == "full")
+        assert run.options["load_test_base_url"] == load_options.get("load_test_base_url", "")
+        assert run.options["phase2"] == run.options["clean_start"] == (mode == "full")
+        secret = decrypt_secrets(settings.secret_key, run.secrets)
+        assert secret["github_token"] == "fixture-token"
+        assert secret["email"] == ("fixture@example.com" if mode == "full" else "")
+        assert secret["password"] == ("fixture-login" if mode == "full" else "")
+
+
+@pytest.mark.parametrize(("overrides", "message"), [
+    ({"test_mode": "unknown"}, "test mode"),
+    ({"repo_url": ""}, "HTTPS backend Git URL"),
+    ({"repo_url": "/local/backend"}, "HTTPS backend Git URL"),
+    ({"repo_url": "https://one.invalid/backend.git\nhttps://two.invalid/backend.git"}, "HTTPS backend Git URL"),
+    ({"repo_url": "https://user:secret@github.com/example/backend.git"}, "HTTPS backend Git URL"),
+    ({"repo_url": "https://github.com/example/backend.git?token=secret"}, "HTTPS backend Git URL"),
+    ({"github_token": "  "}, "Git token is required"),
+    ({"app_path": "/tmp/fixture.apk"}, "Choose Frontend or Full"),
+    ({"test_mode": "full"}, "Provide an APK file"),
+    ({"test_mode": "full", "app_path": "/tmp/fixture.apk", "github_token": ""}, "Git token is required"),
+    ({"load_test": True}, "backend base URL"),
+    ({"load_test": True, "load_test_base_url": "https://user:secret@api.example.com"}, "backend base URL"),
+])
+def test_api_rejects_invalid_android_backend_inputs(submission_client, overrides, message):
+    client, _ = submission_client
+    response = client.post("/runs", data={
+        "platform": "android", "test_mode": "backend", "project": "Mobile QA", "repo_url": "https://github.com/example/backend.git",
+        "github_token": "fixture-token", **overrides,
+    }, follow_redirects=False)
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+    assert "secret" not in response.text
+
+
+def test_form_defaults_do_not_prefill_manual_inputs(monkeypatch):
+    from qaplatform.api.app import form_defaults
+
+    for key in ("TARGET_REPO_URL", "ANDROID_REPO_URL", "ANDROID_BACKEND_REPO_URL", "IOS_REPO_URL", "DESKTOP_REPO_URL"):
+        monkeypatch.setenv(key, "https://git.example.com/env-only.git")
+    for key in ("PROJECT_NAME", "ANDROID_PROJECT_NAME", "IOS_PROJECT_NAME", "DESKTOP_PROJECT_NAME"):
+        monkeypatch.setenv(key, "env-only project")
+    monkeypatch.setenv("ANDROID_APP_PATH", "/tmp/env-only.apk")
+    monkeypatch.setenv("APP_BUILD_PATH", "/tmp/general-env-only.apk")
+    defaults = form_defaults()
+    assert all(defaults[platform]["repo_url"] == "" for platform in ("web", "android", "ios", "macos"))
+    assert all(not defaults[platform].get("project") for platform in ("web", "android", "ios", "macos"))
+    assert defaults["android"]["app_path"] == ""
+
+
+@pytest.mark.parametrize("mode", ["frontend", "backend", "full"])
+@pytest.mark.parametrize("project", [{}, {"project": " \t "}])
+def test_android_requires_a_project_name(submission_client, mode, project):
+    client, _ = submission_client
+    fields = {**project, "platform": "android", "test_mode": mode}
+    if mode != "backend":
+        fields["app_path"] = "/tmp/fixture.apk"
+    if mode != "frontend":
+        fields.update(repo_url="https://github.com/example/backend.git", github_token="fixture-token")
+    response = client.post("/runs", data=fields, follow_redirects=False)
+    assert response.status_code == 400 and "Project name is required" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("missing_input", [
+    {"platform": "android", "project": "Mobile QA", "app_path": "   "},
+    {"platform": "web", "live_url": "https://example.com"},
+    {"platform": "ios", "app_path": "example.ipa"},
+    {"platform": "macos", "app_path": "com.example.app"},
+])
+def test_api_rejects_missing_required_inputs(submission_client, missing_input):
+    client, _ = submission_client
+    response = client.post("/runs", data=missing_input, follow_redirects=False)
+    assert response.status_code in (400, 422), response.text
+
+
+@pytest.fixture
+def apk_bytes():
+    buffer = BytesIO()
+    with ZipFile(buffer, "w") as archive:
+        archive.writestr("AndroidManifest.xml", "fixture")
+    return buffer.getvalue()
+
+
+@pytest.mark.parametrize("mode", ["frontend", "full"])
+def test_api_queues_android_apk_upload(submission_client, tmp_path, apk_bytes, mode):
+    from qaplatform.app.uploads import apk_upload_path
+    from qaplatform.db.models import Run
+    from qaplatform.db.session import session
+
+    client, database_url = submission_client
+    repo_fields = {"repo_url": "https://github.com/example/backend.git", "github_token": "fixture-token"} if mode == "full" else {}
+    response = client.post("/runs", data={"platform": "android", "test_mode": mode, "project": "Mobile QA", **repo_fields},
+                           files={"apk_file": ("release.apk", apk_bytes)}, follow_redirects=False)
+    assert response.status_code == 303, response.text
+    run_id = response.headers["location"].rsplit("/", 1)[-1]
+    uploaded = apk_upload_path(tmp_path / "artifacts", run_id)
+    assert uploaded.read_bytes() == apk_bytes
+    assert not uploaded.is_relative_to(tmp_path / "artifacts")
+    assert client.get(f"/artifacts/{uploaded.parent.name}/{uploaded.name}").status_code == 404
+    with session(database_url) as db:
+        run = db.get(Run, run_id)
+        assert (run.status, run.repo_url, run.live_url) == ("queued", repo_fields.get("repo_url", ""), "release.apk")
+        assert run.options["test_mode"] == mode
+        assert run.options["uploaded_apk"] is True
+
+
+@pytest.mark.parametrize(("platform", "path", "filename", "valid_zip", "oversized", "expected"), [
+    ("android", "com.example.app", "release.apk", True, False, 400),
+    ("ios", "", "release.apk", True, False, 400),
+    ("android", "", "release.zip", True, False, 400),
+    ("android", "", "release.apk", False, False, 400),
+    ("android", "", "release.apk", True, True, 413),
+])
+def test_api_rejects_invalid_apk_upload(submission_client, tmp_path, monkeypatch, apk_bytes, platform, path, filename, valid_zip, oversized, expected):
+    from qaplatform.app import uploads
+    from qaplatform.db.models import Run
+    from qaplatform.db.session import session
+
+    if oversized:
+        monkeypatch.setattr(uploads, "MAX_APK_UPLOAD_BYTES", len(apk_bytes) - 1)
+    client, database_url = submission_client
+    response = client.post("/runs", data={"platform": platform, "project": "Mobile QA", "app_path": path},
+                           files={"apk_file": (filename, apk_bytes if valid_zip else b"invalid")}, follow_redirects=False)
+    assert response.status_code == expected, response.text
+    assert not list((tmp_path / ".artifacts-uploads").glob("*.apk"))
+    with session(database_url) as db:
+        assert db.query(Run).count() == 0
 
 
 def test_findings_say_where_and_how_to_fix():

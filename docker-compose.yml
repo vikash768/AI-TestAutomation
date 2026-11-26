@@ -39,6 +39,7 @@ services:
       - "${API_PORT:-8000}:8000"
     volumes:
       - ./artifacts:/app/artifacts
+      - ./.artifacts-uploads:/app/.artifacts-uploads
     depends_on:
       postgres:
         condition: service_healthy

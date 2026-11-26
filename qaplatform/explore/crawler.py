@@ -170,7 +170,7 @@ def _capture_page(page, url: str, route: str, settings: Settings, shots_dir: Pat
     return observed
 
 
-def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: str, password: str, run_dir: Path, events: EventCb) -> ExploreResult:
+def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: str, password: str, run_dir: Path, events: EventCb, *, state_dir: Path) -> ExploreResult:
     result = ExploreResult(origin=f"{urlparse(live_url).scheme}://{urlparse(live_url).netloc}")
     shots_dir = run_dir / "screenshots"
     shots_dir.mkdir(parents=True, exist_ok=True)
@@ -211,7 +211,7 @@ def explore(settings: Settings, live_url: str, routes: list[CodeRoute], email: s
         # pass 2: login
         events("explore", "Logging in with the test account", 30)
         ctx = session.new_context()
-        result.login = login(ctx, base, email, password, settings, run_dir)
+        result.login = login(ctx, base, email, password, settings, state_dir=state_dir)
         if not result.login.success:
             result.warnings.append(result.login.error)
             ctx.close()

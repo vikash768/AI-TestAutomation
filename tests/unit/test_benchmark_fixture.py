@@ -81,7 +81,7 @@ def outcome(tmp_path_factory):
         api = _api_index(inv)
         intents = {e.key: build_intent(e, inv, api) for e in inv.elements}
         events = lambda *a, **k: None  # noqa: E731
-        ex = explore(settings, ORIGIN, inv.routes, EMAIL, PASSWORD, run_dir, events)
+        ex = explore(settings, ORIGIN, inv.routes, EMAIL, PASSWORD, run_dir, events, state_dir=tmp_path_factory.mktemp("bench-state"))
         assert ex.login and ex.login.success, ex.warnings
         protected = [r.path for r in inv.routes if r.protected]
         rec = reconcile(inv.elements, ex.pages, protected, ex.origin)

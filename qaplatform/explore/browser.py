@@ -173,7 +173,7 @@ def goto(page: Page, url: str, settings: Settings):
     return resp
 
 
-def login(context: BrowserContext, live_url: str, email: str, password: str, settings: Settings, run_dir: Path, login_path: str = "/login", save_state: bool = True) -> LoginResult:
+def login(context: BrowserContext, live_url: str, email: str, password: str, settings: Settings, login_path: str = "/login", *, state_dir: Path | None = None) -> LoginResult:
     page = context.new_page()
     page.set_default_timeout(settings.action_timeout_ms)
     login_url = urljoin(live_url.rstrip("/") + "/", login_path.lstrip("/"))
@@ -216,8 +216,8 @@ def login(context: BrowserContext, live_url: str, email: str, password: str, set
         page.wait_for_timeout(settings.settle_ms)
         final = page.url
         state_path = ""
-        if save_state:
-            state_path = str(run_dir / "storage_state.json")
+        if state_dir is not None:
+            state_path = str(state_dir / "storage_state.json")
             context.storage_state(path=state_path)
         page.close()
         return LoginResult(True, final, storage_state_path=state_path, login_url=login_url)

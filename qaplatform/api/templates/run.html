@@ -2,8 +2,9 @@
 {% block title %}Run {{ run.id }}{% endblock %}
 {% block body %}
 <h1>Run {{ run.id }} <span class="pill {{ run.status }}" id="status">{{ run.status }}</span></h1>
+{% set test_mode = run.options.get('test_mode') if run.options else none %}
 <div class="card">
-<p>{% if run.platform and run.platform != 'web' %}<span class="pill">{{ run.platform }}</span> {% endif %}{{ run.live_url }} · {{ run.repo_url }}{% if run.commit_sha %} @ {{ run.commit_sha[:10] }}{% endif %}{% if run.framework %} · {{ run.framework }}{% endif %}</p>
+<p>{% if run.platform and run.platform != 'web' %}<span class="pill">{{ run.platform }}</span> {% endif %}{% if test_mode %}<span class="pill">{{ test_mode | capitalize }} testing</span> {% endif %}{{ run.live_url }}{% if run.repo_url %} · {{ run.repo_url }}{% if run.commit_sha %} @ {{ run.commit_sha[:10] }}{% endif %}{% endif %}{% if run.framework %} · {{ run.framework }}{% endif %}</p>
 <div class="bar"><i id="bar" style="width:{{ run.progress }}%"></i></div>
 <p id="message"><b id="stage">{{ run.stage }}</b> · {{ run.message }}</p>
 <p id="no-worker" class="warn"{% if not waiting_for_worker %} hidden{% endif %}>No worker is running for <b>{{ run.platform or 'web' }}</b> runs, so this run will stay queued. Start one in a terminal in the project folder: <code id="no-worker-cmd">{{ waiting_for_worker }}</code> — the run starts within a few seconds.</p>
@@ -16,16 +17,48 @@
 </p>
 {% if run.stats %}
 <div class="grid">
+{% if test_mode == 'backend' %}
+<div><b>{{ run.stats.get('backend', {}).get('routes', 0) }}</b><br><small>backend routes identified</small></div>
+{% elif run.stats.get('code_available') is sameas false %}
+<div><b>{{ run.stats.get('screens', 0) }}</b><br><small>screens explored</small></div>
+<div><b>{{ run.stats.get('observed_unmatched_visible', 0) }}</b><br><small>controls observed</small></div>
+<div><b>Source coverage unavailable</b></div>
+{% else %}
 <div><b>{{ run.stats.get('code_interactive', 0) }}</b><br><small>components in code</small></div>
 <div><b>{{ run.stats.get('matched', 0) }}</b><br><small>found on the live app</small></div>
 <div><b>{{ '%.0f' % (run.stats.get('coverage_interaction', run.stats.get('coverage', 0)) * 100) }}%</b><br><small>code components found (at rest {{ '%.0f' % (run.stats.get('coverage', 0) * 100) }}%)</small></div>
+{% endif %}
+{% if test_mode == 'full' %}
+<div><b>{{ run.stats.get('backend', {}).get('routes', 0) }}</b><br><small>backend routes identified</small></div>
+{% endif %}
+{% if test_mode != 'backend' %}
 <div><b>{{ '%.0f' % (run.stats.get('tested_ratio', 0) * 100) }}%</b><br><small>of found components tested</small></div>
+{% endif %}
 <div><b>{{ run.stats.get('tests', 0) }}</b><br><small>tests</small></div>
 <div><b>{{ run.stats.get('findings_total', 0) }}</b><br><small>findings ({{ run.stats.get('findings_needs_review', 0) }} need review)</small></div>
 <div><b>{{ run.stats.get('duration_seconds', 0) }}s</b><br><small>duration</small></div>
 </div>
 {% endif %}
 </div>
+
+{% set legs = run.stats.get('legs') if run.stats else none %}
+{% if legs %}
+<h2>Testing outcomes</h2>
+<div class="card">
+<table>
+<thead><tr><th>Testing scope</th><th>Status</th><th>Details</th></tr></thead>
+<tbody>
+{% for scope in ('frontend', 'backend') %}
+{% if legs.get(scope) %}
+{% set leg = legs[scope] %}
+<tr><td>{{ scope | capitalize }}</td><td><b>{{ leg.status | capitalize }}</b></td><td>{{ leg.detail }}</td></tr>
+{% endif %}
+{% endfor %}
+</tbody>
+</table>
+{% if report_exists %}<p><a href="/runs/{{ run.id }}/report#tests">Open recorded checks and evidence</a></p>{% endif %}
+</div>
+{% endif %}
 
 {% if findings %}
 <h2>Findings</h2>

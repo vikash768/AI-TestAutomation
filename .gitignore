@@ -22,6 +22,8 @@ artifacts/cache/
 artifacts/builds/
 artifacts/logs/
 artifacts/workers/
+.artifacts-uploads/
+.artifacts-repos/
 *.log
 *.pid
 
@@ -62,3 +64,8 @@ artifacts/local.db
 artifacts/app-worker.pid
 artifacts/screenshots/
 artifacts/robot/
+
+#
+*.pdf
+PROJECT_CONTEXT.md
+APP_PLATFORM_TESTING_PLAN.md

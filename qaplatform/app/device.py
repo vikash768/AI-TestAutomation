@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -42,6 +43,7 @@ TEXT_CLASSES = ("android.widget.TextView", "XCUIElementTypeStaticText")
 CRASH_DIALOG_RE = re.compile(r"(keeps stopping|has stopped|isn.t responding|unfortunately,? .* has stopped)", re.I)
 FATAL_LOG_RE = re.compile(r"(FATAL EXCEPTION|AndroidRuntime.*(Exception|Error)|ANR in |ReactNativeJS.*(Error|Exception|Unhandled|TypeError|undefined is not)|Fatal signal \d+|Process .* has died)", re.I)
 SYSTEM_PACKAGES = ("com.android.systemui", "com.google.android.permissioncontroller", "com.android.permissioncontroller", "com.google.android.inputmethod", "com.android.packageinstaller")
+APK_INSTALL_TIMEOUT_S = 180
 
 
 @dataclass
@@ -86,7 +88,9 @@ def _bounds(raw: str) -> list[int]:
 def _descendant_texts(node: ET.Element, limit: int = 3) -> list[str]:
     out = []
     for d in node.iter():
-        t = (d.get("text") or d.get("value") or d.get("label") or "").strip() if d is not node else ""
+        if d is node or d.get("displayed", "true") == "false":
+            continue
+        t = (d.get("text") or d.get("value") or d.get("label") or "").strip()
         if t and t not in out:
             out.append(t)
         if len(out) >= limit:
@@ -104,9 +108,10 @@ def parse_android(xml: str, package: str) -> Snapshot:
         pkg = node.get("package") or ""
         text = (node.get("text") or "").strip()
         desc = (node.get("content-desc") or "").strip()
+        visible = node.get("displayed", "true") == "true"
         if pkg and pkg != package and CRASH_DIALOG_RE.search(text):
             snap.system_dialog = text
-        if text and pkg in ("", package) and cls.endswith("TextView"):
+        if visible and text and pkg in ("", package) and cls.endswith("TextView"):
             snap.texts.append(text)
         clickable = node.get("clickable") == "true" or node.get("checkable") == "true" or cls in ANDROID_ROLE
         if not clickable or (pkg and pkg != package):
@@ -129,7 +134,7 @@ def parse_android(xml: str, package: str) -> Snapshot:
             selector = f"bounds:{','.join(map(str, bbox))}"
         snap.elements.append(ObservedElement(
             selector=selector, role=role, name=name[:200], tag=cls.rsplit(".", 1)[-1], type="password" if node.get("password") == "true" else None,
-            id=rid.split("/", 1)[-1] if rid else None, testid=rid.split("/", 1)[-1] if rid else None, visible=node.get("displayed", "true") == "true",
+            id=rid.split("/", 1)[-1] if rid else None, testid=rid.split("/", 1)[-1] if rid else None, visible=visible,
             enabled=node.get("enabled", "true") == "true", checked=(node.get("checked") == "true") if node.get("checkable") == "true" else None,
             bbox=bbox, path_hint=str(idx),
         ))
@@ -211,13 +216,19 @@ def ensure_appium(settings: Settings, log_dir: Path) -> None:
     raise RuntimeError(f"Started Appium but it did not answer at {url}; see {log_dir / 'appium.log'}")
 
 
+def _android_sdk_dirs() -> list[Path]:
+    configured = [Path(value).expanduser() for key in ("ANDROID_HOME", "ANDROID_SDK_ROOT") if (value := os.environ.get(key))]
+    return [*configured, Path.home() / "Library/Android/sdk"]
+
+
 def _adb() -> str:
     found = shutil.which("adb")
     if found:
         return found
-    candidate = Path.home() / "Library/Android/sdk/platform-tools/adb"
-    if candidate.exists():
-        return str(candidate)
+    for sdk in _android_sdk_dirs():
+        candidate = sdk / "platform-tools" / "adb"
+        if candidate.is_file():
+            return str(candidate)
     raise RuntimeError("adb not found: install Android SDK platform-tools")
 
 
@@ -230,23 +241,27 @@ def ensure_android_device(settings: Settings, log_dir: Path, events) -> str:
         return [ln.split()[0] for ln in out.splitlines()[1:] if ln.strip().endswith("device")]
 
     serials = ready()
-    if settings.device_name and settings.device_name in serials:
+    if settings.device_name:
+        if settings.device_name not in serials:
+            raise RuntimeError(f"Android device {settings.device_name} (DEVICE_NAME) is not connected and ready")
         return settings.device_name
     if serials:
         return serials[0]
-    emulator = Path(adb).parent.parent / "emulator" / "emulator"
-    if not emulator.exists():
+    sdk_dirs = [*_android_sdk_dirs(), Path(adb).resolve().parent.parent]
+    candidates = (sdk / "emulator" / "emulator" for sdk in sdk_dirs)
+    emulator = next((str(path) for path in candidates if path.is_file()), None) or shutil.which("emulator")
+    if not emulator:
         raise RuntimeError("No Android device connected and the emulator binary was not found")
-    avds = subprocess.run([str(emulator), "-list-avds"], capture_output=True, text=True, timeout=30).stdout.split()
+    avds = subprocess.run([emulator, "-list-avds"], capture_output=True, text=True, timeout=30).stdout.split()
     avd = settings.android_avd or (avds[0] if avds else "")
     if not avd:
         raise RuntimeError("No Android device connected and no AVD configured (create one in Android Studio, or set ANDROID_AVD)")
     events("launch", f"Starting Android emulator {avd}")
     log_dir.mkdir(parents=True, exist_ok=True)
     with open(log_dir / "emulator.log", "ab") as fh:
-        subprocess.Popen([str(emulator), "-avd", avd, "-no-snapshot-save"], stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
+        subprocess.Popen([emulator, "-avd", avd, "-no-snapshot-save"], stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
     for _ in range(120):
-        serials = ready()
+        serials = [serial for serial in ready() if serial.startswith("emulator-")]
         if serials:
             boot = subprocess.run([adb, "-s", serials[0], "shell", "getprop", "sys.boot_completed"], capture_output=True, text=True, timeout=20).stdout.strip()
             if boot == "1":
@@ -287,10 +302,20 @@ class AppDevice:
             o.set_capability("appium:autoGrantPermissions", True)
             o.set_capability("appium:noReset", not self.clean_start)
             o.set_capability("appium:fullReset", False)
-            # install the exact build under test: never re-sign it (its signing is reported by the build checks), and no Java needed
             o.set_capability("appium:noSign", True)
             if b.path:
-                o.set_capability("appium:app", b.path)  # installs (or upgrades) the build before the session
+                # Appium can skip installation for an installed package when noReset is enabled.
+                self.events("install", f"Installing APK on Android device {self.serial}")
+                try:
+                    result = subprocess.run([_adb(), "-s", self.serial, "install", "-r", b.path], capture_output=True, text=True, timeout=APK_INSTALL_TIMEOUT_S)
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError(f"APK installation on Android device {self.serial} timed out after {APK_INSTALL_TIMEOUT_S} seconds") from exc
+                if result.returncode or "Success" not in result.stdout.splitlines():
+                    detail = (result.stderr.strip() or result.stdout.strip()).replace(b.path, Path(b.path).name)
+                    raise RuntimeError(f"APK installation failed on Android device {self.serial}: {detail[:500] or 'ADB did not confirm installation'}")
+                self.events("install", f"APK installed on Android device {self.serial}")
+                if not b.app_id or not b.activity:
+                    o.set_capability("appium:app", b.path)  # let Appium read missing manifest metadata
             if b.app_id:
                 o.set_capability("appium:appPackage", b.app_id)
             if b.activity:

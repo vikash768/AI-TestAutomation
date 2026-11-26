@@ -1,6 +1,6 @@
 # AI-TestAutomation
 
-Give it a codebase and a live URL (web) or an app build (Android, iOS, macOS desktop). It reads the code to learn what every interactive component is supposed to do, explores the running application to see what each one actually does, tests the difference, and reports findings with evidence in Grafana. It never changes the application under test.
+Run web QA with a codebase and live URL. For Android, test a build on a device, review a backend repository, or do both in one run. iOS and macOS support source-assisted device testing. Findings and evidence appear in the run report and Grafana.
 
 Web runs use Playwright. Native app runs use Appium (UiAutomator2 for Android, XCUITest for iOS, Mac2 for macOS) through the same stages, tables and dashboards; see [Native apps](#native-apps-android-ios-macos).
 
@@ -15,7 +15,7 @@ live URL ─────┘            (Playwright, 5 viewports)                
 ```bash
 cp .env.example .env            # set GEMINI_API_KEY, the test account, QA_SECRET_KEY
 make up                         # builds the image, starts Postgres, API, worker, Prometheus, Grafana
-open http://localhost:8000      # submit a run: repo URL + live URL + test account
+open http://localhost:8000      # choose a platform and submit the inputs for your run
 open http://localhost:3000      # Grafana (admin/admin): QA Bug Report, QA Runs, QA Findings, QA Components
 ```
 
@@ -41,11 +41,13 @@ set -a; . ./.env; set +a
 .venv/bin/python -m qaplatform.cli run --repo <git url or path> --live <url> --project <name>
 ```
 
+Enter a project name for each run. Supply a repository URL and token when required. On the CLI, use `--project`, `--repo` and `--github-token`.
+
 ## What a run does
 
 | Stage | What happens | Output |
 |---|---|---|
-| 1 ingest | Clones the repo (anonymously, then with `GITHUB_TOKEN` if needed), detects the framework, parses every JS/JSX/TS/TSX file with tree-sitter. Extracts routes and their guards, every interactive element with its label, handler, navigation target, drawer/confirm behaviour and API calls, timers, storage keys. Wrapper components (`Button`, `Field`, `DropdownMenu`) resolve to the native control they render. Gemini summarises each page file into one-line expectations, persistence and lifecycle rules (source code only, cached by file hash). | `inventory.json`, intent per component |
+| 1 ingest | Clones the repo using the token submitted for the run if anonymous access fails, detects the framework, and parses JS/JSX/TS/TSX source with tree-sitter. Extracts routes, guards, interactive controls, handlers, navigation targets, API calls, timers, and storage keys. Wrapper components (`Button`, `Field`, `DropdownMenu`) resolve to the native control they render. Gemini can summarise expectations, persistence and lifecycle rules from source, with results cached by file hash. | `inventory.json`, intent per component |
 | 2 explore | Playwright. Unauthenticated pass: does every protected route send us to login? Then logs in with the test account and crawls breadth-first from the code's routes plus discovered links. Per page: interactive elements with stable selectors, console and network monitors, screenshots and a layout check at 360 / 768 / 1024 / 1440 / 1920 px. | `explore.json`, screenshots |
 | 3 reconcile | Matches code elements to observed elements by route, control type, label, href and id. Produces the component matrix: found, not found, present but undeclared. | coverage % |
 | 4 execute | Route-guard tests, page health (HTTP status, blank render, console errors, failed requests, slow load), responsive checks (horizontal overflow, overlapping controls, tap targets under 24 px, clipped text), and a smoke click on every safe component with the code's expectation as the oracle (link target, drawer opens, nothing breaks). Logout is tested last with its own oracle. | tests |
@@ -62,20 +64,36 @@ Finding record: severity, category (functional, stability, security, ui-responsi
 
 ## Native apps (Android, iOS, macOS)
 
-Pick the platform in the form, give the codebase (git URL or local path, plus a token for private repos; one per line: the app first, then optionally its backend API) and the build: a file path (`.apk`, `.ipa`, `.app`, `.dmg`) or the id of an app already installed on the device (`com.example.app`). The test account fields are used when the app opens on a sign-in screen.
+Select **Android app (Appium)**, choose a testing mode and enter a project name. For Frontend and Full, select or enter the build for each run.
+
+| Mode | What to enter | What runs |
+|---|---|---|
+| **Frontend testing** | Upload an APK up to 512 MiB, enter its path on the host, or enter an installed app ID. | Checks the build when available, launches it through Appium, and reports device findings and screenshots. You can add an expected screen result. |
+| **Backend testing** | The backend repository's HTTPS Git URL and a Git access token. | Reviews backend route declarations and authentication hints. You can verify an expected HTTP response from the deployed API. |
+| **Full testing** | The same backend Git URL and token, plus the APK or installed app ID. | Runs both sets of checks and reports separate Frontend and Backend outcomes, including checks completed before the other side was blocked. |
+
+Android device runs use the worker's configured screen budget. Their frontend source coverage is unavailable because they exercise a build directly. To add bounded GET performance checks in Backend or Full, enable **Backend API load test** and enter the deployed API base URL.
+
+- **Expected app screen.** Enter the control labels in navigation order, one per line, and the text you expect at the destination. Leave the path empty for the first screen after sign-in if sign-in is needed. The report checks observed screen text without regard to case, includes the screenshot when captured, and marks a path as blocked when exploration did not reach it.
+- **Expected API response.** Enter the deployed base URL and a GET path such as `/health`. The expected status defaults to `200`. Optionally enter a dotted JSON object field such as `service.ready` and its expected value, and supply a separate API bearer token for that request. Enter JSON literals like `true` or quoted strings like `"true"` to select the value and type. The report records the result without saving the response body or bearer token.
+- **Combined expectations.** When both expectations are supplied in Full testing, the report shows their individual results and whether both passed. Choose expectations from the same test fixture when the two checks should describe the same workflow.
+
+For iOS and macOS, enter a build path (`.ipa`, `.app`, `.dmg`) or installed app ID. Provide each Git URL or local path on its own line, starting with the app and optionally its backend, and enter a Git token for a private repository. Device runs can use a test account when the app opens on a sign-in screen.
+
+Start the local host worker before submitting. The installation preserves existing app data by default. Uploaded APKs are held privately while the run is queued or in progress and removed when it completes or fails. New Git checkouts use a temporary private directory outside the report tree and are cleaned up at the end of each worker attempt.
 
 | Stage | What happens on a device |
 |---|---|
-| 1 ingest | Clones the repo. React Native: screens from React Navigation (`<Stack.Screen name component>`) or Expo Router (`app/`), every Touchable / Pressable / Button / TextInput / Switch or component given `onPress`, with its label (`accessibilityLabel`, `title`, child `<Text>`), `testID`, navigation target, `Alert.alert` confirmation, API writes, `secureTextEntry` / `maxLength`. Controls rendered from data (`[{ title: 'Settings', route: 'Settings' }]`, `{ label, onPress: () => navigation.navigate(...) }`) count too. Electron: every menu template item grouped by its menu. The build is inspected (package / bundle id, launch activity, version, SHA-256, React Native / Flutter / Electron). A repo that cannot be cloned is reported as a warning and the build is still tested. **Build checks** (Android APK, no device): debuggable, signed with the debug key, `allowBackup`, cleartext HTTP, target SDK below the Play requirement, exported components without a permission, secrets and `http://` URLs in the JS bundle. **Code checks**: navigation to a screen the navigator does not register. |
+| 1 ingest | Inspects package metadata and, when app source is provided, extracts React Native screens, controls, labels, handlers and navigation or Electron menus. For a supplied Android APK, checks manifest settings, signing and JavaScript bundle hygiene. In Android Backend and Full, a failed backend checkout blocks route inventory while other configured checks can continue. |
 | 2 explore | Installs or launches the build (Appium starts on demand, an emulator boots if no device is connected). Signs in when the first screen is a sign-in form. Walks the screens depth-first and taps every control classed safe; each tap records what happened: another screen, nothing, a crash, an ANR, fatal or JavaScript errors in logcat, another app in front. On macOS each application menu is opened and its safe items chosen. |
-| 3 reconcile | Each observed screen is named after the code screen whose labels and texts it shows; the lead's matcher pairs code controls with live ones (accessibility label, text, `testID` = resource-id). |
+| 3 reconcile | Records the screens and controls seen on the device. When app source is available, associates observed controls with the source inventory using accessibility labels, text and test IDs. |
 | 4 execute | Per screen: blank screen, `undefined` / `NaN` / `[object Object]` shown to the user, controls with no accessible name or with code as their name, touch targets below 24 dp, overlapping or clipped controls, unmasked password fields. Per tap: crash, ANR, logged errors, the code's navigation target not reached. On the device: cold start time, sign-in negatives (empty, one wrong password, masking, account enumeration), rotation, background and resume, relaunch keeps the session, offline (Android), 300-character input into each reachable field, frame rendering (janky frames, `dumpsys gfxinfo`; held for review on an emulator) and memory (`dumpsys meminfo`). |
 | 5 judge | Every crash, ANR or error tap is reproduced twice from a fresh launch; heuristic findings start as `needs_review`. |
 | 6 report | Same Postgres tables, `report.html` and Grafana dashboards as web runs (`runs.platform` tells them apart). |
 
-Every app finding says **where to fix it** (`app code`, `app build`, `backend`), **how** (in React Native / Android terms), **which file and line** (linked to the tested commit in the **QA Bug Report** dashboard), and the **steps to reproduce** from launch, next to its screenshot.
+App findings include suggested fixes, source references when available, and reproduction steps and screenshots when recorded.
 
-**Journeys with QA test data** (on by default; form: "Full journeys with QA test data"). Every screen with text fields and a submit control gets a create journey: fill the fields with `qa_<run>_<HHMMSS>` values, submit, check the screen the code navigates to. Boundary cases come from the code's own rules (`maxLength`, `required`). With `GEMINI_API_KEY` the LLM reads the inventory, form screens' source, what the explorer saw and the backend routes, and adds screen intent, expected behaviour per control and further journeys (verify, relaunch, edit, delete, validation). The LLM never acts: every planned step goes through the same safety rules, which are authoritative:
+**Journeys with QA test data** are available on source-assisted iOS and macOS submissions in the web form. A create journey fills fields with `qa_<run>_<HHMMSS>` values, submits, and checks the expected next screen. Boundary cases use constraints in app source such as `maxLength` and `required`. Gemini can suggest additional screen expectations and journeys. The runner validates planned steps against the safety rules.
 
 - A step that would send QA data to the backend, directly or because the screen it opens stores a record that the app uploads in the background, ends the journey as **blocked** unless "Let journeys create QA records on the backend" is ticked. The LLM can make a step's effect stricter, never looser.
 - Bulk actions (sync all, upload all, clear) and sign-out are never used. Delete is used only in a row or screen that shows this run's own value.
@@ -84,7 +102,7 @@ Every app finding says **where to fix it** (`app code`, `app build`, `backend`),
 - Everything the run creates is in `qa_data.json` (written after each change). At the end, and from `finally` after a failure, overwritten fields get their earlier value back and records are deleted where the app allows; the rest is listed as a leftover in the report.
 - Expectations only the LLM supplied end as `needs_review` when they are not met. The LLM also reviews each journey's observed steps; anything it flags is `needs_review` only.
 
-**Backend API load test** (off by default; form checkbox or `LOAD_TEST_ENABLED=true`). HTTP from this machine to the backend, never Appium sessions. GET only; endpoints with ids, behind sign-in (without `LOAD_TEST_BEARER_TOKEN`), or answering 401 / 403 / 404 to a first probe are skipped with the reason. Target: `LOAD_TEST_BASE_URL` (or the form field), else the origin the app's code names. Limits: `LOAD_TEST_USERS` (10), `LOAD_TEST_MAX_RPS` (20, shared by all users), `LOAD_TEST_DURATION_SECONDS` (30), hard caps 50 users / 100 req/s / 300 s. Reported per endpoint: requests, failures, error rate, req/s, p50 / p95 / p99 / max; error rate above `LOAD_TEST_MAX_ERROR_RATE` or p95 above `LOAD_TEST_P95_MS` is a finding. Device performance (cold start, rendering, memory) is a separate section of the report.
+**Backend API load test** uses bounded GET requests from the host worker. Android Backend and Full require the run's checkbox and deployed base URL and use public endpoints. Source-assisted iOS and macOS can also use configured load-test defaults or a discovered origin. The report includes request counts, error rate, throughput, and latency for each measured endpoint. Endpoints that need a runtime ID or unavailable authentication are listed as skipped. The existing `LOAD_TEST_*` settings control limits and failure thresholds. Device performance has its own section in the report.
 
 Safety on a device, where writes cannot be intercepted:
 
@@ -97,9 +115,11 @@ Safety on a device, where writes cannot be intercepted:
 Requirements on the host: Node + `npm i -g appium`, then `appium driver install uiautomator2` (Android) and/or `appium driver install mac2` (macOS; grant Accessibility to the Appium/WebDriverAgent runner); Android SDK platform-tools and an emulator or a device with USB debugging. macOS may block reading builds in `~/Downloads` or `~/Desktop` from a terminal without Files and Folders access; grant it, or copy the build to `artifacts/builds/`.
 
 ```bash
-make run-android REPO=https://github.com/org/mobile.git APP=/path/app-release.apk
+make run-android APP=/path/app-release.apk PROJECT=my-android-app
 make run-desktop REPO=https://github.com/jgraph/drawio-desktop APP=/Applications/draw.io.app
 ```
+
+Direct Android CLI runs require `--app` and `--project`.
 
 ## Safety rules
 

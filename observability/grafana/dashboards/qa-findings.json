@@ -332,7 +332,7 @@
      },
      "format": "table",
      "rawQuery": true,
-     "rawSql": "SELECT coalesce((stats->>'coverage_interaction')::float, (stats->>'coverage')::float) * 100 AS \"components found %\", (stats->>'tested_ratio')::float * 100 AS \"tested %\", (stats->>'findings_total')::int AS findings, (stats->>'findings_needs_review')::int AS \"needs review\", (stats->>'tests')::int AS tests, (stats->>'pages')::int AS pages FROM runs WHERE id = '${run}'",
+     "rawSql": "SELECT (CASE WHEN stats->>'code_available' IS DISTINCT FROM 'false' THEN coalesce((stats->>'coverage_interaction')::float, (stats->>'coverage')::float) END) * 100 AS \"components found %\", (stats->>'tested_ratio')::float * 100 AS \"tested %\", (stats->>'findings_total')::int AS findings, (stats->>'findings_needs_review')::int AS \"needs review\", (stats->>'tests')::int AS tests, (stats->>'pages')::int AS pages FROM runs WHERE id = '${run}'",
      "refId": "A",
      "editorMode": "code"
     }
@@ -342,6 +342,23 @@
     "y": 0,
     "w": 8,
     "h": 6
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "components found %"
+      },
+      "properties": [
+       {
+        "id": "noValue",
+        "value": "N/A"
+       }
+      ]
+     }
+    ]
    },
    "options": {
     "reduceOptions": {

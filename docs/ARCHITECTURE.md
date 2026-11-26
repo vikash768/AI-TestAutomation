@@ -21,7 +21,9 @@ flowchart LR
 
 ## Native apps (`qaplatform/app/`)
 
-A run's `platform` column picks the pipeline: `web` runs `pipeline.run_pipeline` (Playwright), `android` / `ios` / `macos` run `app/pipeline.run_app_pipeline` (Appium). Both write the same rows, so Grafana, the run page and `report.html` need no change. The docker worker claims web runs only (`QA_WORKER_PLATFORMS=web`); `make app-worker-start` runs a second worker on the host for app runs, because they need the host's Appium server, devices, emulator and build files.
+A run's `platform` column selects the pipeline. Web uses `pipeline.run_pipeline` with Playwright. Android, iOS and macOS use `app/pipeline.run_app_pipeline` and share the reporting tables. The Docker worker claims web runs only. `make app-worker-start` runs a host worker for native jobs. Native device jobs need access to the host's Appium server, device and build.
+
+Android's `runs.options.test_mode` selects the work. `frontend` exercises the build without a repository. `backend` checks out the backend source and inventories supported route declarations without opening a device session. `full` combines both. Backend and Full require a submitted HTTPS Git URL and token. Both can verify an explicit GET response and optionally run bounded GET performance checks against an explicit deployed API base URL. Android device jobs use the worker's `MAX_SCREENS` budget.
 
 | Module | Role | Reuses from the web pipeline |
 |---|---|---|
@@ -32,14 +34,15 @@ A run's `platform` column picks the pipeline: `web` runs `pipeline.run_pipeline`
 | `app/checks.py` | Screen checks, tap results, active device checks, sign-in negatives | `TestRecord`, `FindingRecord`, `judge/gate.py` |
 | `app/buildcheck.py` | Checks on the build file itself: manifest flags, signing certificate, exported components, secrets / `http://` URLs in the bundle | `TestRecord`, `FindingRecord` |
 | `app/remedy.py` | Fills each finding's `fix_in`, `fix`, `code_ref` (path:line) and `steps` | `CodeInventory`, `ComponentRecord` |
-| `app/backend.py` | Optional second codebase: backend routes (Express / Koa / Fastify / Hono / NestJS / FastAPI / Flask / Django) with mount prefixes and sign-in guards; endpoints and base URL the app calls. Never part of UI coverage | |
+| `app/backend.py` | Backend route declarations with mount prefixes and auth hints, plus client endpoint discovery when app source is available. Backend source stays outside UI coverage. | |
+| `app/assertions.py` | One user-defined observed screen-text expectation and one user-selected GET response expectation | `TestRecord` |
 | `app/testdata.py` | QA values (`qa_<run>_<time>`), ownership on screen (row / record screen showing this run's value), the `qa_data.json` ledger | `app/device.Snapshot` |
 | `app/journeys.py` | Journey plan from the code, safety validation (effect of each step from the code; LLM may only raise it), runner on the device, cleanup | `explore/safety`, `app/explore` navigation |
 | `app/ai.py` | LLM screen intent, journeys and validation cases; second look at journey results (`needs_review` only). No credentials in prompts | `ingest/intent._generate_json`, `_strip_secrets` |
 | `app/loadtest.py` | Bounded GET-only backend load test with a shared rate limiter | `TestRecord`, `FindingRecord` |
 | `app/pipeline.py` | The seven stages | `reconcile/matcher.reconcile`, `pipeline.build_components`, `report/writer.persist`, `report/html.write_report` |
 
-A native run takes one or two codebases (`runs.repo_url` is the app; `runs.options.codebase_sources` lists `frontend` and optional `backend`), so no schema change. Journey, QA-data and load-test results go to `runs.stats` (`journeys`, `qa_data`, `load_test`, `held_actions`) and to `tests` rows (techniques `journey`, `validation`, `load`); Prometheus exposes `qa_latest_load_test` and `qa_latest_journeys`.
+The Android form records a single `backend` entry in `runs.options.codebase_sources` when source is required. Source-assisted iOS and macOS runs can record a `frontend` entry and an optional `backend` entry. Repository and API assertion credentials are encrypted separately from run options and cleared at terminal completion. `ingest/workspace.py` gives each worker attempt a private temporary checkout directory. The API serves the `runs` directory, and the worker writes backend route counts to `runs.stats` and detailed declarations to `backend.json`. Android stores outcomes under `runs.stats.legs` and writes assertions, journeys and load results to the shared test rows. Full runs retain the backend result if device work stops and continue device work after a checkout failure. Prometheus exposes `qa_latest_load_test` and `qa_latest_journeys`.
 
 An observed screen becomes an `ObservedPage` whose route is the code screen it is: the screen the tapped control navigates to in the code, else the one whose title it shows, else the one with the most labels and texts only it has; a panel opened in place keeps its parent's route; `screen:<heading>` when nothing matches. The page URL is `app://<app id>/<route>#<screen signature>`.
 

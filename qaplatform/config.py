@@ -43,7 +43,6 @@ class Settings:
     gemini_model: str = "gemini-3.5-flash"
     gemini_fallback_model: str = "gemini-3.5-flash-lite"
     llm_intent: bool = True
-    github_token: str | None = None
     headless: bool = True
     max_pages: int = 60
     max_elements_per_page: int = 150
@@ -72,7 +71,6 @@ class Settings:
             gemini_model=os.environ.get("GEMINI_MODEL") or cls.gemini_model,
             gemini_fallback_model=os.environ.get("GEMINI_FALLBACK_MODEL") or cls.gemini_fallback_model,
             llm_intent=_bool("LLM_INTENT", True),
-            github_token=os.environ.get("GITHUB_TOKEN") or None,
             headless=_bool("HEADLESS", True),
             max_pages=_int("MAX_PAGES", 60),
             max_elements_per_page=_int("MAX_ELEMENTS_PER_PAGE", 150),

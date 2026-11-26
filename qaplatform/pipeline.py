@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import traceback
+from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,7 @@ from qaplatform.explore.safety import DOWNLOAD_EXT, classify_action
 from qaplatform.ingest.intent import apply_enrichment, build_intent, enrich_with_llm, _api_index
 from qaplatform.ingest.js_parser import build_inventory
 from qaplatform.ingest.repo import fetch_repo
+from qaplatform.ingest.workspace import repository_workspace
 from qaplatform.reconcile.matcher import INTERACTIVE_KINDS, normalize, reconcile
 from qaplatform.report.html import write_report
 from qaplatform.report.writer import persist
@@ -30,8 +32,8 @@ logger = logging.getLogger(__name__)
 ROLE_KIND = {"link": "link", "textbox": "input", "combobox": "select", "checkbox": "checkbox", "radio": "radio", "switch": "switch", "tab": "tab", "menuitem": "menuitem"}
 
 
-def build_components(rec, intents: dict) -> list[ComponentRecord]:
-    """Code components (matched or not) plus live controls the code does not declare."""
+def build_components(rec, intents: dict, *, code_available: bool = True) -> list[ComponentRecord]:
+    """Build component rows from source and live observations."""
     components: list[ComponentRecord] = []
     for m in rec.matches:
         if m.reason == "twin":
@@ -59,13 +61,14 @@ def build_components(rec, intents: dict) -> list[ComponentRecord]:
             row.status = "not_observed"
             row.notes = "declared in code; not found on the live page" + (" (conditional or data-driven)" if (c.conditional or c.repeated) else "")
         components.append(row)
+    observed_note = "present on live page, not declared in code" if code_available else "observed on the device"
     seen_obs: dict[tuple, ComponentRecord] = {}
     for page, o in rec.unmatched_observed:
         sig = (page.route, o.role, normalize(o.name) or o.selector)
         if sig in seen_obs:
             prev = seen_obs[sig]
             prev.attrs["instances"] = int(prev.attrs.get("instances", 1)) + 1
-            prev.notes = f"present on live page, not declared in code ({prev.attrs['instances']} instances)"
+            prev.notes = f"{observed_note} ({prev.attrs['instances']} instances)"
             continue
         intent = {"expected": ["Responds without errors"], "observed_only": True}
         cls = classify_action(o.name, {"href": o.href, "type": o.type, "download": True if o.download else None}, intent)
@@ -73,7 +76,7 @@ def build_components(rec, intents: dict) -> list[ComponentRecord]:
             key=f"obs|{page.route}|{o.role}|{o.name}|{o.selector}"[:400], route=page.route, kind=ROLE_KIND.get(o.role, "button"),
             label=o.name, source="observed", selector=o.selector, role=o.role, name=o.name, href=o.href, attrs={"type": o.type, "tag": o.tag, "path_hint": o.path_hint, "haspopup": o.haspopup},
             intent={**intent, "action_class": cls}, action_class=cls, page_url=page.url, page_protected=bool(page.protected), visible=o.visible, enabled=o.enabled,
-            in_dialog=o.in_dialog, notes="present on live page, not declared in code",
+            in_dialog=o.in_dialog, notes=observed_note,
         )
         components.append(seen_obs[sig])
     return components
@@ -202,10 +205,12 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
     run_dir = settings.artifacts_dir / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
+    workspaces = ExitStack()
     try:
         # 1. ingest ---------------------------------------------------------
+        workspace = workspaces.enter_context(repository_workspace(settings.artifacts_dir))
         ctx.event("ingest", f"Fetching codebase {repo_url}", 3)
-        repo = fetch_repo(repo_url, settings.artifacts_dir / "repos" / run_id, token=settings.github_token or secrets.get("github_token"), branch=options.get("branch") or None)
+        repo = fetch_repo(repo_url, workspace / "frontend", token=secrets.get("github_token"), branch=options.get("branch") or None)
         ctx.event("ingest", f"Detected {repo.framework} ({repo.router or 'no router'}) at {repo.commit_sha[:10]}; parsing source", 6)
         inv = build_inventory(repo.path, repo.framework)
         api_index = _api_index(inv)
@@ -229,7 +234,7 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
         ctx.event("explore", f"Opening {live_url}", 20)
         max_pages = int(options.get("max_pages") or settings.max_pages)
         settings_local = Settings(**{**asdict(settings), "max_pages": max_pages})
-        ex = explore(settings_local, live_url, inv.routes, secrets.get("email", ""), secrets.get("password", ""), run_dir, ctx.event)
+        ex = explore(settings_local, live_url, inv.routes, secrets.get("email", ""), secrets.get("password", ""), run_dir, ctx.event, state_dir=workspace)
         for w in ex.warnings:
             ctx.event("explore", w, None, level="warn")
         if ex.login is not None and not ex.login.success:
@@ -244,12 +249,7 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
         ctx.event("reconcile", f"Matched {rec.stats['matched']}/{rec.stats['code_interactive']} code components on the live app ({rec.coverage * 100:.0f}%); {rec.stats['observed_unmatched_visible']} live controls have no code declaration", 59)
 
         # 4-5. execute + judge --------------------------------------------------
-        try:
-            tests, findings, phase_stats = execute_all(settings, live_url, secrets, run_dir, inv, ex, components, protected_routes, options, ctx.event, tag=run_id)
-        finally:
-            state_file = Path(ex.storage_state_path) if ex.storage_state_path else None
-            if state_file and state_file.exists():
-                state_file.unlink()  # holds a live refresh token; never keep it after the run
+        tests, findings, phase_stats = execute_all(settings, live_url, secrets, run_dir, inv, ex, components, protected_routes, options, ctx.event, tag=run_id)
         # findings that are not click-based are deterministic single observations
         for f in findings:
             if f.reproduced_m == 0:
@@ -292,3 +292,5 @@ def run_pipeline(run_id: str, settings: Settings) -> None:
                 r.message = f"failed in {r.stage}: {type(exc).__name__}: {str(exc)[:200]}"
                 db.add(RunEvent(run_id=run_id, level="error", stage=r.stage, message=r.message))
                 db.commit()
+    finally:
+        workspaces.close()

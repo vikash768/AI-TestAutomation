@@ -8,6 +8,8 @@
 .DS_Store
 
 artifacts/
+.artifacts-uploads/
+.artifacts-repos/
 __pycache__/
 **/__pycache__/
 *.py[cod]

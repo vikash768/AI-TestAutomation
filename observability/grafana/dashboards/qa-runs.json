@@ -35,6 +35,7 @@
   {
    "id": 1,
    "title": "Code components found (latest run)",
+   "description": "Source coverage is unavailable for runs without app source.",
    "type": "gauge",
    "datasource": {
     "type": "prometheus",
@@ -61,6 +62,7 @@
    "fieldConfig": {
     "defaults": {
      "unit": "percent",
+     "noValue": "Source coverage unavailable",
      "min": 0,
      "max": 100,
      "thresholds": {
@@ -305,7 +307,7 @@
      },
      "format": "time_series",
      "rawQuery": true,
-     "rawSql": "SELECT finished_at AS time, coalesce((stats->>'coverage_interaction')::float, (stats->>'coverage')::float) * 100 AS \"found after interaction %\", (stats->>'coverage')::float * 100 AS \"found at rest %\", (stats->>'tested_ratio')::float * 100 AS \"tested %\" FROM runs WHERE project = '${project}' AND status = 'completed' AND finished_at IS NOT NULL ORDER BY 1",
+     "rawSql": "SELECT finished_at AS time, (CASE WHEN stats->>'code_available' IS DISTINCT FROM 'false' THEN coalesce((stats->>'coverage_interaction')::float, (stats->>'coverage')::float) END) * 100 AS \"found after interaction %\", (CASE WHEN stats->>'code_available' IS DISTINCT FROM 'false' THEN (stats->>'coverage')::float END) * 100 AS \"found at rest %\", (stats->>'tested_ratio')::float * 100 AS \"tested %\" FROM runs WHERE project = '${project}' AND status = 'completed' AND finished_at IS NOT NULL ORDER BY 1",
      "refId": "A",
      "editorMode": "code"
     }
@@ -465,7 +467,7 @@
      },
      "format": "table",
      "rawQuery": true,
-     "rawSql": "SELECT created_at AS created, id, status, stage, live_url, commit_sha AS commit, framework, round((coalesce((stats->>'coverage_interaction')::float, (stats->>'coverage')::float) * 100)::numeric, 1) AS \"found %\", round(((stats->>'tested_ratio')::float * 100)::numeric, 1) AS \"tested %\", (stats->>'findings_total')::int AS findings, (stats->>'findings_needs_review')::int AS \"needs review\", (stats->>'tests')::int AS tests, (stats->>'pages')::int AS pages, (stats->>'duration_seconds')::float AS \"duration s\", message FROM runs WHERE project = '${project}' ORDER BY created_at DESC LIMIT 50",
+     "rawSql": "SELECT created_at AS created, id, status, stage, live_url, commit_sha AS commit, framework, round(((CASE WHEN stats->>'code_available' IS DISTINCT FROM 'false' THEN coalesce((stats->>'coverage_interaction')::float, (stats->>'coverage')::float) END) * 100)::numeric, 1) AS \"found %\", round(((stats->>'tested_ratio')::float * 100)::numeric, 1) AS \"tested %\", (stats->>'findings_total')::int AS findings, (stats->>'findings_needs_review')::int AS \"needs review\", (stats->>'tests')::int AS tests, (stats->>'pages')::int AS pages, (stats->>'duration_seconds')::float AS \"duration s\", message FROM runs WHERE project = '${project}' ORDER BY created_at DESC LIMIT 50",
      "refId": "A",
      "editorMode": "code"
     }
@@ -487,6 +489,18 @@
      }
     },
     "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "found %"
+      },
+      "properties": [
+       {
+        "id": "noValue",
+        "value": "N/A"
+       }
+      ]
+     },
      {
       "matcher": {
        "id": "byName",

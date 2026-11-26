@@ -64,7 +64,7 @@ class ClientEndpoint:
 def _files(root: Path) -> list[Path]:
     out = []
     for p in sorted(root.rglob("*")):
-        if p.suffix in SOURCE_SUFFIXES and p.is_file() and not any(part in SKIP_DIRS or part.startswith(".") for part in p.relative_to(root).parts[:-1]):
+        if p.suffix in SOURCE_SUFFIXES and not p.is_symlink() and p.is_file() and not any(part in SKIP_DIRS or part.startswith(".") for part in p.relative_to(root).parts[:-1]):
             if p.stat().st_size < 600_000 and not p.name.endswith((".min.js", ".d.ts", ".test.ts", ".test.js", ".spec.ts", ".spec.js")):
                 out.append(p)
     return out

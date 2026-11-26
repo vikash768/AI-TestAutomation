@@ -38,10 +38,12 @@ class RunCollector:
                         continue
                     stats = run.stats or {}
                     info.add_metric([project, run.id, run.status], 1)
-                    coverage.add_metric([project], float(stats.get("coverage", 0.0)))
-                    coverage_u.add_metric([project], float(stats.get("coverage_unconditional", 0.0)))
-                    coverage_i.add_metric([project], float(stats.get("coverage_interaction", stats.get("coverage", 0.0))))
-                    tested.add_metric([project], float(stats.get("tested_ratio", 0.0)))
+                    if stats.get("code_available") is not False:
+                        coverage.add_metric([project], float(stats.get("coverage", 0.0)))
+                        coverage_u.add_metric([project], float(stats.get("coverage_unconditional", 0.0)))
+                        coverage_i.add_metric([project], float(stats.get("coverage_interaction", stats.get("coverage", 0.0))))
+                    if stats.get("test_mode") != "backend":
+                        tested.add_metric([project], float(stats.get("tested_ratio", 0.0)))
                     for ep in (stats.get("load_test") or {}).get("endpoints", []):
                         for k in ("total", "failed", "error_rate", "rps", "p50_ms", "p95_ms", "p99_ms", "max_ms"):
                             load.add_metric([project, f"GET {ep.get('path')}", k], float(ep.get(k) or 0))
