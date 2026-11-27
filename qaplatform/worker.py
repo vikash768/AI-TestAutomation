@@ -71,6 +71,10 @@ def main() -> None:
     # stop (make app-worker-stop, docker stop) through the pipelines' finally blocks: the device session ends and the network is restored
     signal.signal(signal.SIGTERM, _stop)
     state = start_heartbeat(settings.artifacts_dir, settings.worker_platforms)
+    if "macos" in settings.worker_platforms:
+        from qaplatform.app.installed import start_macos_app_inventory
+
+        start_macos_app_inventory(settings.artifacts_dir)
     next_sweep = 0.0
     while True:
         claimed = None

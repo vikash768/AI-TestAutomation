@@ -1,0 +1,47 @@
+<section class="recent-runs" id="recent-runs" aria-labelledby="recent-runs-title">
+  <div class="home-section-heading"><h2 id="recent-runs-title">Recent runs</h2></div>
+  {% if runs %}
+  {% set platform_labels = {'web': 'Web', 'android': 'Android', 'ios': 'iOS', 'macos': 'macOS'} %}
+  <ul class="recent-list">
+    {% for run in runs %}
+    {% set platform = run.platform or 'web' %}
+    {% set mode = (run.options or {}).get('test_mode') %}
+    {% set target = run.live_url or '' %}
+    {% set short_target = (target.rsplit('/', 1)[-1] or target) if platform != 'web' else target %}
+    <li class="recent-run">
+      <div class="recent-identity">
+        <a class="recent-run-link" href="/runs/{{ run.id }}">
+          <strong>{{ run.project }}</strong>
+          <code class="recent-id"><span class="visually-hidden">Run </span>{{ run.id }}</code>
+        </a>
+      </div>
+      <div class="recent-target">
+        <span class="recent-platform">{{ platform_labels.get(platform, platform | capitalize) }}{% if mode %} · {{ mode | capitalize }} testing{% endif %}</span>
+        {% if short_target %}<span class="recent-target-name">{{ short_target }}</span>{% endif %}
+      </div>
+      <div class="recent-state">
+        <span class="recent-status" data-status="{{ run.status }}">{{ run.status | replace('_', ' ') | capitalize }}</span>
+        <span class="recent-stage">{% if run.stage %}{{ run.stage | replace('-', ' ') | replace('_', ' ') | capitalize }} · {% endif %}{{ run.progress }}%</span>
+      </div>
+      <div class="recent-date">
+        {% if run.created_at %}
+        <time datetime="{{ run.created_at.isoformat() }}">
+          <span>{{ run.created_at.strftime('%d %b %Y') }}</span>
+          <small>{{ run.created_at.strftime('%H:%M %Z') | trim }}</small>
+        </time>
+        {% else %}<span aria-hidden="true">—</span><span class="visually-hidden">Creation date unavailable</span>{% endif %}
+      </div>
+      {% if run.message or short_target != target %}
+      <details class="recent-message">
+        <summary>{% if run.message and short_target != target %}Run message and build path{% elif run.message %}Run message{% else %}Build path{% endif %}</summary>
+        {% if run.message %}<p>{{ run.message }}</p>{% endif %}
+        {% if short_target != target %}<p><code>{{ target }}</code></p>{% endif %}
+      </details>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="recent-empty">No runs yet.</p>
+  {% endif %}
+</section>

@@ -75,14 +75,14 @@ appium:
 
 ## One native run from the terminal, on the host:
 ##   make run-android APP=/path/app-release.apk PROJECT=my-android-app
-##   make run-desktop REPO=https://github.com/jgraph/drawio-desktop APP=/Applications/draw.io.app
+##   make run-desktop APP=/Applications/draw.io.app PROJECT=desktop-qa
 run-android:
 	set -a; . ./.env; set +a; DATABASE_URL=postgresql+psycopg://$${POSTGRES_USER:-qa}:$${POSTGRES_PASSWORD:-qa}@localhost:$${POSTGRES_PORT:-5434}/$${POSTGRES_DB:-qa} \
 		.venv/bin/python -m qaplatform.cli run --platform android --repo "$(REPO)" --app "$(APP)" --project "$(PROJECT)" --email "$${ANDROID_USER_EMAIL:-}" --password "$${ANDROID_USER_PASSWORD:-}"
 
 run-desktop:
 	set -a; . ./.env; set +a; DATABASE_URL=postgresql+psycopg://$${POSTGRES_USER:-qa}:$${POSTGRES_PASSWORD:-qa}@localhost:$${POSTGRES_PORT:-5434}/$${POSTGRES_DB:-qa} \
-		.venv/bin/python -m qaplatform.cli run --platform macos --repo "$(REPO)" --app "$(or $(APP),$${DESKTOP_APP_PATH})" --project "$(PROJECT)"
+		.venv/bin/python -m qaplatform.cli run --platform macos --repo "$(REPO)" --app "$(APP)" --project "$(PROJECT)"
 
 ## Check the repository for tracked secrets, builds and generated artifacts
 security-check:

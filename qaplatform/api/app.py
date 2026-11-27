@@ -6,22 +6,27 @@ import re
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from qaplatform.app.assertions import validate_api_assertion, validate_ui_assertion
+from qaplatform.app.build import APP_ID_RE
+from qaplatform.app.installed import read_macos_app_inventory
 from qaplatform.app.uploads import ApkUploadTooLarge, save_apk_upload
-from qaplatform.config import Settings
+from qaplatform.config import APP_TEST_MODES, SCOPED_APP_PLATFORMS, Settings
 from qaplatform.db.models import Component, Finding, ReviewLabel, Run, RunEvent, Test, new_id
 from qaplatform.db.session import init_db, session
 from qaplatform.heartbeat import live_platforms
-from qaplatform.report.legacy import refresh_saved_report, saved_report_needs_refresh
+from qaplatform.report.html import CHECK_STATES, REPORT_CSS, REPORT_LAYOUT_MARKER, SCREEN_RESULTS_MARKER
+from qaplatform.report.legacy import LEGACY_REPORT_PREFIX, refresh_saved_report, saved_report_needs_refresh
 from qaplatform.report.metrics import build_registry
+from qaplatform.report.saved import render_saved_device_report
 from qaplatform.secrets import encrypt_secrets
 
 
@@ -38,14 +43,13 @@ init_db(settings.database_url)
 settings.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="AI-TestAutomation", version="1.0")
-templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+templates = Jinja2Templates(directory=[Path(__file__).parent / "templates", REPORT_CSS.parent])
 runs_dir = settings.artifacts_dir / "runs"
 runs_dir.mkdir(exist_ok=True)
 app.mount("/artifacts/runs", RunArtifacts(directory=str(runs_dir)), name="artifacts")
 registry = build_registry(settings.database_url)
 GRAFANA_URL = os.environ.get("GRAFANA_URL", "http://localhost:3000")
 PLATFORMS = ("web", "android", "ios", "macos")
-ANDROID_TEST_MODES = ("frontend", "backend", "full")
 
 
 def db_session():
@@ -79,8 +83,8 @@ def form_defaults() -> dict:
         "repo_url": "", "live_url": env("TARGET_LIVE_URL", env("BASE_URL", "")),
         "email": env("VALID_USER_EMAIL", ""), "max_pages": settings.max_pages}}
     for platform, prefix in (("android", "ANDROID"), ("ios", "IOS"), ("macos", "DESKTOP")):
-        out[platform] = {"repo_url": "", "app_path": "" if platform == "android" else env(f"{prefix}_APP_PATH", ""),
-                         "email": env(f"{prefix}_USER_EMAIL", ""), "max_pages": settings.max_screens}
+        out[platform] = {"repo_url": "", "app_path": "" if platform in SCOPED_APP_PLATFORMS else env(f"{prefix}_APP_PATH", ""),
+                         "email": env(f"{prefix}_USER_EMAIL", ""), "max_pages": settings.macos_max_screens if platform == "macos" else settings.max_screens}
     out["load_test"] = {"enabled": env("LOAD_TEST_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"), "base_url": env("LOAD_TEST_BASE_URL", "")}
     return out
 
@@ -109,6 +113,11 @@ def _parse_http_url(source: str) -> SplitResult | None:
     return None
 
 
+@app.get("/api/macos/apps")
+def macos_apps():
+    return JSONResponse(read_macos_app_inventory(settings.artifacts_dir), headers={"Cache-Control": "no-store"})
+
+
 @app.post("/runs")
 def create_run(
     project: str = Form(""), repo_url: str = Form(""), live_url: str = Form(""), email: str = Form(""), password: str = Form(""),
@@ -116,7 +125,7 @@ def create_run(
     platform: str = Form("web"), app_path: str = Form(""), clean_start: bool = Form(False),
     journeys: bool = Form(False), remote_qa_data: bool = Form(False), load_test: bool = Form(False), load_test_base_url: str = Form(""),
     apk_file: UploadFile | None = File(None),
-    test_mode: str = Form("frontend"),
+    test_mode: str | None = Form(None),
     ui_path: str = Form(""), ui_expected_text: str = Form(""),
     api_base_url: str = Form(""), api_path: str = Form(""), api_expected_status: str = Form(""),
     api_json_field: str = Form(""), api_expected_value: str = Form(""), api_token: str = Form(""),
@@ -124,18 +133,22 @@ def create_run(
 ):
     if platform not in PLATFORMS:
         raise HTTPException(400, f"platform must be one of {', '.join(PLATFORMS)}")
+    # Older desktop clients sent source without selecting a testing mode.
+    scoped = platform == "android" or (platform == "macos" and (test_mode is not None or not repo_url.strip()))
+    platform_label = "macOS" if platform == "macos" else "Android"
     project = project.strip()
-    if platform == "android" and not project:
-        raise HTTPException(400, "Project name is required for Android testing")
+    if scoped and not project:
+        raise HTTPException(400, f"Project name is required for {platform_label} testing")
     if len(project) > 80:
         raise HTTPException(400, "Project name must be 80 characters or fewer")
-    if platform == "android" and test_mode not in ANDROID_TEST_MODES:
-        raise HTTPException(400, "Android test mode must be frontend, backend, or full")
+    test_mode = "frontend" if test_mode is None else test_mode
+    if scoped and test_mode not in APP_TEST_MODES:
+        raise HTTPException(400, f"{platform_label} test mode must be frontend, backend, or full")
     target = live_url.strip() if platform == "web" else app_path.strip()
     upload = apk_file if apk_file and apk_file.filename else None
-    backend_only = platform == "android" and test_mode == "backend"
+    backend_only = scoped and test_mode == "backend"
     if backend_only and (target or upload is not None):
-        raise HTTPException(400, "Choose Frontend or Full testing to submit an APK or installed app ID")
+        raise HTTPException(400, "Choose Frontend or Full testing to submit an app for device testing")
     if upload is not None:
         if platform != "android":
             raise HTTPException(400, "APK uploads are supported for Android runs")
@@ -147,11 +160,16 @@ def create_run(
     sources = parse_sources(repo_url)
     assertions = {}
     run_secrets = {}
-    if platform == "android":
+    if scoped:
         if not backend_only and not target:
-            raise HTTPException(400, "Provide an APK file, a build path, or an installed app ID")
-        max_pages = settings.max_screens
+            detail = "Provide an APK file, a build path, or an installed app ID" if platform == "android" else "Choose an installed Mac app or enter a .app path, .dmg path, or bundle ID"
+            raise HTTPException(400, detail)
+        if platform == "macos" and not backend_only and not (Path(target).suffix.lower() in (".app", ".dmg") or APP_ID_RE.fullmatch(target)):
+            raise HTTPException(400, "Select an installed Mac app or enter a .app path, .dmg path, or bundle ID")
+        max_pages = settings.macos_max_screens if platform == "macos" else settings.max_screens
         llm_intent = journeys = remote_qa_data = False
+        if platform == "macos":
+            clean_start = False
         if test_mode == "frontend":
             sources = []
             load_test = False
@@ -197,10 +215,10 @@ def create_run(
             raise HTTPException(400, "web runs take one codebase" if platform == "web" else "give at most two codebases: the app first, then its backend")
     options = {"max_pages": max_pages, "llm_intent": llm_intent, "phase2": phase2, "branch": branch.strip(), "clean_start": clean_start}
     if platform != "web":
-        source_roles = ("backend",) if platform == "android" else ("frontend", "backend")
+        source_roles = ("backend",) if scoped else ("frontend", "backend")
         options["codebase_sources"] = [{"role": role, "source": src} for role, src in zip(source_roles, sources)]
         options.update({"journeys": journeys, "remote_qa_data": remote_qa_data, "load_test": load_test, "load_test_base_url": load_test_base_url.strip()})
-    if platform == "android":
+    if scoped:
         options["test_mode"] = test_mode
         if assertions:
             options["assertions"] = assertions
@@ -232,23 +250,34 @@ def run_page(run_id: str, request: Request, db: Session = Depends(db_session)):
     run = db.get(Run, run_id)
     if run is None:
         raise HTTPException(404)
-    events = db.execute(select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.id.desc()).limit(60)).scalars().all()
+    events = _recent_events(db, run_id, 60)
     findings = db.execute(select(Finding).where(Finding.run_id == run_id).order_by(Finding.severity, Finding.route)).scalars().all()
     sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
     findings.sort(key=lambda f: (0 if f.status == "reported" else 1, sev_order.get(f.severity, 9)))
     report_exists = (settings.artifacts_dir / "runs" / run_id / "report.html").exists()
-    return templates.TemplateResponse(request, "run.html", {"run": run, "events": list(reversed(events)), "findings": findings, "grafana_url": GRAFANA_URL, "report_exists": report_exists,
-                                                             "waiting_for_worker": _waiting_for_worker(run)})
+    check_counts = None
+    if run.status == "completed":
+        check_counts = (run.stats or {}).get("tests_by_status") or _test_status_counts(db, run_id)
+    return templates.TemplateResponse(request, "run.html", {
+        "run": run, "events": events, "findings": findings, "grafana_url": GRAFANA_URL, "report_exists": report_exists,
+        "waiting_for_worker": _waiting_for_worker(run), "check_counts": check_counts, "check_states": CHECK_STATES,
+    })
 
 
 @app.get("/runs/{run_id}/report", response_class=HTMLResponse)
-def run_report(run_id: str):
+def run_report(run_id: str, db: Session = Depends(db_session)):
     path = settings.artifacts_dir / "runs" / run_id / "report.html"
     if not path.is_file():
         raise HTTPException(404, "report not ready")
     try:
         with path.open(encoding="utf-8") as report:
             head = report.read(512)
+            if SCREEN_RESULTS_MARKER not in head and (REPORT_LAYOUT_MARKER in head or head.startswith(LEGACY_REPORT_PREFIX)):
+                try:
+                    if screen_report := render_saved_device_report(db, path.parent, run_id):
+                        return HTMLResponse(screen_report)
+                except SQLAlchemyError:
+                    pass  # The archived HTML can still be served while the database is unavailable.
             if saved_report_needs_refresh(head):
                 upgraded = refresh_saved_report(head + report.read(), run_id)
                 if upgraded is not None:
@@ -278,13 +307,25 @@ def api_run(run_id: str, db: Session = Depends(db_session)):
         raise HTTPException(404)
     counts = dict(db.execute(select(Finding.severity, func.count()).where(Finding.run_id == run_id, Finding.status == "reported").group_by(Finding.severity)).all())
     comps = dict(db.execute(select(Component.status, func.count()).where(Component.run_id == run_id).group_by(Component.status)).all())
-    tests = dict(db.execute(select(Test.status, func.count()).where(Test.run_id == run_id).group_by(Test.status)).all())
+    tests = _test_status_counts(db, run_id)
     return {**_run_json(run), "findings_by_severity": counts, "components_by_status": comps, "tests_by_status": tests, "waiting_for_worker": _waiting_for_worker(run)}
 
 
+def _test_status_counts(db: Session, run_id: str) -> dict[str, int]:
+    return dict(db.execute(select(Test.status, func.count()).where(Test.run_id == run_id).group_by(Test.status)).all())
+
+
+def _recent_events(db: Session, run_id: str, limit: int) -> list[RunEvent]:
+    events = db.scalars(select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.id.desc()).limit(limit)).all()
+    return list(reversed(events))
+
+
 @app.get("/api/runs/{run_id}/events")
-def api_events(run_id: str, db: Session = Depends(db_session)):
-    events = db.execute(select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.id).limit(500)).scalars().all()
+def api_events(run_id: str, limit: int | None = Query(None, ge=1, le=500), db: Session = Depends(db_session)):
+    if limit is None:
+        events = db.scalars(select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.id).limit(500)).all()
+    else:
+        events = _recent_events(db, run_id, limit)
     return [{"ts": e.ts.isoformat(), "level": e.level, "stage": e.stage, "message": e.message} for e in events]
 
 

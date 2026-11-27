@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}AI-TestAutomation{% endblock %}</title>
+{% block styles %}
 <style>
 :root{--bg:#f5f7f5;--surface:#fff;--fg:#1b2220;--muted:#5a6663;--line:#d3dad6;--accent:#0f7a69;--crit:#b3362c;--warn:#a86a12;--ok:#2e7a4d}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -25,9 +26,12 @@ p.warn{background:#fbeed5;color:var(--fg);border-left:4px solid var(--warn);padd
 pre{font-size:12px;white-space:pre-wrap;background:#f0f3f1;padding:10px;border-radius:6px;max-height:320px;overflow:auto}
 small{color:var(--muted)}
 </style>
+{% endblock %}
 </head>
 <body>
+{% block header %}
 <header><a href="/">AI-TestAutomation</a><a href="{{ grafana_url }}" target="_blank" rel="noopener">Grafana</a><a href="/metrics">Metrics</a></header>
-<main>{% block body %}{% endblock %}</main>
+{% endblock %}
+<main{% block main_attributes %}{% endblock %}>{% block body %}{% endblock %}</main>
 </body>
 </html>

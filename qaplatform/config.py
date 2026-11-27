@@ -10,6 +10,9 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+SCOPED_APP_PLATFORMS = ("android", "macos")
+APP_TEST_MODES = ("frontend", "backend", "full")
+
 # name, width, height. The five widths the responsive checks run at.
 DEFAULT_VIEWPORTS: list[tuple[str, int, int]] = [
     ("mobile", 360, 780),
@@ -60,6 +63,8 @@ class Settings:
     android_avd: str = ""
     device_name: str = ""
     max_screens: int = 25
+    macos_max_screens: int = 120
+    macos_exploration_seconds: int = 900
     app_launch_timeout_s: int = 60
 
     @classmethod
@@ -86,5 +91,7 @@ class Settings:
             android_avd=os.environ.get("ANDROID_AVD") or "",
             device_name=os.environ.get("DEVICE_NAME") or "",
             max_screens=_int("MAX_SCREENS", 25),
+            macos_max_screens=max(1, _int("MACOS_MAX_SCREENS", 120)),
+            macos_exploration_seconds=max(1, _int("MACOS_EXPLORATION_SECONDS", 900)),
             app_launch_timeout_s=_int("APP_LAUNCH_TIMEOUT_S", 60),
         )

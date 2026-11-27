@@ -51,6 +51,53 @@ def test_metrics_endpoint(client):
     assert r.status_code == 200 and "qa_runs_total" in r.text
 
 
+def test_run_activity_shows_latest_events_after_original_api_limit(client):
+    from qaplatform.api.app import settings
+    from qaplatform.db.models import Run, RunEvent
+    from qaplatform.db.session import session
+
+    with session(settings.database_url) as db:
+        run = Run(repo_url="", live_url="com.example.app", platform="android", status="running", progress=60)
+        db.add(run)
+        db.flush()
+        run_id = run.id
+        db.add_all(RunEvent(run_id=run_id, stage="explore", message=f"Activity event {i:04d}") for i in range(530))
+        db.commit()
+
+    path = f"/api/runs/{run_id}/events"
+    initial = client.get(path).json()
+    recent = client.get(path, params={"limit": 60}).json()
+    assert len(initial) == 500 and initial[-1]["message"] == "Activity event 0499"
+    assert [event["message"] for event in recent] == [f"Activity event {i:04d}" for i in range(470, 530)]
+
+    page = client.get(f"/runs/{run_id}")
+    assert page.status_code == 200 and 'aria-valuenow="60"' in page.text
+    assert "Activity event 0469" not in page.text
+    assert "Activity event 0470" in page.text and "Activity event 0529" in page.text
+
+
+def test_completed_run_shows_saved_check_results_and_findings_first(client):
+    from qaplatform.api.app import settings
+    from qaplatform.db.models import Finding, Run, Test
+    from qaplatform.db.session import session
+
+    with session(settings.database_url) as db:
+        run = Run(repo_url="", live_url="com.example.app", platform="android", status="completed", progress=100)
+        db.add(run)
+        db.flush()
+        run_id = run.id
+        db.add_all(Test(run_id=run_id, test_key=status, name=f"Fixture {status}", status=status) for status in ("pass", "fail"))
+        db.add(Finding(run_id=run_id, fingerprint="fixture", title="Fixture finding", severity="high", category="functional"))
+        db.commit()
+
+    page = client.get(f"/runs/{run_id}")
+    assert page.status_code == 200 and '<h1 id="run-title">Run results</h1>' in page.text
+    assert '<strong>2</strong> checks recorded' in page.text
+    assert 'class="result-pass" style="flex-grow:1"' in page.text
+    assert 'class="result-fail" style="flex-grow:1"' in page.text
+    assert page.text.index("Fixture finding") < page.text.index('id="activity-heading"')
+
+
 def test_artifact_mount_only_serves_run_evidence(client):
     from qaplatform.api.app import settings
 
@@ -129,4 +176,40 @@ def test_saved_redesigned_report_gets_live_section_highlight(client, monkeypatch
     assert '.jump-nav a[aria-current="location"]' in response.text
     assert ".jump-nav a:first-child" not in response.text
     assert "selectFromHash" in response.text and '<section id="screens">Saved screens</section>' in response.text
+    assert report.read_text(encoding="utf-8") == original
+
+
+def test_saved_device_report_uses_screen_data_and_keeps_original(client, monkeypatch, tmp_path):
+    from qaplatform.api.app import settings
+    from qaplatform.db.models import Component, Page, Run, Test
+    from qaplatform.db.session import session
+    from qaplatform.report.html import REPORT_LAYOUT_MARKER, REPORT_NAVIGATION_MARKER, SCREEN_RESULTS_MARKER
+
+    with session(settings.database_url) as db:
+        run = Run(platform="macos", repo_url="", live_url="com.example.app", status="completed", stats={"screens": 1})
+        db.add(run)
+        db.flush()
+        run_id = run.id
+        page_url = "app://com.example.app/Compose#example"
+        db.add(Page(run_id=run_id, route="Compose", url=page_url, title="Compose", screenshot="screenshots/window.png"))
+        component = Component(run_id=run_id, component_key="save", route="(layout)", label="Save draft", kind="button",
+                              source="observed", attrs={"page_url": page_url})
+        db.add(component)
+        db.flush()
+        db.add(Test(run_id=run_id, test_key="tap-save", name="Save draft", route="Compose", status="fail", component_id=component.id))
+        db.commit()
+
+    run_dir = tmp_path / "runs" / run_id
+    (run_dir / "screenshots").mkdir(parents=True)
+    (run_dir / "screenshots/window.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    report = run_dir / "report.html"
+    original = f'<!doctype html>\n<html lang="en"><head>{REPORT_LAYOUT_MARKER}{REPORT_NAVIGATION_MARKER}</head><body>Old report</body></html>'
+    report.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(settings, "artifacts_dir", tmp_path)
+
+    response = client.get(f"/runs/{run_id}/report")
+    assert response.status_code == 200 and SCREEN_RESULTS_MARKER in response.text
+    assert 'Compose</h3>' in response.text and 'Save draft</th>' in response.text and '1 failed' in response.text
+    assert f'<img src="/artifacts/runs/{run_id}/screenshots/window.png"' in response.text
+    assert f'href="/artifacts/runs/{run_id}/report.html"' in response.text
     assert report.read_text(encoding="utf-8") == original

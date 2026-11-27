@@ -33,6 +33,9 @@ LOGIN_ERROR_RE = re.compile(r"(invalid|incorrect|wrong|failed|error|not (found|m
 ACCOUNT_LEAK_RE = re.compile(r"(no (account|user)|user (not found|does not exist)|account (not found|does not exist)|email (not|isn.t) registered)", re.I)
 NAV_LABEL_RE = re.compile(r"\b(forgot|view|details?|see (all|more)|more|open|show|settings|history|profile|help|next|back|menu|account|terms|privacy|learn|read)\b", re.I)
 ICON_ONLY_TAGS = {"ImageButton", "ImageView", "Image", "Button", "ViewGroup", "View"}
+WINDOW_CONTROL_ROLES = {"button", "link", "menuitem", "tab", "switch", "checkbox", "radio", "textbox", "combobox"}
+DESKTOP_CONTROL_ROLES = WINDOW_CONTROL_ROLES | {"searchbox", "slider", "disclosure"}
+MENU_TAGS = {"MenuBarItem", "MenuItem"}
 
 
 def _finding(route: str, category: str, severity: str, title: str, expected: str, observed: str, standard: str, evidence: list, *, conf: float = 0.9,
@@ -74,19 +77,84 @@ def _spacing_exempt(el, others, px_per_dp: float) -> bool:
     return True
 
 
+def _desktop_geometry(screen: Screen, controls: list) -> tuple[list[TestRecord], list[FindingRecord]]:
+    """Report layout candidates in each control's own window. Scroll areas can intentionally clip."""
+    framed = {}
+    for control in controls:
+        window = screen.snap.element_windows.get(control.path_hint)
+        if (control.enabled and window and len(control.bbox) == 4 and min(control.bbox[2:]) > 0
+                and control.path_hint not in screen.snap.scrollable_elements):
+            parent, marker, offset = control.path_hint.rpartition("/Window[")
+            window_path = parent + marker + offset.partition("]")[0]
+            framed.setdefault((window_path, window, control.in_dialog), []).append(control)
+
+    clipped, overlaps = [], []
+    for (_, (left, top, width, height), _), group in framed.items():
+        right, bottom = left + width, top + height
+        contained = []
+        for control in group:
+            x, y, w, h = control.bbox
+            if x < left - 2 or y < top - 2 or x + w > right + 2 or y + h > bottom + 2:
+                # Ignore elements completely outside the window. AX trees can keep layout entries for hidden panes.
+                if x + w > left and x < right and y + h > top and y < bottom:
+                    clipped.append(control)
+            else:
+                contained.append(control)
+        for index, a in enumerate(contained):
+            for b in contained[index + 1:]:
+                if _contains(a.bbox, b.bbox) or _contains(b.bbox, a.bbox):
+                    continue
+                if _overlap(a.bbox, b.bbox) > 0.3:
+                    overlaps.append((a, b))
+
+    tests, findings = [], []
+    candidates = (
+        ("clipping", "Controls fit inside the window", clipped,
+         ", ".join(f"{item.name or item.tag!r} {item.bbox}" for item in clipped[:5]),
+         {"clipped": [item.bbox for item in clipped[:20]]}),
+        ("overlap", "Controls have distinct hit areas", overlaps,
+         "; ".join(f"{a.name or a.tag!r} / {b.name or b.tag!r}" for a, b in overlaps[:5]),
+         {"overlap": [[a.bbox, b.bbox] for a, b in overlaps[:20]]}),
+    )
+    count = sum(len(group) for group in framed.values())
+    for kind, expected, matched, detail, layout in candidates:
+        test_key = f"desktop-{kind}|{screen.route}|{screen.sig}"
+        observed = (f"{len(matched)} possible {kind} cases. {detail}" if matched else
+                    f"No visible {kind} in {count} measurable controls outside scroll areas" if count else
+                    "No measurable controls with window bounds outside scroll areas")
+        tests.append(TestRecord(test_key=test_key, name=f"{screen.route}: window {kind}", technique="desktop-layout",
+                                category="ui-responsive", route=screen.route, expected=expected, observed=observed,
+                                status="needs_review" if matched else "pass" if count else "blocked",
+                                evidence=[{"type": "layout", **layout}] if matched else []))
+        if matched:
+            findings.append(_finding(
+                screen.route, "ui-responsive", "low", f"Possible window {kind}: {len(matched)} case(s)", expected,
+                observed, "ISO/IEC 25010 operability", [_shot(screen.screenshot, "window"), {"type": "layout", **layout}],
+                key=screen.sig, test_key=test_key, review=True, viewport="window",
+            ))
+    return tests, findings
+
+
 def screen_checks(screens: list[Screen], density: float, platform: str) -> tuple[list[TestRecord], list[FindingRecord]]:
     tests: list[TestRecord] = []
     findings: list[FindingRecord] = []
     px_per_dp = density / 160.0 if platform == "android" and density else 1.0
+    desktop = platform == "macos"
     for s in screens:
-        snap, route, ev = s.snap, s.route, [_shot(s.screenshot)]
-        if s.kind == "menu":
+        snap, route, ev = s.snap, s.route, [_shot(s.screenshot, "window" if desktop else "device")]
+        menu = s.kind == "menu"
+        if menu and not desktop:
             continue
+        clickable = [e for e in snap.elements if e.visible and (e.tag in MENU_TAGS) == menu
+                     and e.role in (DESKTOP_CONTROL_ROLES if desktop else WINDOW_CONTROL_ROLES)]
         # blank
-        blank = not snap.elements and not [t for t in snap.texts if t.strip()]
+        blank = (not clickable and (menu or not any(t.strip() for t in snap.texts))) if desktop else not snap.elements and not any(t.strip() for t in snap.texts)
         tests.append(TestRecord(test_key=f"health|{route}|{s.sig}", name=f"{route} renders content", technique="page_health", category="stability", route=route,
-                                expected="Screen shows text or controls", observed="blank screen" if blank else f"{len(snap.elements)} controls, {len(snap.texts)} texts", status="fail" if blank else "pass"))
-        if blank:
+                                expected="Menu exposes controls" if menu else "Screen shows text or controls",
+                                observed=("No visible controls or content exposed by accessibility" if desktop else "blank screen") if blank else
+                                f"{len(clickable) if desktop else len(snap.elements)} controls, {len(snap.texts)} texts",
+                                status=("blocked" if desktop else "fail") if blank else "pass"))
+        if blank and not desktop:
             findings.append(_finding(route, "stability", "high", "Screen renders blank", "Every screen shows content or a loading / empty state", "No text and no controls in the UI tree", "ISO/IEC 25010 reliability", ev, key=s.sig))
         # placeholders leaking into the UI
         leaks = sorted({t for t in snap.texts if PLACEHOLDER_RE.search(t)})[:5]
@@ -95,23 +163,34 @@ def screen_checks(screens: list[Screen], density: float, platform: str) -> tuple
         if leaks:
             findings.append(_finding(route, "functional", "medium", f"Unformatted value shown to the user: {leaks[0][:60]}", "Data is formatted, or a fallback is shown when it is missing",
                                      f"Visible text: {' | '.join(leaks)}", "ISO/IEC 25010 functional correctness", ev, key="|".join(leaks)))
-        def in_window(e) -> bool:  # macOS: controls outside the window frame are system UI (menu bar)
-            if platform != "macos" or not snap.width or len(e.bbox) != 4:
-                return True
-            return e.bbox[1] + e.bbox[3] > snap.origin[1] and e.bbox[1] < snap.origin[1] + snap.height
-
-        clickable = [e for e in snap.elements if e.visible and in_window(e) and e.tag not in ("MenuBarItem", "MenuItem") and e.role in ("button", "link", "menuitem", "tab", "switch", "checkbox", "radio", "textbox", "combobox")]
         # accessible names
         unnamed = [e for e in clickable if not (e.name or "").strip()]
         code_names = [e for e in clickable if e.name and CODE_NAME_RE.search(e.name)]
+        names_status = "fail" if unnamed or code_names else "pass"
+        if desktop and not clickable:
+            names_status = "blocked"
+        elif desktop and code_names and not unnamed:
+            names_status = "needs_review"
         tests.append(TestRecord(test_key=f"a11y-name|{route}|{s.sig}", name=f"{route}: every control has an accessible name", technique="accessibility", category="accessibility", route=route,
-                                expected="Each control exposes a human-readable name", observed=f"{len(unnamed)} unnamed, {len(code_names)} with code as the name", status="fail" if unnamed or code_names else "pass"))
+                                expected="Each control exposes a human-readable name",
+                                observed="No visible controls to inspect" if desktop and not clickable else f"{len(unnamed)} unnamed, {len(code_names)} with code as the name",
+                                status=names_status))
         if unnamed:
-            findings.append(_finding(route, "accessibility", "medium", f"{len(unnamed)} control(s) without an accessible name", "Every control has a name a screen reader can announce (accessibilityLabel / content-desc)",
+            named_expected = "Every control has a name a screen reader can announce"
+            if not desktop:
+                named_expected += " (accessibilityLabel / content-desc)"
+            findings.append(_finding(route, "accessibility", "medium", f"{len(unnamed)} control(s) without an accessible name", named_expected,
                                      "Unnamed: " + ", ".join(f"{e.tag}@{e.bbox}" for e in unnamed[:6]), "WCAG 2.2 SC 4.1.2 Name, Role, Value", ev + [{"type": "layout", "unnamed": [e.bbox for e in unnamed[:20]]}], key=str(len(unnamed))))
         for e in code_names[:5]:
             findings.append(_finding(route, "accessibility", "medium", f"Control's accessible name is code: {e.name[:60]}", "A human-readable name", f"{e.tag} announced as '{e.name[:120]}'",
-                                     "WCAG 2.2 SC 4.1.2 Name, Role, Value", ev, key=e.name))
+                                     "WCAG 2.2 SC 4.1.2 Name, Role, Value", ev, key=e.name, review=desktop))
+        if desktop:
+            if not menu:
+                layout_tests, layout_findings = _desktop_geometry(s, clickable)
+                tests.extend(layout_tests)
+                findings.extend(layout_findings)
+                _check_passwords(clickable, route, ev, findings, desktop=True)
+            continue
         # touch targets (WCAG 2.5.8: 24 x 24 CSS px; on Android, dp)
         small = [e for e in clickable if len(e.bbox) == 4 and e.bbox[2] and e.bbox[3] and min(e.bbox[2], e.bbox[3]) / px_per_dp < 24 and e.role != "textbox"
                  and not _spacing_exempt(e, clickable, px_per_dp)]
@@ -138,12 +217,17 @@ def screen_checks(screens: list[Screen], density: float, platform: str) -> tuple
             if clipped:
                 findings.append(_finding(route, "ui-responsive", "low", f"{len(clipped)} control(s) extend past the screen edge", "Controls fit within the screen width",
                                          ", ".join(f"'{e.name[:30]}' {e.bbox}" for e in clipped[:5]), "ISO/IEC 25010 operability", ev, key=str(len(clipped))))
-        # unmasked passwords
-        for e in snap.elements:
-            if e.role == "textbox" and re.search(r"password|passcode|\bpin\b", e.name or "", re.I) and e.type != "password":
-                findings.append(_finding(route, "security", "high", f"Password field '{e.name[:40]}' is not masked", "Password input is masked (secureTextEntry)",
-                                         "The field reports password=false", "OWASP MASVS-PLATFORM / WSTG-ATHN", ev, key=e.selector))
+        _check_passwords(snap.elements, route, ev, findings)
     return tests, findings
+
+
+def _check_passwords(elements: list, route: str, evidence: list, findings: list[FindingRecord], *, desktop: bool = False) -> None:
+    for element in elements:
+        if element.role == "textbox" and re.search(r"password|passcode|\bpin\b", element.name or "", re.I) and element.type != "password":
+            findings.append(_finding(route, "security", "high", f"Password field '{element.name[:40]}' is not masked",
+                                     "Password input is masked" if desktop else "Password input is masked (secureTextEntry)",
+                                     "The field is exposed as ordinary text input" if desktop else "The field reports password=false",
+                                     "WSTG-ATHN" if desktop else "OWASP MASVS-PLATFORM / WSTG-ATHN", evidence, key=element.selector))
 
 
 def tap_results(explorer: AppExplorer, by_screen_el: dict[tuple[str, str], ComponentRecord]) -> tuple[list[TestRecord], list[FindingRecord]]:
@@ -151,19 +235,29 @@ def tap_results(explorer: AppExplorer, by_screen_el: dict[tuple[str, str], Compo
     tests: list[TestRecord] = []
     findings: list[FindingRecord] = []
     screens = {s.sig: s for s in explorer.screens}
+    desktop = explorer.dev.platform == "macos"
     for tap in explorer.taps:
         screen = screens.get(tap.screen_sig)
         route = screen.route if screen else ""
         comp = by_screen_el.get((tap.screen_sig, tap.element.selector))
         ckey = comp.key if comp else None
         expected_nav = (comp.intent or {}).get("navigates_to") if comp else []
+        toggle = desktop and tap.element.role in ("switch", "checkbox")
         name = tap.element.name or tap.element.selector
         tkey = f"tap|{route}|{tap.element.selector}"
+        if desktop and screen is not None:
+            tkey = f"tap|{screen.sig}|{tap.element.path_hint or tap.element.selector}"
         steps = [{"tap": p.name or p.selector} for p in (screen.path if screen else [])] + [{"tap": name}]
         if tap.result in ("skipped", "not_reached"):
             if comp is not None and comp.status == "untested":
                 comp.status = "skipped"
-                comp.notes = f"{comp.notes}; not tapped ({tap.action_class})".strip("; ")
+                note = tap.detail if desktop and tap.detail else f"not tapped ({tap.action_class})"
+                comp.notes = f"{comp.notes}; {note}".strip("; ")
+            if desktop:
+                reason = tap.detail or ("Could not reach the control's screen" if tap.result == "not_reached" else f"Held by exploration rules ({tap.action_class})")
+                tests.append(TestRecord(test_key=tkey, name=f"Tap '{name[:60]}' on {route}", technique="smoke",
+                                        category="functional", route=route, steps=steps, expected="Control can be exercised",
+                                        observed=reason, status="blocked", component_key=ckey))
             continue
         dead = tap.result == "same" and tap.element.role in ("button", "link")
         transient = dead and comp is not None and bool({"toast", "sheet"} & set((comp.intent or {}).get("opens") or []))
@@ -177,6 +271,14 @@ def tap_results(explorer: AppExplorer, by_screen_el: dict[tuple[str, str], Compo
             if tap.result == "same":
                 status = "fail"
                 observed = "no screen change"
+        if desktop and tap.result == "foreign":
+            status, observed = "blocked", tap.detail or "The target app moved out of the foreground"
+        elif desktop and dead and not expected_nav:
+            status, observed = "needs_review", "No visible response in the tested window"
+        if toggle and tap.result in ("updated", "same", "state_unverified"):
+            exp = "Clicking changes the on/off state and the original setting can be restored"
+            status = {"updated": "pass", "same": "fail", "state_unverified": "blocked"}[tap.result]
+            observed = tap.detail
         if transient:
             # per the code it shows a short message or a sheet; one that closed before the check is not a dead control
             status, observed = "blocked", f"no lasting change; per the code ({comp.code_file}:{comp.code_line}) it shows a {' / '.join((comp.intent or {}).get('opens'))}, not seen in time to verify"
@@ -186,11 +288,17 @@ def tap_results(explorer: AppExplorer, by_screen_el: dict[tuple[str, str], Compo
         n, m = (tap.reproduced_n, tap.reproduced_m) if tap.reproduced_m else (1, 1)
         if status == "fail" and m > 1 and n < m:
             status = "flaky"
-        tests.append(TestRecord(test_key=tkey, name=f"Tap '{name[:60]}' on {route}", technique="smoke", category="functional" if tap.result == "same" else "stability", route=route,
-                                steps=steps, expected=exp, observed=observed, status=status, duration_ms=tap.ms, reproduced_n=n, reproduced_m=m, component_key=ckey))
+        ev = [_shot(tap.screenshot, "window" if desktop else "device"), {"type": "console", "messages": tap.errors[:10]} if tap.errors else None]
+        tests.append(TestRecord(test_key=tkey, name=f"Tap '{name[:60]}' on {route}", technique="state-change" if toggle else "smoke",
+                                category="functional" if toggle or tap.result == "same" else "stability", route=route,
+                                steps=steps, expected=exp, observed=observed, status=status, duration_ms=tap.ms, reproduced_n=n, reproduced_m=m, component_key=ckey,
+                                evidence=[item for item in ev if item] if desktop else []))
+        if toggle and status == "fail" and tap.result == "same":
+            findings.append(_finding(route, "functional", "medium", f"'{name[:50]}' does not toggle", exp, observed,
+                                     "ISO/IEC 25010 functional correctness", ev, conf=confidence(n, m), n=n, m=m,
+                                     key=tkey, component_key=ckey, test_key=tkey, viewport="window"))
         if comp is not None:
             comp.status = status if comp.status in ("untested", "pass", "skipped") else comp.status
-        ev = [_shot(tap.screenshot), {"type": "console", "messages": tap.errors[:10]} if tap.errors else None]
         conf = confidence(n, m)
         if tap.result in ("crash", "anr"):
             findings.append(_finding(route, "stability", "critical", f"App {'crashes' if tap.result == 'crash' else 'stops responding'} when '{name[:50]}' is tapped", exp, observed,
@@ -200,9 +308,13 @@ def tap_results(explorer: AppExplorer, by_screen_el: dict[tuple[str, str], Compo
                                      "ISO/IEC 25010 reliability", ev, conf=conf, n=n, m=m, key=tap.element.selector, component_key=ckey, test_key=tkey))
         elif dead and not expected_nav:
             promises = bool(NAV_LABEL_RE.search(name))
-            findings.append(_finding(route, "functional", "medium" if promises else "low", f"Tapping '{name[:50]}' does nothing", "A control responds when tapped: navigates, opens something, or gives feedback",
-                                     "No screen change, no dialog, no message and no log output after two taps", "Nielsen #1 visibility of system status; ISO/IEC 25010 functional completeness",
-                                     ev, conf=0.9 if n == m else 0.5, n=n, m=m, key=tap.element.selector, component_key=ckey, test_key=tkey, review=not promises))
+            if promises or not desktop:
+                finding_title = f"No visible response after tapping '{name[:50]}'" if desktop else f"Tapping '{name[:50]}' does nothing"
+                detail = observed if desktop else "No screen change, no dialog, no message and no log output after two taps"
+                findings.append(_finding(route, "functional", "medium" if promises else "low", finding_title,
+                                         "A control responds when tapped: navigates, opens something, or gives feedback", detail,
+                                         "Nielsen #1 visibility of system status; ISO/IEC 25010 functional completeness", ev, conf=0.9 if n == m else 0.5,
+                                         n=n, m=m, key=tap.element.selector, component_key=ckey, test_key=tkey, review=desktop or not promises))
         elif expected_nav and tap.result == "same":
             findings.append(_finding(route, "functional", "medium", f"'{name[:50]}' does not navigate to {expected_nav[0]}", f"Per the code ({comp.code_file}:{comp.code_line}) the handler navigates to {expected_nav[0]}",
                                      "Tapping left the same screen in place", "ISO/IEC 25010 functional correctness", ev, key=tap.element.selector, component_key=ckey, test_key=tkey, review=True))
@@ -212,11 +324,13 @@ def tap_results(explorer: AppExplorer, by_screen_el: dict[tuple[str, str], Compo
 class ActiveChecks:
     """Checks that change device state, each restoring what it changed."""
 
-    def __init__(self, dev: AppDevice, explorer: AppExplorer, events, home_route: str):
+    def __init__(self, dev: AppDevice, explorer: AppExplorer, events, home_route: str, *,
+                 by_screen_el: dict[tuple[str, str], ComponentRecord] | None = None):
         self.dev = dev
         self.explorer = explorer
         self.events = events
         self.home_route = home_route
+        self.by_screen_el = by_screen_el or {}
         self.tests: list[TestRecord] = []
         self.findings: list[FindingRecord] = []
 
@@ -241,11 +355,13 @@ class ActiveChecks:
                 ("launch", self.cold_start), ("offline", self.offline), ("relaunch", self.relaunch_keeps_session)]
         relaunching = {"launch", "offline", "relaunch"}
         for name, fn in plan:
-            if name not in modules:
+            if name not in modules or (self.dev.platform == "macos" and name in ("perf", "rotation", "resume", "offline")):
                 continue
             if name in relaunching and not self.explorer.can_relaunch:
+                reason = ("Desktop runs preserve the existing app session by avoiding restarts" if self.dev.platform == "macos"
+                          else "skipped: it relaunches the app, and without a test account the session could not be restored afterwards")
                 self.tests.append(TestRecord(test_key=f"module|{name}", name=f"{name} checks", technique=name, category="platform", route=self.home_route,
-                                             expected="Module completes", observed="skipped: it relaunches the app, and without a test account the session could not be restored afterwards",
+                                             expected="Module completes", observed=reason,
                                              status="blocked"))
                 continue
             t0 = time.time()
@@ -457,6 +573,9 @@ class ActiveChecks:
 
     def inputs(self) -> None:
         """Type boundary values into each reached text field, check it holds them, restore the original."""
+        if self.dev.platform == "macos":
+            self.desktop_inputs()
+            return
         done = 0
         for screen in self.explorer.screens:
             boxes = [e for e in screen.snap.elements if e.role in ("textbox", "searchbox") and e.visible and e.enabled and e.type != "password"]
@@ -468,6 +587,8 @@ class ActiveChecks:
                 continue
             for box in boxes[:3]:
                 tkey = f"input|{screen.route}|{box.selector}"
+                component = self.by_screen_el.get((screen.sig, box.selector))
+                component_key = component.key if component else None
                 try:
                     original = self.dev.read_value(box)
                     self.dev.errors_since_last()
@@ -479,12 +600,13 @@ class ActiveChecks:
                     self.dev.hide_keyboard()
                 except Exception as exc:  # the field went away (a panel closed, the screen changed): this field is untested, the rest still run
                     self.tests.append(TestRecord(test_key=tkey, name=f"300 characters into '{box.name[:40]}'", technique="boundary", category="functional", route=screen.route,
-                                                 expected="Field accepts or limits the input without crashing", observed=f"field not reachable: {type(exc).__name__}", status="blocked"))
+                                                 expected="Field accepts or limits the input without crashing", observed=f"field not reachable: {type(exc).__name__}",
+                                                 status="blocked", component_key=component_key))
                     continue
                 done += 1
                 self.tests.append(TestRecord(test_key=tkey, name=f"300 characters into '{box.name[:40]}'", technique="boundary", category="functional", route=screen.route,
                                              expected="Field accepts or limits the input without crashing", observed=why or f"field holds {kept} characters" + (f" | log: {errors[0][:120]}" if errors else ""),
-                                             status="fail" if not alive or errors else "pass"))
+                                             status="fail" if not alive or errors else "pass", component_key=component_key))
                 if not alive:
                     self.findings.append(_finding(screen.route, "stability", "critical", f"App crashes on long input in '{box.name[:40]}'", "Long input is accepted or limited", why,
                                                   "ISTQB boundary value analysis", [], key=box.selector, test_key=tkey))
@@ -492,6 +614,73 @@ class ActiveChecks:
                 elif errors:
                     self.findings.append(_finding(screen.route, "stability", "high", f"Error logged on long input in '{box.name[:40]}'", "No error", errors[0][:300],
                                                   "ISTQB boundary value analysis", [{"type": "console", "messages": errors[:10]}], key=box.selector, test_key=tkey))
+
+    def desktop_inputs(self) -> None:
+        """Probe readable search fields and verify that their exact original values are restored."""
+        attempted = 0
+        restoration_failed = False
+        for screen in self.explorer.screens:
+            if screen.kind == "menu" or self.explorer.login_fields(screen.snap)[1] is not None:
+                continue
+            for box in screen.snap.elements:
+                if not (box.role in ("textbox", "searchbox") and box.visible and box.enabled and box.type != "password"):
+                    continue
+                component = self.by_screen_el.get((screen.sig, box.selector))
+                test = TestRecord(test_key=f"desktop-input|{screen.sig}|{box.path_hint or box.selector}",
+                                  name=f"Desktop input '{box.name[:40] or box.tag}'", technique="boundary",
+                                  category="functional", route=screen.route,
+                                  expected="A search field handles a long query and its original value is restored", status="blocked",
+                                  component_key=component.key if component else None)
+                self.tests.append(test)
+                if not (box.role == "searchbox" or normalize(box.name) in {"search", "find", "filter"}):
+                    test.observed = "Held because this field may edit saved app data"
+                    continue
+                if restoration_failed or attempted >= 20:
+                    test.observed = ("Further input checks stopped after a value could not be restored" if restoration_failed
+                                     else "Desktop input check limit reached (20 probes)")
+                    continue
+                if not self.explorer.return_to(screen):
+                    test.observed = "The field's screen could not be reached again"
+                    continue
+                try:
+                    original = self.dev.read_value(box, strict=True)
+                except Exception:
+                    test.observed = "The original value could not be read reliably"
+                    continue
+
+                attempted += 1
+                try:
+                    typed = self.dev.type_into(box, "A" * 300)
+                    alive, _, reason = self._alive()
+                    if alive and typed:
+                        kept = len(self.dev.read_value(box, strict=True))
+                        test.status, test.observed = "pass", f"Search field accepted or limited the query to {kept} characters"
+                    else:
+                        test.observed = reason or "The query could not be entered"
+                        if not alive and self.dev.app_state() == 1:
+                            test.status = "fail"
+                            self.findings.append(_finding(
+                                screen.route, "stability", "critical", f"App stopped during input in '{box.name[:40]}'",
+                                test.expected, test.observed, "ISO/IEC 25010 reliability", [_shot(screen.screenshot, "window")],
+                                key=test.test_key, test_key=test.test_key, viewport="window",
+                            ))
+                except Exception as exc:
+                    test.observed = f"Could not verify the search query ({type(exc).__name__})"
+                finally:
+                    try:
+                        if self.dev.read_value(box, strict=True) != original:
+                            self.dev.type_into(box, original)
+                        restored = self.dev.read_value(box, strict=True) == original
+                    except Exception:
+                        restored = False
+                    if restored:
+                        test.cleanup = "Original value restored and verified"
+                    else:
+                        restoration_failed = True
+                        if test.status != "fail":
+                            test.status = "blocked"
+                        test.cleanup = "Original value could not be verified; remaining input checks stopped"
+                        self.events("inputs", f"Could not verify restoration of a search field on {screen.route}", level="warn")
 
 
 def signin_negative(dev: AppDevice, explorer: AppExplorer, snap: Snapshot, email: str, route: str) -> tuple[list[TestRecord], list[FindingRecord]]:

@@ -1,0 +1,28 @@
+<section class="run-panel activity-panel" aria-labelledby="activity-heading">
+  <div class="panel-heading">
+    <h2 class="activity-heading" id="activity-heading">Run activity</h2>
+    <div class="activity-meta">
+      <span class="activity-count" id="activity-count">{{ events | length }} {{ 'event' if events | length == 1 else 'events' }}</span>
+      {% if run.status not in ('completed', 'failed') %}
+      <span class="activity-live" id="activity-live" data-state="live">Live</span>
+      {% endif %}
+    </div>
+  </div>
+  <div class="activity-stream" id="log" role="region" aria-label="Recent run events" tabindex="0">
+    <ol class="activity-list" id="activity-events">
+      {% for event in events %}
+      <li class="activity-entry" data-level="{{ event.level }}">
+        <time class="activity-time" datetime="{{ event.ts.isoformat() }}">{{ event.ts.strftime('%H:%M:%S') }}</time>
+        <span class="activity-stage" data-stage="{{ event.stage }}">
+          {{ (event.stage or 'Run') | replace('_', ' ') | replace('-', ' ') | capitalize }}
+          {% if event.level == 'warn' %}<span class="activity-level">Warning</span>{% elif event.level == 'error' %}<span class="activity-level">Error</span>{% endif %}
+        </span>
+        <span class="activity-message">{{ event.message }}</span>
+      </li>
+      {% endfor %}
+    </ol>
+    <p class="activity-empty" id="activity-empty"{% if events %} hidden{% endif %}>
+      {{ 'No activity was recorded.' if run.status in ('completed', 'failed') else 'Activity will appear when the worker starts.' }}
+    </p>
+  </div>
+</section>

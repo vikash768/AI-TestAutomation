@@ -41,7 +41,7 @@ from qaplatform.app.remedy import explain
 from qaplatform.app.testdata import QADataRegistry
 from qaplatform.app.uploads import apk_upload_path
 from qaplatform.execute.smoke import FindingRecord, TestRecord, fingerprint
-from qaplatform.config import Settings
+from qaplatform.config import SCOPED_APP_PLATFORMS, Settings
 from qaplatform.db.models import Run, RunEvent
 from qaplatform.db.session import session
 from qaplatform.explore.crawler import ObservedPage
@@ -210,13 +210,14 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
         repo_url, build_spec, options, platform = run.repo_url, run.live_url, dict(run.options or {}), run.platform
         secrets = decrypt_secrets(settings.secret_key, run.secrets)
 
-    test_mode = options.get("test_mode") if platform == "android" else None
+    test_mode = options.get("test_mode") if platform in SCOPED_APP_PLATFORMS else None
     backend_required = test_mode in ("backend", "full")
-    build_only = platform == "android" and (test_mode == "frontend" or not repo_url)
+    build_only = test_mode == "frontend" or (platform in SCOPED_APP_PLATFORMS and test_mode is None and not repo_url)
     uploaded_apk = apk_upload_path(settings.artifacts_dir, run_id) if platform == "android" and options.get("uploaded_apk") else None
     run_dir = settings.artifacts_dir / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
+    build = None
     dev: AppDevice | None = None
     runner: JourneyRunner | None = None
     registry = QADataRegistry(run_id, run_dir / "qa_data.json")
@@ -227,7 +228,8 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
     assertions = options.get("assertions", {}) if test_mode else {}
     api_result = ui_result = None
     frontend_pending = False
-    frontend_stage = "Prepare the Android build"
+    platform_label = "macOS" if platform == "macos" else "Android"
+    frontend_stage = f"Prepare the {platform_label} build"
     pages, components, tests, findings = [], [], [], []
     try:
         # 1. ingest ---------------------------------------------------------
@@ -364,19 +366,23 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
                       + (f"; {len(static_findings)} finding(s): " + "; ".join(x.title for x in static_findings[:4]) if static_findings else ""), 17)
         with session(settings.database_url) as db:
             r = db.get(Run, run_id)
-            r.commit_sha, r.framework = commit_sha, f"{framework} / {platform}"
+            r.commit_sha, r.framework = commit_sha, " / ".join(part for part in (framework, platform) if part)
             db.commit()
 
         # 2. explore --------------------------------------------------------
-        frontend_stage = "Start the Android Appium session"
-        ctx.event("explore", f"Starting Appium session on {platform}" + (" (clean start: app data cleared)" if options.get("clean_start") else ""), 18)
-        dev = AppDevice(settings, build, run_dir, ctx.event, clean_start=bool(options.get("clean_start")))
+        frontend_stage = f"Start the {platform_label} Appium session"
+        clean_start = platform != "macos" and bool(options.get("clean_start"))
+        ctx.event("explore", f"Starting Appium session on {platform}" + (" (clean start: app data cleared)" if clean_start else ""), 18)
+        dev = AppDevice(settings, build, run_dir, ctx.event, clean_start=clean_start)
         dev.start()
-        frontend_stage = "Explore the Android app"
+        frontend_stage = f"Explore the {platform_label} app"
         ctx.event("explore", f"App launched in {dev.launch_seconds}s", 22)
         lc = label_classes(inv, intents)
-        max_screens = settings.max_screens if test_mode else int(options.get("max_pages") or settings.max_screens)
-        explorer = AppExplorer(dev, ctx.event, max_screens=max_screens, label_class=lc,
+        desktop = platform == "macos"
+        default_screens = settings.macos_max_screens if desktop else settings.max_screens
+        max_screens = default_screens if test_mode else max(1, int(options.get("max_pages") or default_screens))
+        explorer = AppExplorer(dev, ctx.event, max_screens=max_screens, max_depth=max_screens if desktop else 3,
+                               budget_seconds=settings.macos_exploration_seconds if desktop else None, label_class=lc,
                                code_menu_items={normalize(e.label) for e in inv.elements if e.kind == "menuitem" and e.label})
         explorer.skip_labels = sorted({e.label for e in inv.elements if e.label and SKIP_SETUP_RE.search(e.label)}) or ["Skip for now", "Skip", "Not now"]
         first = explorer.settled(15.0)  # past splash and loading screens
@@ -413,8 +419,21 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
         explorer.run(first)
         for w in explorer.warnings:
             ctx.event("explore", w, None, level="warn")
-        tapped = sum(1 for t in explorer.taps if t.result not in ("skipped", "not_reached"))
-        ctx.event("explore", f"Explored {len(explorer.screens)} screens; {tapped} controls tapped, {sum(1 for t in explorer.taps if t.result == 'skipped')} held back by the safety rules", 55)
+        desktop_coverage = explorer.coverage_details() if desktop else None
+        coverage_result = None
+        if desktop_coverage is not None:
+            tapped = desktop_coverage["exercised"]
+            completed_scope = desktop_coverage["complete_within_scope"]
+            detail = (f"{desktop_coverage['states_walked']} views inspected, {tapped} controls exercised, "
+                      f"{desktop_coverage['held']} held, {desktop_coverage['unreachable']} unreached")
+            coverage_result = TestRecord(test_key="desktop|traversal", name="Explore reachable desktop controls", technique="coverage",
+                                         category="functional", route="desktop", expected="Inspect the discovered app views and exercise their safe controls",
+                                         observed=detail, status="pass" if completed_scope else "blocked")
+            tests.append(coverage_result)
+            ctx.event("explore", detail, 55, level="info" if completed_scope else "warn")
+        else:
+            tapped = sum(1 for t in explorer.taps if t.result not in ("skipped", "not_reached"))
+            ctx.event("explore", f"Explored {len(explorer.screens)} screens; {tapped} controls tapped, {sum(1 for t in explorer.taps if t.result == 'skipped')} held back by the safety rules", 55)
 
         # 3. reconcile ------------------------------------------------------
         assign_routes(explorer.screens, inv, texts_by_screen)
@@ -428,7 +447,8 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
                 by_screen_el[(c.page_url.rsplit("#", 1)[1], c.selector)] = c
         (run_dir / "explore.json").write_text(json.dumps({"screens": [{"route": s.route, "kind": s.kind, "title": s.snap.title, "activity": s.snap.activity, "path": [e.name for e in s.path],
                                                                        "elements": [asdict(e) for e in s.snap.elements], "texts": s.snap.texts[:80]} for s in explorer.screens],
-                                                          "taps": [{**{k: v for k, v in asdict(t).items() if k != "element"}, "element": t.element.name, "selector": t.element.selector} for t in explorer.taps]},
+                                                          "taps": [{**{k: v for k, v in asdict(t).items() if k != "element"}, "element": t.element.name, "selector": t.element.selector} for t in explorer.taps],
+                                                          **({"desktop_coverage": desktop_coverage} if desktop_coverage is not None else {})},
                                                          indent=1, default=str), encoding="utf-8")
         if code_available:
             ctx.event("reconcile", f"Matched {rec.stats['matched']}/{rec.stats['code_interactive']} code controls on the device ({rec.coverage * 100:.0f}%); {rec.stats['observed_unmatched_visible']} controls on screen have no code declaration", 60)
@@ -439,7 +459,7 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
             _append_assertion(ui_result, tests, findings)
 
         # 4-5. execute + judge ----------------------------------------------
-        frontend_stage = "Run the Android device checks"
+        frontend_stage = f"Run the {platform_label} app checks"
         failing = [t for t in explorer.taps if t.result in ("crash", "anr", "error")]
         if failing:
             ctx.event("judge", f"Reproducing {len(failing)} failing taps from a fresh launch", 62)
@@ -458,7 +478,7 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
         ai_info: dict = {"used": False}
         journey_stats: dict = {"planner": "off", "total": 0, "completed": 0, "items": [], "actions": 0}
         journey_held: list[dict] = []
-        if options.get("journeys", True) and options.get("phase2", True) and (platform != "android" or code_available):
+        if options.get("journeys", True) and options.get("phase2", True) and (platform not in SCOPED_APP_PLATFORMS or code_available):
             ai_plan = None
             if native_ai.enabled(settings, options):
                 ctx.event("journey", f"Asking {settings.gemini_model} for screen intent, journeys and validation cases (no credentials are sent)", 64)
@@ -498,13 +518,14 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
             ctx.event("journey", f"Journeys: {journey_stats['completed']}/{journey_stats['total']} completed, {journey_stats['validation_cases']} validation cases; QA data: {qa['created']} created, {qa['cleaned']} cleaned, {qa['leftover']} left over", 70,
                       level="info" if not qa["leftover"] else "warn")
         home_route = explorer.home.route if explorer.home else ""
-        active = ActiveChecks(dev, explorer, ctx.event, home_route)
+        active = ActiveChecks(dev, explorer, ctx.event, home_route, by_screen_el=by_screen_el)
         active.run(enabled)
         tests += active.tests
         findings += active.findings
 
         if test_mode:
-            legs["frontend"] = _leg_result(tests, [ui_result] if ui_result else [])
+            required = [check for check in (ui_result, coverage_result) if check is not None]
+            legs["frontend"] = _leg_result(tests, required)
         if not backend_required:
             # Existing load test for source-assisted native runs. Frontend testing disables it.
             load_summary, lt_tests, lt_findings = run_load_test(load_config, api_routes, client_eps, ctx.event, run_id, api_bases)
@@ -526,6 +547,8 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
         }
         if legs:
             stats["legs"] = legs
+        if desktop_coverage is not None:
+            stats["desktop_coverage"] = desktop_coverage
         summary = f"{len(explorer.screens)} screens, {tapped} controls tapped"
         if backend_required:
             summary += f"; Frontend checks {legs['frontend']['status']}; Backend checks {legs['backend']['status']}"
@@ -544,9 +567,9 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
         ctx.event("done", f"Report written: {report_path}", 100)
     except Exception as exc:
         if frontend_pending:
-            reason = f"{frontend_stage} did not complete ({type(exc).__name__}). Review the Android worker and Appium logs."
+            reason = f"{frontend_stage} did not complete ({type(exc).__name__}). Review the host worker and Appium logs."
             ctx.event("explore", reason, None, level="warn")
-            device_result = _blocked_check("frontend|device", "Android device checks", "device", "frontend", reason)
+            device_result = _blocked_check("frontend|device", f"{platform_label} app checks", "device", "frontend", reason)
             tests.append(device_result)
             if assertions.get("ui") and ui_result is None:
                 ui_result = _blocked_check("assertion|ui", "Expected text on app screen", "ui_assertion", "frontend", reason)
@@ -594,6 +617,8 @@ def run_app_pipeline(run_id: str, settings: Settings) -> None:
             if dev is not None:
                 dev.stop()
         finally:
+            if build is not None:
+                build.close()
             checkouts.close()
             if uploaded_apk is not None and terminal:
                 try:

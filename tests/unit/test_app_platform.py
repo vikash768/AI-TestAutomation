@@ -304,6 +304,61 @@ def test_api_queues_android_backend_modes(submission_client, mode):
         assert secret["password"] == ("fixture-login" if mode == "full" else "")
 
 
+@pytest.mark.parametrize(("mode", "target"), [
+    ("frontend", "/Applications/Fixture Editor.app"), ("frontend", "com.example.editor"),
+    ("backend", ""), ("full", "/tmp/Fixture Editor.dmg"),
+])
+def test_api_queues_macos_modes(submission_client, mode, target):
+    from qaplatform.api.app import settings
+    from qaplatform.db.models import Run
+    from qaplatform.db.session import session
+    from qaplatform.secrets import decrypt_secrets
+
+    client, database_url = submission_client
+    repo, token = "https://github.com/example/backend.git", "fixture-per-run-token"
+    response = client.post("/runs", data={
+        "platform": "macos", "test_mode": mode, "project": "Mac QA", "app_path": target,
+        "repo_url": repo, "github_token": token, "clean_start": True, "phase2": True,
+        "ui_expected_text": "Editor", "api_base_url": "https://fixture.invalid", "api_path": "/health",
+    }, follow_redirects=False)
+    assert response.status_code == 303, response.text
+    with session(database_url) as db:
+        run = db.get(Run, response.headers["location"].rsplit("/", 1)[-1])
+        assert run.platform == "macos"
+        assert run.live_url == (target or "Backend source review")
+        assert run.options["test_mode"] == mode and run.options["max_pages"] == settings.macos_max_screens
+        assert run.options["clean_start"] is False and run.options["phase2"] == (mode != "backend")
+        assert run.repo_url == ("" if mode == "frontend" else repo)
+        assert run.options["codebase_sources"] == ([] if mode == "frontend" else [{"role": "backend", "source": repo}])
+        assert decrypt_secrets(settings.secret_key, run.secrets)["github_token"] == ("" if mode == "frontend" else token)
+        assert ("ui" in run.options["assertions"]) == (mode != "backend")
+        assert ("api" in run.options["assertions"]) == (mode != "frontend")
+
+
+@pytest.mark.parametrize(("fields", "message"), [
+    ({"test_mode": "frontend", "app_path": "invalid"}, "bundle ID"),
+    ({"test_mode": "backend", "app_path": "/Applications/Example.app"}, "Choose Frontend or Full"),
+    ({"test_mode": "backend", "repo_url": "https://github.com/example/backend.git"}, "Git token is required"),
+    ({"test_mode": "full", "app_path": "/Applications/Example.app"}, "HTTPS backend Git URL"),
+    ({"test_mode": "unknown"}, "test mode"),
+])
+def test_api_validates_macos_scope(submission_client, fields, message):
+    client, _ = submission_client
+    response = client.post("/runs", data={"platform": "macos", "project": "Mac QA", **fields}, follow_redirects=False)
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+def test_macos_installed_app_route(submission_client, monkeypatch):
+    from qaplatform.api import app as app_module
+
+    client, _ = submission_client
+    expected = {"available": True, "apps": [{"name": "Editor", "bundle_id": "com.example.editor", "path": "/Applications/Editor.app"}]}
+    monkeypatch.setattr(app_module, "read_macos_app_inventory", lambda _: expected)
+    response = client.get("/api/macos/apps")
+    assert response.json() == expected and response.headers["Cache-Control"] == "no-store"
+
+
 @pytest.mark.parametrize(("overrides", "message"), [
     ({"test_mode": "unknown"}, "test mode"),
     ({"repo_url": ""}, "HTTPS backend Git URL"),
@@ -337,11 +392,13 @@ def test_form_defaults_do_not_prefill_manual_inputs(monkeypatch):
     for key in ("PROJECT_NAME", "ANDROID_PROJECT_NAME", "IOS_PROJECT_NAME", "DESKTOP_PROJECT_NAME"):
         monkeypatch.setenv(key, "env-only project")
     monkeypatch.setenv("ANDROID_APP_PATH", "/tmp/env-only.apk")
+    monkeypatch.setenv("DESKTOP_APP_PATH", "/tmp/env-only.app")
     monkeypatch.setenv("APP_BUILD_PATH", "/tmp/general-env-only.apk")
     defaults = form_defaults()
     assert all(defaults[platform]["repo_url"] == "" for platform in ("web", "android", "ios", "macos"))
     assert all(not defaults[platform].get("project") for platform in ("web", "android", "ios", "macos"))
     assert defaults["android"]["app_path"] == ""
+    assert defaults["macos"]["app_path"] == ""
 
 
 @pytest.mark.parametrize("mode", ["frontend", "backend", "full"])

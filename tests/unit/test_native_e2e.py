@@ -126,7 +126,7 @@ def test_native_run_with_two_sources_and_web_with_one(client):
     assert client.post("/runs", data={"repo_url": "a\nb", "live_url": "https://example.com"}).status_code == 400
     assert client.post("/runs", data={"platform": "macos", "repo_url": "a\nb\nc", "app_path": "x"}).status_code == 400
     page = client.get("/").text
-    assert "Codebase URL(s) (git) or local path(s)" in page and "<textarea" in page
+    assert "Repository URL or local path" in page and "<textarea" in page
 
 
 # -- report evidence links ------------------------------------------------------------------------------
@@ -160,7 +160,7 @@ def test_report_links_resolve_and_cannot_escape(tmp_path):
     assert artifact_href(str(run_dir / "screenshots" / "missing.png"), run_dir, run_id) == ""  # no misleading link
     finding = FindingRecord(fingerprint="f1", route="Home", category="functional", severity="high", title="Broken <control>", evidence=[{"type": "screenshot", "path": str(shot), "viewport": "device"},
                                                                                                                               {"type": "screenshot", "path": str(outside)}])
-    page = ObservedPage(route="Home", url="app://x/Home", viewports={"device": {"screenshot": str(shot)}}, screenshot=str(shot))
+    page = ObservedPage(route="Home", url="app://x/Home", load_ms=20, viewports={"device": {"screenshot": str(shot)}}, screenshot=str(shot))
     test = TestRecord(test_key="t", name="Journey: x", technique="journey", category="functional", route="Home", status="fail", evidence=[{"type": "screenshot", "path": str(shot)}],
                       expected="Shows <sample details>", observed="Loading stopped", duration_ms=42, code_ref="Sample.tsx:12", qa_data="qa_x", cleanup="qa_x: cleaned",
                       steps=[{"action": "type", "target": "Test ID", "value": "qa_x", "result": "typed"}])
@@ -172,6 +172,8 @@ def test_report_links_resolve_and_cannot_escape(tmp_path):
     for section_id in ("findings", "tests", "screens"):
         assert f'href="#{section_id}"' in html
         assert f'id="{section_id}"' in html
+    assert html.index('id="screens"') < html.index('id="findings"')
+    assert f'<img src="/artifacts/runs/{run_id}/screenshots/001%20home%20screen.png"' in html
     assert 'name="viewport"' in html and 'class="finding-card' in html
     assert 'id="finding-search"' in html and 'id="finding-severity"' in html
     assert "Broken &lt;control&gt;" in html and "Broken <control>" not in html
@@ -189,6 +191,34 @@ def test_report_links_resolve_and_cannot_escape(tmp_path):
     for section in ("Performance &amp; Load Testing", "Mobile device performance", "Backend API load test", "Journeys and QA test data", "Tested vs held back",
                     "full journeys completed", "QA records cleaned", "Screen load time"):
         assert section in html, section
+
+
+@pytest.mark.parametrize("platform", ["android", "ios", "macos"])
+def test_device_report_groups_component_results_with_screens(tmp_path, platform):
+    from qaplatform.execute.smoke import ComponentRecord
+
+    pages = [ObservedPage(route=route, url=f"app://qa/{route}", title="Example app") for route in ("Library", "Settings")]
+    components = [
+        ComponentRecord(key="open", route="Library", kind="button", label="Open item", source="observed"),
+        ComponentRecord(key="toggle", route="(layout)", kind="switch", label="Show previews", source="both", page_url=pages[1].url),
+        ComponentRecord(key="remove", route="Settings", kind="button", label="Remove item", source="observed", status="skipped"),
+    ]
+    tests = [
+        TestRecord("open|ok", "Open selected item", "smoke", "functional", "Library", component_key="open"),
+        TestRecord("toggle|on", "Enable previews", "state-change", "functional", "Settings", status="fail", component_key="toggle"),
+        TestRecord("toggle|off", "Disable previews", "state-change", "functional", "Settings", component_key="toggle"),
+        TestRecord("launch", "Start app", "launch", "platform", "Library", status="blocked"),
+    ]
+    out = write_report(tmp_path, "screenreport", {}, {"platform": platform}, pages, components, tests, [])
+    html = out.read_text()
+    cards = re.findall(r'<article class="screen-card".*?</article>', html, re.DOTALL)
+    assert len(cards) == 2
+    library, settings = cards
+    assert all(text in library for text in ("Library</h3>", "Open item", "1 passed", "Open selected item"))
+    assert all(text in settings for text in ("Settings</h3>", "Show previews", "1 failed", "1 passed", "Enable previews", "Skipped"))
+    assert all(text not in library for text in ("Show previews", "Enable previews", "Start app"))
+    assert "Open selected item" not in settings and all("Screenshot unavailable" in card for card in cards)
+    assert '<h2 id="tests">Other checks</h2>' in html and html.count("Start app") == 2  # Other checks and performance
 
 
 def test_web_report_keeps_its_layout(tmp_path):
@@ -491,6 +521,7 @@ def test_hardware_screen_blocks_instead_of_failing(tmp_path):
 class PipelineDevice(FakeDevice):
     def __init__(self, settings, build, run_dir, events, clean_start=False):
         super().__init__(run_dir)
+        self.platform = build.platform
         self.build, self.launch_seconds = build, 1.0
         self.driver = type("D", (), {"capabilities": {"deviceScreenDensity": 420}})()
 
@@ -508,7 +539,8 @@ class PipelineDevice(FakeDevice):
     ("backend", "", "true"), ("backend", "", "false"), ("full", "", "true"),
     ("full", "checkout", "true"), ("full", "device", "true"),
 ])
-def test_android_modes_report_requested_scope(client, tmp_path, monkeypatch, api_server, mode, unavailable, expected_value):
+@pytest.mark.parametrize("platform", ["android", "macos"])
+def test_app_modes_report_requested_scope(client, tmp_path, monkeypatch, api_server, mode, unavailable, expected_value, platform):
     from qaplatform.api import app as app_module
     from qaplatform.app import pipeline as app_pipeline
     from qaplatform.config import Settings
@@ -546,7 +578,7 @@ def test_android_modes_report_requested_scope(client, tmp_path, monkeypatch, api
             raise RuntimeError("Fixture Appium is unavailable")
 
     def unexpected_device(*args, **kwargs):
-        pytest.fail("Backend testing must complete without preparing or starting a mobile device")
+        pytest.fail("Backend testing must complete without preparing or starting an app")
 
     def disabled_load_only(config, *args):
         assert config.enabled is False
@@ -563,26 +595,29 @@ def test_android_modes_report_requested_scope(client, tmp_path, monkeypatch, api
     target = {"app_path": "com.example.rn", "ui_expected_text": "Home"} if mode == "full" else {}
     api_token = "fixture-api-token"
     response = client.post("/runs", data={
-        "platform": "android", "test_mode": mode, "project": "Android QA", "repo_url": repo_url, "github_token": git_token,
+        "platform": platform, "test_mode": mode, "project": "App QA", "repo_url": repo_url, "github_token": git_token,
         "branch": "review", "api_base_url": api_server, "api_path": "/fixture-record", "api_json_field": "record.available",
         "api_expected_value": expected_value, "api_token": api_token, **target,
     }, follow_redirects=False)
     assert response.status_code == 303, response.text
     run_id = response.headers["location"].rsplit("/", 1)[-1]
-    assert claim_next(settings.database_url, ("android",)) == (run_id, "android")
+    assert claim_next(settings.database_url, (platform,)) == (run_id, platform)
     with session(settings.database_url) as db:
         run = db.get(Run, run_id)
         assert git_token not in run.secrets and api_token not in run.secrets and api_token not in str(run.options)
 
-    execute(run_id, "android", settings)
+    execute(run_id, platform, settings)
 
     with session(settings.database_url) as db:
         run = db.get(Run, run_id)
         assert run.status == "completed", (run.error, run.message)
         assert run.secrets is None
         assert run.commit_sha == ("" if unavailable == "checkout" else "a" * 40)
+        assert run.stats["platform"] == platform
         assert run.stats["test_mode"] == mode and run.stats["code_available"] is False
         assert run.stats["load_test"]["status"] == "disabled"
+        if platform == "macos" and mode == "full" and unavailable != "device":
+            assert run.stats["desktop_coverage"]["states_walked"] > 0
         assert (run.stats["backend"]["routes"] >= 6) == (unavailable != "checkout")
         api_status = "pass" if expected_value == "true" else "fail"
         assert run.stats["legs"]["backend"]["status"] == ("blocked" if unavailable == "checkout" else api_status)
@@ -623,9 +658,12 @@ def test_android_modes_report_requested_scope(client, tmp_path, monkeypatch, api
     assert f"{mode.capitalize()} testing" in html
     assert "Backend source review" in html and "Open backend route inventory" in html
     assert ("<h2>Screens</h2>" in html) == (mode == "full" and unavailable != "device")
+    assert ('id="desktop-coverage"' in html) == (platform == "macos" and mode == "full" and unavailable != "device")
+    if platform == "macos" and mode == "full" and unavailable != "device":
+        assert "Desktop coverage by control type" in html
 
 
-@pytest.mark.parametrize("kind", ["apk", "installed", "upload"])
+@pytest.mark.parametrize("kind", ["apk", "installed", "upload", "mac-app"])
 def test_native_pipeline_without_source_reports_device_findings(tmp_path, monkeypatch, kind):
     from prometheus_client import generate_latest
 
@@ -644,7 +682,7 @@ def test_native_pipeline_without_source_reports_device_findings(tmp_path, monkey
             return observed
 
     def unexpected(*args, **kwargs):
-        pytest.fail("Source-free Android runs should skip Git and source-based planning")
+        pytest.fail("Source-free app runs should skip Git and source-based planning")
 
     monkeypatch.setattr(app_pipeline, "AppDevice", DefectiveDevice)
     monkeypatch.setattr(app_pipeline, "fetch_repo", unexpected)
@@ -652,12 +690,21 @@ def test_native_pipeline_without_source_reports_device_findings(tmp_path, monkey
     monkeypatch.setattr(app_pipeline.native_ai, "plan", unexpected)
     monkeypatch.setattr(build, "_aapt2", lambda: None)
     monkeypatch.setattr(buildcheck, "_aapt2", lambda: None)
+    platform = "macos" if kind == "mac-app" else "android"
     target = "com.example.rn"
     if kind == "apk":
         apk = tmp_path / "app-release.apk"
         with ZipFile(apk, "w") as bundle:
             bundle.writestr("assets/index.android.bundle", "console.log('fixture');")
         target = str(apk)
+    elif kind == "mac-app":
+        from plistlib import dumps
+
+        bundle = tmp_path / "Fixture.app"
+        contents = bundle / "Contents"
+        contents.mkdir(parents=True)
+        (contents / "Info.plist").write_bytes(dumps({"CFBundleIdentifier": "com.example.fixture"}))
+        target = str(bundle)
 
     settings = Settings(
         database_url=f"sqlite:///{tmp_path / 'run.db'}",
@@ -669,12 +716,13 @@ def test_native_pipeline_without_source_reports_device_findings(tmp_path, monkey
     with session(settings.database_url) as db:
         run = Run(
             project="source-free",
-            platform="android",
+            platform=platform,
             repo_url="",
             live_url="uploaded-release.apk" if kind == "upload" else target,
             status="claimed",
             options={"phase2": True, "modules": ["rotation"], "journeys": True,
-                     "llm_intent": True, "load_test": True, "uploaded_apk": kind == "upload"},
+                     "llm_intent": True, "load_test": True, "uploaded_apk": kind == "upload",
+                     "test_mode": "frontend" if kind == "mac-app" else None},
         )
         db.add(run)
         db.commit()
@@ -693,14 +741,17 @@ def test_native_pipeline_without_source_reports_device_findings(tmp_path, monkey
         run = db.get(Run, run_id)
         assert run.status == "completed", (run.error, run.message)
         assert run.stats["code_available"] is False and run.stats["sources"] == []
-        assert run.stats["build"]["kind"] == ("installed" if kind == "installed" else "apk")
+        assert run.stats["build"]["kind"] == {"installed": "installed", "mac-app": "app"}.get(kind, "apk")
         assert run.stats["screens"] > 0 and run.stats["journeys"]["total"] == 0
         assert run.stats["load_test"]["status"] == "disabled"
         components = db.query(Component).filter_by(run_id=run_id).all()
         assert components and all(c.source == "observed" and not c.code_file for c in components)
         tests = db.query(Test).filter_by(run_id=run_id).all()
         assert any(t.technique == "content" and t.status == "fail" for t in tests)
-        assert any(t.technique == "build" for t in tests) == (kind != "installed")
+        if platform == "macos":
+            assert any(t.test_key == "desktop|traversal" for t in tests)
+            assert run.stats["desktop_coverage"]["controls_observed"] > 0
+        assert any(t.technique == "build" for t in tests) == (kind in ("apk", "upload"))
         finding = db.query(Finding).filter(Finding.run_id == run_id, Finding.title.contains("Invalid Date")).one()
         assert finding.category == "functional" and not finding.code_ref
         assert any(evidence["type"] == "screenshot" for evidence in finding.evidence)
@@ -789,5 +840,5 @@ def test_native_pipeline_two_sources_journeys_cleanup_and_load(tmp_path, monkeyp
     assert stats["ai"]["used"] is False  # no GEMINI_API_KEY: the plan from the code still ran
     run_dir = settings.artifacts_dir / "runs" / run_id
     html = (run_dir / "report.html").read_text()
-    assert "Backend API load test" in html and "Journeys and QA test data" in html and "backend:" in html
+    assert "Backend API load test" in html and "Journeys and QA test data" in html and "Backend ·" in html
     assert json.loads((run_dir / "qa_data.json").read_text())["records"] and (run_dir / "journeys.json").exists() and (run_dir / "backend.json").exists()

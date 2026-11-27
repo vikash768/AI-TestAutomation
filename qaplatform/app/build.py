@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import logging
 import os
 import plistlib
 import re
@@ -21,6 +22,7 @@ from pathlib import Path
 KIND_OF_SUFFIX = {".apk": "apk", ".aab": "aab", ".ipa": "ipa", ".app": "app", ".dmg": "dmg"}
 PLATFORM_OF_KIND = {"apk": "android", "ipa": "ios", "app": "macos", "dmg": "macos"}
 APP_ID_RE = re.compile(r"^[A-Za-z][\w-]*(\.[A-Za-z0-9_-]+)+$")
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -37,6 +39,22 @@ class BuildInfo:
     size_bytes: int = 0
     framework: str = ""  # react-native | flutter | electron | native
     extra: dict = field(default_factory=dict)
+    _dmg_device: str = field(default="", repr=False)
+
+    @property
+    def owns_mount(self) -> bool:
+        return bool(self._dmg_device)
+
+    def close(self) -> None:
+        """Detach a disk image attached during this run after the Appium session ends."""
+        if not self._dmg_device:
+            return
+        try:
+            subprocess.run(["hdiutil", "detach", self._dmg_device], capture_output=True, timeout=20, check=True)
+        except (OSError, subprocess.SubprocessError):
+            logger.warning("Could not detach the macOS build image %s", self._dmg_device, exc_info=True)
+        else:
+            self._dmg_device = ""
 
 
 def _sha256(path: Path) -> str:
@@ -90,25 +108,30 @@ def _inspect_app_bundle(app: Path, info: BuildInfo) -> None:
         raise RuntimeError(f"Not a macOS app bundle (Contents/Info.plist missing): {app}")
     with plist_path.open("rb") as fh:
         _plist(info, plistlib.load(fh))
+    if not info.app_id:
+        raise RuntimeError(f"macOS app bundle has no CFBundleIdentifier: {app}")
     if (app / "Contents" / "Frameworks" / "Electron Framework.framework").exists():
         info.framework = "electron"
     else:
         info.framework = "native"
 
 
-def mount_dmg(path: Path) -> Path:
+def _mount_dmg(path: Path, info: BuildInfo) -> Path:
     """Attach a DMG read-only (or reuse its mount) and return the single .app inside."""
     if sys.platform != "darwin":
         raise RuntimeError("DMG builds can only be mounted on macOS")
-    volumes: list[Path] = []
     listing = subprocess.run(["hdiutil", "info", "-plist"], capture_output=True, timeout=20, check=True)
-    for image in plistlib.loads(listing.stdout).get("images", []):
-        if Path(image.get("image-path", "")).resolve() == path.resolve():
-            volumes += [Path(e["mount-point"]) for e in image.get("system-entities", []) if e.get("mount-point")]
-    if not volumes:
+    image = next((image for image in plistlib.loads(listing.stdout).get("images", [])
+                  if image.get("image-path") and Path(image["image-path"]).resolve() == path.resolve()), None)
+    if image is None:
         attached = subprocess.run(["hdiutil", "attach", "-readonly", "-nobrowse", "-plist", str(path)], capture_output=True, timeout=120, check=True)
-        volumes = [Path(e["mount-point"]) for e in plistlib.loads(attached.stdout).get("system-entities", []) if e.get("mount-point")]
-    apps = sorted(a for v in volumes for a in v.glob("*.app") if a.is_dir())
+        image = plistlib.loads(attached.stdout)
+        entities = image.get("system-entities", [])
+        info._dmg_device = next((e["dev-entry"] for e in entities if re.fullmatch(r"/dev/disk\d+", e.get("dev-entry", ""))), "")
+        if not info.owns_mount:
+            info._dmg_device = next((e["mount-point"] for e in entities if e.get("mount-point")), "")
+    volumes = [Path(e["mount-point"]) for e in image.get("system-entities", []) if e.get("mount-point")]
+    apps = sorted(a for v in volumes for a in v.glob("*.app") if a.is_dir() and not a.is_symlink())
     if len(apps) != 1:
         raise RuntimeError(f"Expected exactly one .app in {path.name}; found {len(apps)}")
     return apps[0]
@@ -149,11 +172,15 @@ def resolve_build(spec: str, platform: str = "") -> BuildInfo:
                 if plists:
                     _plist(info, plistlib.loads(zf.read(plists[0])))
         elif kind == "dmg":
-            app = mount_dmg(path)
+            app = _mount_dmg(path, info)
             info.launch_path = str(app)
             _inspect_app_bundle(app, info)
         elif kind == "app":
             _inspect_app_bundle(path, info)
     except PermissionError as exc:
+        info.close()
         raise PermissionError(f"Cannot read {path}: {exc}. Grant this process access to the folder, or copy the build into artifacts/builds/") from exc
+    except BaseException:
+        info.close()
+        raise
     return info

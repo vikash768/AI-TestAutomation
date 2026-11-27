@@ -1,6 +1,6 @@
 # AI-TestAutomation
 
-Run web QA with a codebase and live URL. For Android, test a build on a device, review a backend repository, or do both in one run. iOS and macOS support source-assisted device testing. Findings and evidence appear in the run report and Grafana.
+Run web QA with a codebase and live URL. Android and macOS can test an app, review a backend repository, or do both in one run. iOS supports source-assisted device testing. Findings and evidence appear in the run report and Grafana.
 
 Web runs use Playwright. Native app runs use Appium (UiAutomator2 for Android, XCUITest for iOS, Mac2 for macOS) through the same stages, tables and dashboards; see [Native apps](#native-apps-android-ios-macos).
 
@@ -64,28 +64,42 @@ Finding record: severity, category (functional, stability, security, ui-responsi
 
 ## Native apps (Android, iOS, macOS)
 
-Select **Android app (Appium)**, choose a testing mode and enter a project name. For Frontend and Full, select or enter the build for each run.
+Select **Android app (Appium)** or **macOS desktop app (Appium)**, choose a testing mode, and enter a project name. Select or enter the app for each Frontend and Full run.
 
 | Mode | What to enter | What runs |
 |---|---|---|
-| **Frontend testing** | Upload an APK up to 512 MiB, enter its path on the host, or enter an installed app ID. | Checks the build when available, launches it through Appium, and reports device findings and screenshots. You can add an expected screen result. |
+| **Frontend testing** | Android APK upload, APK path, or package ID. On macOS, choose an installed app or enter a `.app` path, `.dmg` path, or bundle ID. | Exercises the app through Appium and reports findings and screenshots when available. You can add an expected screen result. |
 | **Backend testing** | The backend repository's HTTPS Git URL and a Git access token. | Reviews backend route declarations and authentication hints. You can verify an expected HTTP response from the deployed API. |
-| **Full testing** | The same backend Git URL and token, plus the APK or installed app ID. | Runs both sets of checks and reports separate Frontend and Backend outcomes, including checks completed before the other side was blocked. |
+| **Full testing** | One app target plus the backend Git URL and token. | Runs both sets of checks and reports separate Frontend and Backend outcomes, including checks completed before the other side was blocked. |
 
-Android device runs use the worker's configured screen budget. Their frontend source coverage is unavailable because they exercise a build directly. To add bounded GET performance checks in Backend or Full, enable **Backend API load test** and enter the deployed API base URL.
+Android and macOS Frontend and Full use the worker's configured exploration budgets. Their frontend source coverage is unavailable because they exercise the app directly. To add bounded GET performance checks in Backend or Full, enable **Backend API load test** and enter the deployed API base URL.
 
 - **Expected app screen.** Enter the control labels in navigation order, one per line, and the text you expect at the destination. Leave the path empty for the first screen after sign-in if sign-in is needed. The report checks observed screen text without regard to case, includes the screenshot when captured, and marks a path as blocked when exploration did not reach it.
 - **Expected API response.** Enter the deployed base URL and a GET path such as `/health`. The expected status defaults to `200`. Optionally enter a dotted JSON object field such as `service.ready` and its expected value, and supply a separate API bearer token for that request. Enter JSON literals like `true` or quoted strings like `"true"` to select the value and type. The report records the result without saving the response body or bearer token.
 - **Combined expectations.** When both expectations are supplied in Full testing, the report shows their individual results and whether both passed. Choose expectations from the same test fixture when the two checks should describe the same workflow.
 
-For iOS and macOS, enter a build path (`.ipa`, `.app`, `.dmg`) or installed app ID. Provide each Git URL or local path on its own line, starting with the app and optionally its backend, and enter a Git token for a private repository. Device runs can use a test account when the app opens on a sign-in screen.
+For iOS, enter an `.ipa` path or installed app ID. Provide each Git URL or local path on its own line, starting with the app and optionally its backend, and enter a Git token for a private repository. Device runs can use a test account when the app opens on a sign-in screen.
 
-Start the local host worker before submitting. The installation preserves existing app data by default. Uploaded APKs are held privately while the run is queued or in progress and removed when it completes or fails. New Git checkouts use a temporary private directory outside the report tree and are cleaned up at the end of each worker attempt.
+### macOS desktop testing
+
+1. Install Xcode and select it as the active developer directory. Install a Mac2 driver compatible with your Appium major version. For Appium 3, use `appium driver install mac2@4.6.1`. Run `appium driver doctor mac2` on the Mac. [Mac2 setup and permissions](https://appium.github.io/appium-mac2-driver/v4/getting-started/)
+2. Start the services with `make up` and the macOS host worker with `make app-worker-start`. The picker reads the App Catalog published by the host worker. It refreshes periodically and searches the standard system and user Applications folders.
+3. In the web UI, choose **macOS desktop app (Appium)**, select a mode, and enter the project name. For Frontend and Full, select an installed app or enter a path or bundle ID manually. For Backend and Full, enter the Git URL and token. Choose **Start run** and open the HTML report from the run page.
+
+Mac2 runs in the Mac's logged-in desktop session. Each local desktop run requests a fresh XCTest runner so macOS can authorize the new session. Keep the Mac unlocked and authenticate if **Enable Automation** appears. If a run stops while attaching to an open app, check the Xcode test log for denied UI testing access and review the Mac2 device preparation steps. Reports capture the tested window when available. Backend mode runs source and optional API checks through the host worker without opening an app. [Mac2 device preparation](https://appium.github.io/appium-mac2-driver/v4/getting-started/#device-preparation)
+
+On a local Mac worker, Frontend and Full open the selected installed app or bundle and verify its process before Mac2 attaches. If the picker finds several copies with the same bundle ID, it shows each path. Launch errors identify an invalid code signature, an app that exits during startup, or a different copy that opened. Electron apps open in GUI mode and request renderer accessibility. An Electron process that was already open may keep its original launch settings. [Electron environment variables](https://www.electronjs.org/docs/latest/api/environment-variables#electron_run_as_node) · [Chromium renderer accessibility](https://www.chromium.org/developers/design-documents/accessibility/)
+
+Desktop exploration walks accessible app windows, menus, tabs, disclosures, dialogs, and supported scroll areas. It exercises controls classified as safe and checks observed UI elements and eligible search or filter inputs. For readable checkboxes and switches, it verifies the state change and restores the initial setting. It opens dropdowns and records their choices. Choices that could change a saved setting are held back. Open **Desktop coverage** in the HTML report to see the counts by control type and reasons for missed controls. Desktop runs use `MACOS_MAX_SCREENS` and `MACOS_EXPLORATION_SECONDS`, which default to 120 discovered views and 900 seconds of exploration. A coverage row marked **Blocked** means the explorer could only verify part of the app UI.
+
+When a local desktop run finishes, the worker closes the Appium session and shuts down the XCTest runner it started.
+
+Start the local host worker before submitting. Android APK uploads accept up to 512 MiB. The installation preserves existing app data by default. Uploaded APKs are held privately while the run is queued or in progress and removed when it completes or fails. New Git checkouts use a temporary private directory outside the report tree and are cleaned up at the end of each worker attempt.
 
 | Stage | What happens on a device |
 |---|---|
 | 1 ingest | Inspects package metadata and, when app source is provided, extracts React Native screens, controls, labels, handlers and navigation or Electron menus. For a supplied Android APK, checks manifest settings, signing and JavaScript bundle hygiene. In Android Backend and Full, a failed backend checkout blocks route inventory while other configured checks can continue. |
-| 2 explore | Installs or launches the build (Appium starts on demand, an emulator boots if no device is connected). Signs in when the first screen is a sign-in form. Walks the screens depth-first and taps every control classed safe; each tap records what happened: another screen, nothing, a crash, an ANR, fatal or JavaScript errors in logcat, another app in front. On macOS each application menu is opened and its safe items chosen. |
+| 2 explore | Installs or launches the build (Appium starts on demand, an emulator boots if no device is connected). Signs in when the first screen is a sign-in form. It exercises controls classified as safe and records the response. On macOS, the explorer also records the app menus, nested views, and uncovered branches. |
 | 3 reconcile | Records the screens and controls seen on the device. When app source is available, associates observed controls with the source inventory using accessibility labels, text and test IDs. |
 | 4 execute | Per screen: blank screen, `undefined` / `NaN` / `[object Object]` shown to the user, controls with no accessible name or with code as their name, touch targets below 24 dp, overlapping or clipped controls, unmasked password fields. Per tap: crash, ANR, logged errors, the code's navigation target not reached. On the device: cold start time, sign-in negatives (empty, one wrong password, masking, account enumeration), rotation, background and resume, relaunch keeps the session, offline (Android), 300-character input into each reachable field, frame rendering (janky frames, `dumpsys gfxinfo`; held for review on an emulator) and memory (`dumpsys meminfo`). |
 | 5 judge | Every crash, ANR or error tap is reproduced twice from a fresh launch; heuristic findings start as `needs_review`. |
@@ -93,7 +107,7 @@ Start the local host worker before submitting. The installation preserves existi
 
 App findings include suggested fixes, source references when available, and reproduction steps and screenshots when recorded.
 
-**Journeys with QA test data** are available on source-assisted iOS and macOS submissions in the web form. A create journey fills fields with `qa_<run>_<HHMMSS>` values, submits, and checks the expected next screen. Boundary cases use constraints in app source such as `maxLength` and `required`. Gemini can suggest additional screen expectations and journeys. The runner validates planned steps against the safety rules.
+**Journeys with QA test data** are available on source-assisted iOS submissions in the web form and on compatible older source-assisted native runs. A create journey fills fields with `qa_<run>_<HHMMSS>` values, submits, and checks the expected next screen. Boundary cases use constraints in app source such as `maxLength` and `required`. Gemini can suggest additional screen expectations and journeys. The runner validates planned steps against the safety rules.
 
 - A step that would send QA data to the backend, directly or because the screen it opens stores a record that the app uploads in the background, ends the journey as **blocked** unless "Let journeys create QA records on the backend" is ticked. The LLM can make a step's effect stricter, never looser.
 - Bulk actions (sync all, upload all, clear) and sign-out are never used. Delete is used only in a row or screen that shows this run's own value.
@@ -102,7 +116,7 @@ App findings include suggested fixes, source references when available, and repr
 - Everything the run creates is in `qa_data.json` (written after each change). At the end, and from `finally` after a failure, overwritten fields get their earlier value back and records are deleted where the app allows; the rest is listed as a leftover in the report.
 - Expectations only the LLM supplied end as `needs_review` when they are not met. The LLM also reviews each journey's observed steps; anything it flags is `needs_review` only.
 
-**Backend API load test** uses bounded GET requests from the host worker. Android Backend and Full require the run's checkbox and deployed base URL and use public endpoints. Source-assisted iOS and macOS can also use configured load-test defaults or a discovered origin. The report includes request counts, error rate, throughput, and latency for each measured endpoint. Endpoints that need a runtime ID or unavailable authentication are listed as skipped. The existing `LOAD_TEST_*` settings control limits and failure thresholds. Device performance has its own section in the report.
+**Backend API load test** uses bounded GET requests from the host worker. Android and macOS Backend and Full require the run's checkbox and deployed base URL and use public endpoints. Source-assisted runs can use configured load-test defaults or a discovered origin. Reports include request counts, error rate, throughput, latency and endpoints that were skipped. The existing `LOAD_TEST_*` settings control limits and failure thresholds.
 
 Safety on a device, where writes cannot be intercepted:
 
@@ -112,11 +126,11 @@ Safety on a device, where writes cannot be intercepted:
 - macOS: the run stays inside the app. The system Apple menu (Sleep, Restart, Shut Down) is never read or clicked. The run moves the mouse and types on this Mac, so leave it alone while it runs.
 - Network is turned back on and the device rotated back to portrait after every check, even when the check fails.
 
-Requirements on the host: Node + `npm i -g appium`, then `appium driver install uiautomator2` (Android) and/or `appium driver install mac2` (macOS; grant Accessibility to the Appium/WebDriverAgent runner); Android SDK platform-tools and an emulator or a device with USB debugging. macOS may block reading builds in `~/Downloads` or `~/Desktop` from a terminal without Files and Folders access; grant it, or copy the build to `artifacts/builds/`.
+For Android, install Node, Appium and UiAutomator2, then configure Android SDK platform-tools and an emulator or a device with USB debugging. The macOS requirements are in the desktop setup above. For builds in protected macOS folders, grant the worker access or copy the build to `artifacts/builds/`.
 
 ```bash
 make run-android APP=/path/app-release.apk PROJECT=my-android-app
-make run-desktop REPO=https://github.com/jgraph/drawio-desktop APP=/Applications/draw.io.app
+make run-desktop APP=/Applications/draw.io.app PROJECT=desktop-qa
 ```
 
 Direct Android CLI runs require `--app` and `--project`.

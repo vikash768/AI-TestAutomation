@@ -1,102 +1,207 @@
 {% extends "base.html" %}
-{% block title %}Run {{ run.id }}{% endblock %}
+{% block title %}Run {{ run.id }} · AI-TestAutomation{% endblock %}
+{% block styles %}
+<style>
+{% include "report.css" %}
+{% include "run.css" %}
+</style>
+{% endblock %}
+{% block header %}
+<a class="skip-link" href="#run-title">Skip to run summary</a>
+<header class="report-top">
+  <div class="report-width">
+    <a class="back-link" href="/">← All runs</a>
+    <nav class="run-top-links" aria-label="Platform links">
+      <a href="{{ grafana_url }}" target="_blank" rel="noopener">Grafana</a>
+      <a href="/metrics">Metrics</a>
+    </nav>
+  </div>
+</header>
+{% endblock %}
+{% block main_attributes %} class="report-width run-page"{% endblock %}
+{% macro metric(value, label, note='') %}
+<div class="stat"><b>{{ value }}</b>{{ label }}{% if note %}<small>{{ note }}</small>{% endif %}</div>
+{% endmacro %}
+{% macro status_badge(status) %}
+<span class="run-status" id="status" data-status="{{ status }}" role="status">{{ status | replace('_', ' ') | capitalize }}</span>
+{% endmacro %}
 {% block body %}
-<h1>Run {{ run.id }} <span class="pill {{ run.status }}" id="status">{{ run.status }}</span></h1>
+{% set platform = run.platform or 'web' %}
 {% set test_mode = run.options.get('test_mode') if run.options else none %}
-<div class="card">
-<p>{% if run.platform and run.platform != 'web' %}<span class="pill">{{ run.platform }}</span> {% endif %}{% if test_mode %}<span class="pill">{{ test_mode | capitalize }} testing</span> {% endif %}{{ run.live_url }}{% if run.repo_url %} · {{ run.repo_url }}{% if run.commit_sha %} @ {{ run.commit_sha[:10] }}{% endif %}{% endif %}{% if run.framework %} · {{ run.framework }}{% endif %}</p>
-<div class="bar"><i id="bar" style="width:{{ run.progress }}%"></i></div>
-<p id="message"><b id="stage">{{ run.stage }}</b> · {{ run.message }}</p>
-<p id="no-worker" class="warn"{% if not waiting_for_worker %} hidden{% endif %}>No worker is running for <b>{{ run.platform or 'web' }}</b> runs, so this run will stay queued. Start one in a terminal in the project folder: <code id="no-worker-cmd">{{ waiting_for_worker }}</code> — the run starts within a few seconds.</p>
-{% if run.error %}<pre>{{ run.error }}</pre>{% endif %}
-<p>
-{% if report_exists %}<a href="/runs/{{ run.id }}/report" target="_blank">Open HTML report</a> · {% endif %}
-<a href="{{ grafana_url }}/d/qa-bugs/qa-bug-report?var-run={{ run.id }}" target="_blank" rel="noopener"><b>Bug report for developers (Grafana)</b></a> ·
-<a href="{{ grafana_url }}/d/qa-findings/qa-findings?var-run={{ run.id }}" target="_blank" rel="noopener">Findings in Grafana</a> ·
-<a href="/api/runs/{{ run.id }}">JSON</a>
-</p>
-{% if run.stats %}
-<div class="grid">
-{% if test_mode == 'backend' %}
-<div><b>{{ run.stats.get('backend', {}).get('routes', 0) }}</b><br><small>backend routes identified</small></div>
-{% elif run.stats.get('code_available') is sameas false %}
-<div><b>{{ run.stats.get('screens', 0) }}</b><br><small>screens explored</small></div>
-<div><b>{{ run.stats.get('observed_unmatched_visible', 0) }}</b><br><small>controls observed</small></div>
-<div><b>Source coverage unavailable</b></div>
-{% else %}
-<div><b>{{ run.stats.get('code_interactive', 0) }}</b><br><small>components in code</small></div>
-<div><b>{{ run.stats.get('matched', 0) }}</b><br><small>found on the live app</small></div>
-<div><b>{{ '%.0f' % (run.stats.get('coverage_interaction', run.stats.get('coverage', 0)) * 100) }}%</b><br><small>code components found (at rest {{ '%.0f' % (run.stats.get('coverage', 0) * 100) }}%)</small></div>
-{% endif %}
-{% if test_mode == 'full' %}
-<div><b>{{ run.stats.get('backend', {}).get('routes', 0) }}</b><br><small>backend routes identified</small></div>
-{% endif %}
-{% if test_mode != 'backend' %}
-<div><b>{{ '%.0f' % (run.stats.get('tested_ratio', 0) * 100) }}%</b><br><small>of found components tested</small></div>
-{% endif %}
-<div><b>{{ run.stats.get('tests', 0) }}</b><br><small>tests</small></div>
-<div><b>{{ run.stats.get('findings_total', 0) }}</b><br><small>findings ({{ run.stats.get('findings_needs_review', 0) }} need review)</small></div>
-<div><b>{{ run.stats.get('duration_seconds', 0) }}s</b><br><small>duration</small></div>
-</div>
-{% endif %}
-</div>
+{% set target = run.live_url.rsplit('/', 1)[-1] if platform != 'web' and run.live_url else run.live_url %}
+{% set stats = run.stats or {} %}
+{% set legs = stats.get('legs') or {} %}
+{% set outcome_labels = {'pass': 'Passed', 'fail': 'Failed', 'blocked': 'Blocked'} %}
+<section class="report-hero has-overview run-hero" aria-labelledby="run-title">
+  <div class="hero-intro">
+    <div class="report-scope">{{ {'ios': 'iOS', 'macos': 'macOS'}.get(platform, platform | capitalize) }}{% if test_mode %}<span aria-hidden="true">/</span>{{ test_mode | capitalize }} testing{% endif %}</div>
+    <h1 id="run-title">{{ 'Run results' if run.status == 'completed' else 'Run overview' }}</h1>
+    {% if target %}<p class="report-target">{{ target }}</p>{% endif %}
+    <p class="hero-meta">Run <code>{{ run.id }}</code>{% if run.framework %} · {{ run.framework }}{% endif %}</p>
+  </div>
+  {% if check_counts %}
+  <div class="check-overview run-check-summary">
+    <div class="run-progress-heading">
+      <p><strong>{{ check_counts.values() | sum }}</strong> checks recorded</p>
+      {{ status_badge(run.status) }}
+    </div>
+    <div class="result-bar" aria-hidden="true">
+      {% for key, _ in check_states if check_counts.get(key) %}<span class="result-{{ key }}" style="flex-grow:{{ check_counts[key] | int }}"></span>{% endfor %}
+    </div>
+    <ul class="result-legend">
+      {% for key, label in check_states if check_counts.get(key) or key in ('pass', 'fail', 'blocked') %}
+      <li><i class="result-{{ key }}" aria-hidden="true"></i><b>{{ check_counts.get(key, 0) }}</b> {{ label | lower }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% else %}
+  <div class="check-overview run-progress-card">
+    <div class="run-progress-heading">
+      <div><strong id="progress-value">{{ run.progress }}%</strong><span>Run progress</span></div>
+      {{ status_badge(run.status) }}
+    </div>
+    <div class="result-bar run-progress" id="progress" role="progressbar" aria-label="Run progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ run.progress }}">
+      <div id="bar" style="width:{{ run.progress }}%"></div>
+    </div>
+    <div class="run-current">
+      <b id="stage">{{ run.stage | replace('-', ' ') | replace('_', ' ') | capitalize }}</b>
+      <p id="message">{{ run.message }}</p>
+    </div>
+  </div>
+  {% endif %}
+</section>
 
-{% set legs = run.stats.get('legs') if run.stats else none %}
-{% if legs %}
-<h2>Testing outcomes</h2>
-<div class="card">
-<table>
-<thead><tr><th>Testing scope</th><th>Status</th><th>Details</th></tr></thead>
-<tbody>
-{% for scope in ('frontend', 'backend') %}
-{% if legs.get(scope) %}
-{% set leg = legs[scope] %}
-<tr><td>{{ scope | capitalize }}</td><td><b>{{ leg.status | capitalize }}</b></td><td>{{ leg.detail }}</td></tr>
+<nav class="run-actions" aria-label="Run resources">
+  {% if report_exists %}<a class="run-button primary" href="/runs/{{ run.id }}/report" target="_blank" rel="noopener">Open HTML report <span aria-hidden="true">↗</span></a>{% endif %}
+  <a class="run-button" href="{{ grafana_url }}/d/qa-bugs/qa-bug-report?var-run={{ run.id }}" target="_blank" rel="noopener">Developer bug report <span aria-hidden="true">↗</span></a>
+  <a class="run-button" href="{{ grafana_url }}/d/qa-findings/qa-findings?var-run={{ run.id }}" target="_blank" rel="noopener">Findings in Grafana <span aria-hidden="true">↗</span></a>
+  <a class="run-button run-json" href="/api/runs/{{ run.id }}">Run JSON</a>
+</nav>
+
+<section id="no-worker" class="run-notice" aria-labelledby="worker-title"{% if not waiting_for_worker %} hidden{% endif %}>
+  <h2 id="worker-title">Waiting for a worker</h2>
+  <p>Start a worker for <strong>{{ platform }}</strong> runs from the project folder to continue.</p>
+  <code id="no-worker-cmd">{{ waiting_for_worker }}</code>
+</section>
+
+{% if run.error %}
+<details class="run-panel run-error">
+  <summary>Run error details</summary>
+  <pre>{{ run.error }}</pre>
+</details>
 {% endif %}
-{% endfor %}
-</tbody>
-</table>
-{% if report_exists %}<p><a href="/runs/{{ run.id }}/report#tests">Open recorded checks and evidence</a></p>{% endif %}
-</div>
+
+{% if stats %}
+<section class="run-results" {% if legs %}aria-labelledby="results-title"{% else %}aria-label="Run metrics"{% endif %}>
+  {% if legs %}
+  <div class="panel-heading">
+    <h2 id="results-title">Testing outcomes</h2>
+    {% if report_exists %}
+    {% if stats.get('screens') and run.platform in ('android', 'ios', 'macos') and stats.get('test_mode') != 'backend' %}
+    <a class="run-inline-link" href="/runs/{{ run.id }}/report#screens">Open screen results <span aria-hidden="true">→</span></a>
+    {% else %}
+    <a class="run-inline-link" href="/runs/{{ run.id }}/report#tests">Open recorded checks and evidence <span aria-hidden="true">→</span></a>
+    {% endif %}
+    {% endif %}
+  </div>
+  <div class="outcomes">
+    {% for scope in ('frontend', 'backend') if legs.get(scope) %}
+    {% set leg = legs[scope] %}
+    <div class="leg"><strong>{{ scope | capitalize }}</strong><span class="badge status-{{ leg.status }}">{{ outcome_labels.get(leg.status, leg.status | capitalize) }}</span><span>{{ leg.detail }}</span></div>
+    {% endfor %}
+  </div>
+  {% if report_exists and stats.get('desktop_coverage') %}<p><a class="run-inline-link" href="/runs/{{ run.id }}/report#desktop-coverage">View desktop coverage <span aria-hidden="true">→</span></a></p>{% endif %}
+  {% endif %}
+  <details class="run-metrics"{% if run.status != 'completed' %} open{% endif %}>
+    <summary>Run metrics</summary>
+    <div class="stats run-stats">
+      {% if not check_counts %}{{ metric(stats.get('tests', 0), 'Tests recorded') }}{% endif %}
+      {{ metric(stats.get('findings_total', 0), 'Findings', (stats.get('findings_needs_review', 0) | string) ~ ' need review') }}
+      {{ metric(stats.get('duration_seconds', 0) ~ 's', 'Duration') }}
+      {% if test_mode in ('backend', 'full') %}
+        {{ metric(stats.get('backend', {}).get('routes', 0), 'Backend routes identified') }}
+      {% endif %}
+      {% if test_mode != 'backend' %}
+        {% if stats.get('code_available') is sameas false %}
+          {{ metric(stats.get('screens', 0), 'Screens explored') }}
+          {{ metric(stats.get('observed_unmatched_visible', 0), 'Controls observed') }}
+          {{ metric('N/A', 'Source coverage unavailable') }}
+        {% else %}
+          {{ metric(stats.get('code_interactive', 0), 'Components in code') }}
+          {{ metric(stats.get('matched', 0), 'Found on the live app') }}
+          {{ metric('%.0f%%' % (stats.get('coverage_interaction', stats.get('coverage', 0)) * 100), 'Code components found', '%.0f%% found at rest' % (stats.get('coverage', 0) * 100)) }}
+        {% endif %}
+        {{ metric('%.0f%%' % (stats.get('tested_ratio', 0) * 100), 'Found components tested') }}
+      {% endif %}
+    </div>
+  </details>
+</section>
 {% endif %}
 
 {% if findings %}
-<h2>Findings</h2>
-<div class="card"><table>
-<thead><tr><th>Severity</th><th>Status</th><th>Category</th><th>Route</th><th>Finding</th><th>Standard</th><th>Confidence</th><th>Review</th></tr></thead>
-<tbody>
-{% for f in findings %}
-<tr><td><span class="pill {{ f.severity }}">{{ f.severity }}</span></td><td>{{ f.status }}</td><td>{{ f.category }}</td><td>{{ f.route }}{% if f.viewport %} <small>@{{ f.viewport }}</small>{% endif %}</td>
-<td><b>{{ f.title }}</b><br><small>Expected: {{ f.expected }}<br>Observed: {{ f.observed }}{% if f.fix %}<br><b>Fix in {{ f.fix_in }}{% if f.code_ref %} · {{ f.code_ref }}{% endif %}:</b> {{ f.fix }}{% endif %}</small></td><td><small>{{ f.standard_ref }}</small></td><td>{{ '%.2f' % f.confidence }} ({{ f.reproduced_n }}/{{ f.reproduced_m }})</td>
-<td><form method="post" action="/api/findings/{{ f.id }}/label" style="display:flex;gap:4px"><button name="verdict" value="true_positive" style="margin:0;padding:4px 8px;background:var(--ok)">real</button><button name="verdict" value="false_positive" style="margin:0;padding:4px 8px;background:var(--crit)">not a bug</button></form></td></tr>
-{% endfor %}
-</tbody></table></div>
+<section class="findings-section run-findings" aria-labelledby="run-findings-title">
+  <div class="section-heading"><h2 id="run-findings-title">Findings</h2></div>
+  <div class="finding-list">
+    {% for f in findings %}
+    <article class="finding-card accent-{{ f.severity }}">
+      <div class="finding-lead">
+        <div class="finding-badges">
+          <span class="badge severity-{{ f.severity }}">{{ f.severity | capitalize }}</span>
+          <span class="badge status-{{ f.status | replace('_', '-') }}">{{ f.status | replace('_', ' ') | capitalize }}</span>
+        </div>
+        <h3>{{ f.title }}</h3>
+        <div class="finding-meta">
+          {% if f.category %}<span>{{ f.category }}</span>{% endif %}
+          {% if f.route %}<span>{{ f.route.removeprefix('screen:') }}</span>{% endif %}
+          {% if f.viewport %}<span>{{ f.viewport }}</span>{% endif %}
+        </div>
+      </div>
+      {% if f.expected or f.observed %}
+      <dl class="finding-comparison">
+        {% if f.observed %}<div><dt>Observed</dt><dd>{{ f.observed }}</dd></div>{% endif %}
+        {% if f.expected %}<div><dt>Expected</dt><dd>{{ f.expected }}</dd></div>{% endif %}
+      </dl>
+      {% endif %}
+      <details class="finding-details">
+        <summary>Technical details</summary>
+        <div>
+          {% if f.description %}<p>{{ f.description }}</p>{% endif %}
+          {% if f.fix or f.code_ref %}
+          <div class="finding-fix"><strong>{% if f.fix_in %}Fix in {{ f.fix_in }}{% else %}Suggested fix{% endif %}</strong>{% if f.code_ref %} <code>{{ f.code_ref }}</code>{% endif %}{% if f.fix %}<p>{{ f.fix }}</p>{% endif %}</div>
+          {% endif %}
+          <dl class="finding-facts">
+            {% if f.standard_ref %}<div><dt>Standard</dt><dd>{{ f.standard_ref }}</dd></div>{% endif %}
+            <div><dt>Confidence</dt><dd>{{ '%.2f' % f.confidence }} ({{ f.reproduced_n }}/{{ f.reproduced_m }} reproduced)</dd></div>
+          </dl>
+        </div>
+      </details>
+      <form class="finding-review" method="post" action="/api/findings/{{ f.id }}/label" aria-label="Review {{ f.title }}">
+        <button class="review-real" name="verdict" value="true_positive">Mark as real</button>
+        <button name="verdict" value="false_positive">Not a bug</button>
+      </form>
+    </article>
+    {% endfor %}
+  </div>
+</section>
 {% endif %}
+<div class="run-layout">
+  {% include "run_activity.html" %}
+  <aside class="run-panel run-context" aria-labelledby="context-title">
+    <div class="panel-heading"><h2 id="context-title">Run details</h2></div>
+    <dl>
+      <div><dt>Project</dt><dd>{{ run.project }}</dd></div>
+      {% if run.live_url and target != run.live_url %}<div><dt>Build path</dt><dd><code>{{ run.live_url }}</code></dd></div>{% endif %}
+      {% if run.repo_url %}
+      <div><dt>Repository</dt><dd>{{ run.repo_url }}{% if run.commit_sha %}<small>Commit <code>{{ run.commit_sha[:10] }}</code></small>{% endif %}</dd></div>
+      {% endif %}
+      {% if run.created_at %}<div><dt>Created</dt><dd><time datetime="{{ run.created_at.isoformat() }}">{{ run.created_at.strftime('%d %b %Y, %H:%M %Z') | trim }}</time></dd></div>{% endif %}
+      {% if run.started_at %}<div><dt>Started</dt><dd><time datetime="{{ run.started_at.isoformat() }}">{{ run.started_at.strftime('%d %b %Y, %H:%M %Z') | trim }}</time></dd></div>{% endif %}
+      {% if run.finished_at %}<div><dt>Finished</dt><dd><time datetime="{{ run.finished_at.isoformat() }}">{{ run.finished_at.strftime('%d %b %Y, %H:%M %Z') | trim }}</time></dd></div>{% endif %}
+    </dl>
+  </aside>
+</div>
 
-<h2>Log</h2>
-<div class="card"><pre id="log">{% for e in events %}{{ e.ts.strftime('%H:%M:%S') }} [{{ e.stage }}] {{ e.message }}
-{% endfor %}</pre></div>
 <script>
-(function(){
-  const status = "{{ run.status }}";
-  if (status === "completed" || status === "failed") return;
-  async function tick(){
-    try {
-      const r = await fetch("/api/runs/{{ run.id }}"); const j = await r.json();
-      document.getElementById("bar").style.width = j.progress + "%";
-      const pill = document.getElementById("status");
-      pill.textContent = j.status; pill.className = "pill " + j.status;
-      const msg = document.getElementById("message");  // rebuilt each time: it holds the stage
-      msg.textContent = " · " + (j.message || ""); const b = document.createElement("b"); b.id = "stage"; b.textContent = j.stage; msg.prepend(b);
-      document.getElementById("no-worker").hidden = !j.waiting_for_worker;
-      if (j.waiting_for_worker) document.getElementById("no-worker-cmd").textContent = j.waiting_for_worker;
-      const ev = await fetch("/api/runs/{{ run.id }}/events"); const events = await ev.json();
-      document.getElementById("log").textContent = events.map(e => e.ts.slice(11,19) + " [" + e.stage + "] " + e.message).join("\n");
-      if (j.status === "completed" || j.status === "failed") { location.reload(); return; }
-    } catch (e) {}
-    setTimeout(tick, 4000);
-  }
-  setTimeout(tick, 4000);
-})();
+{% include "run_live.js" %}
 </script>
 {% endblock %}

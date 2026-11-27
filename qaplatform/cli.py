@@ -2,7 +2,7 @@
 
     python -m qaplatform.cli run --repo <git url or path> --live <url> [--project x] [--max-pages 60]
     python -m qaplatform.cli run --platform android --app <path.apk | package id> --project <name>
-    python -m qaplatform.cli run --platform macos --repo <git url or path> --app <path.app | path.dmg | bundle id>
+    python -m qaplatform.cli run --platform macos --app <path.app | path.dmg | bundle id> [--repo <git url or path>]
 
 Credentials come from VALID_USER_EMAIL / VALID_USER_PASSWORD (or --email/--password).
 Supply repository URLs and private repository tokens per run with --repo and --github-token.
@@ -58,10 +58,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.platform == "android" and not project:
         print("--project is required for Android runs", file=sys.stderr)
         return 2
+    default_max_pages = {"web": settings.max_pages, "macos": settings.macos_max_screens}.get(args.platform, settings.max_screens)
     init_db(settings.database_url)
     with session(settings.database_url) as db:
         run = Run(project=project or "default", platform=args.platform, repo_url=args.repo, live_url=target, status="claimed", stage="claimed",
-                  options={"max_pages": args.max_pages or (settings.max_pages if args.platform == "web" else settings.max_screens), "llm_intent": not args.no_llm, "phase2": not args.no_phase2,
+                  options={"max_pages": args.max_pages or default_max_pages, "llm_intent": not args.no_llm, "phase2": not args.no_phase2,
                            "modules": [m.strip() for m in args.modules.split(",") if m.strip()] or None, "branch": args.branch, "clean_start": args.clean_start},
                   secrets=encrypt_secrets(settings.secret_key, {"email": args.email, "password": args.password, "github_token": args.github_token}))
         db.add(run)

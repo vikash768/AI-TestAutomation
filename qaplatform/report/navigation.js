@@ -45,7 +45,8 @@
   }
 
   function selectFromHash() {
-    const item = sections.find(item => item.link.hash === window.location.hash);
+    const target = document.getElementById(window.location.hash.slice(1));
+    const item = target && sections.find(item => item.section.contains(target));
     if (item) {
       // Short sections can share the same landing position at the end of the page.
       anchorScrollY = window.scrollY;

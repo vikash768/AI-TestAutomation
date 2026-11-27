@@ -10,6 +10,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -24,21 +25,23 @@ REPORT_CSS = Path(__file__).with_name("report.css")
 REPORT_NAVIGATION = Path(__file__).with_name("navigation.js")
 REPORT_LAYOUT_MARKER = '<meta name="qa-report-layout" content="2">'
 REPORT_NAVIGATION_MARKER = '<meta name="qa-report-navigation" content="1">'
+SCREEN_RESULTS_MARKER = '<meta name="qa-screen-results" content="1">'
 CHECK_STATES = (
     ("pass", "Passed"), ("fail", "Failed"), ("blocked", "Blocked"),
     ("flaky", "Flaky"), ("needs_review", "Needs review"),
 )
 STATUS_LABELS = dict(CHECK_STATES)
+CHECK_PRIORITY = {state: i for i, state in enumerate(("fail", "flaky", "needs_review", "blocked", "pass"))}
 
 
 def _e(s) -> str:
     return html.escape(str(s if s is not None else ""))
 
 
-def _badge(value: str, kind: str = "status") -> str:
+def _badge(value: str, kind: str = "status", *, label: str = "") -> str:
     value = value or "unknown"
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-    label = STATUS_LABELS.get(value, value.replace("_", " ").capitalize())
+    label = label or STATUS_LABELS.get(value, value.replace("_", " ").capitalize())
     return f'<span class="badge {kind}-{slug}">{_e(label)}</span>'
 
 
@@ -160,8 +163,11 @@ def _perf_section(stats: dict, tests: list[TestRecord]) -> str:
     device = [t for t in tests if t.technique in DEVICE_PERF_TECHNIQUES]
     drows = "".join(f"<tr><td>{_e(t.name)}</td><td>{_e(t.expected)}</td><td>{_e(t.observed)}</td><td>{_badge(t.status)}</td></tr>" for t in device)
     lt = stats.get("load_test") or {}
-    device_summary = "" if stats.get("test_mode") == "backend" else f"""<h3>Mobile device performance</h3>
-<p>Device-level measurements for cold start, rendering, and memory.</p>
+    desktop = stats.get("platform") == "macos"
+    title = "macOS app performance" if desktop else "Mobile device performance"
+    description = "Desktop app launch checks." if desktop else "Device-level measurements for cold start, rendering, and memory."
+    device_summary = "" if stats.get("test_mode") == "backend" else f"""<h3>{title}</h3>
+<p>{description}</p>
 <div class="table-wrap" tabindex="0" role="region" aria-label="Device performance checks">
 <table><thead><tr><th>Check</th><th>Expected</th><th>Observed</th><th>Status</th></tr></thead><tbody>{drows or '<tr><td colspan="4">No device performance checks ran.</td></tr>'}</tbody></table></div>"""
     if stats.get("test_mode") == "frontend":
@@ -210,6 +216,36 @@ def _held_section(stats: dict) -> str:
 <table><thead><tr><th>Screen</th><th>Control</th><th>Class</th><th>Why it was held</th></tr></thead><tbody>{rows or '<tr><td colspan="4">None.</td></tr>'}</tbody></table></div></details>"""
 
 
+def _desktop_coverage_section(stats: dict, run_dir: Path, run_id: str) -> str:
+    coverage = stats.get("desktop_coverage")
+    if not coverage:
+        return ""
+    summary = ("The explorer exercised the discovered safe controls." if coverage.get("complete_within_scope")
+               else "Some desktop views or controls could not be tested in this run.")
+    metrics = "".join(_stat(coverage.get(key, 0), label) for key, label in (
+        ("states_walked", "views inspected"), ("controls_observed", "controls discovered"),
+        ("exercised", "controls exercised"), ("held", "held back"), ("unreachable", "unreached"),
+    ))
+    role_labels = {"combobox": "Dropdown", "menuitem": "Menu item", "radio": "Radio button", "switch": "Toggle switch", "treeitem": "Tree item"}
+    types = "".join(
+        f"<tr><th scope='row'>{_e(role_labels.get(role, role.title()))}</th><td>{_e(counts.get('observed', 0))}</td>"
+        f"<td>{_e(counts.get('exercised', 0))}</td><td>{_e(counts.get('held', 0))}</td><td>{_e(counts.get('unreachable', 0))}</td></tr>"
+        for role, counts in sorted(coverage.get("control_types", {}).items())
+    )
+    breakdown = f'''<div class="table-wrap" tabindex="0" role="region" aria-label="Desktop coverage by control type">
+<table><thead><tr><th>Control type</th><th>Discovered</th><th>Exercised</th><th>Held</th><th>Unreached</th></tr></thead>
+<tbody>{types}</tbody></table></div>''' if types else ""
+    notes = dict.fromkeys([*coverage.get("limits", []), *coverage.get("warnings", [])])
+    reasons = "<ul>" + "".join(f"<li>{_e(note)}</li>" for note in notes) + "</ul>" if notes else ""
+    unreached = "".join(f"<tr><td>{_e(item.get('screen'))}</td><td>{_e(item.get('label') or 'Unnamed control')}</td>"
+                        f"<td>{_e(item.get('reason'))}</td></tr>" for item in coverage.get("unreachable_items", []))
+    pending = f'''<details><summary>Unreached controls</summary>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Unreached desktop controls">
+<table><thead><tr><th>Screen</th><th>Control</th><th>Reason</th></tr></thead><tbody>{unreached}</tbody></table></div></details>''' if unreached else ""
+    trace = _link("explore.json", run_dir, run_id, "Open exploration details")
+    return f'<h2>Desktop coverage</h2><p>{summary}</p><div class="stats">{metrics}</div>{breakdown}{reasons}{pending}{trace}'
+
+
 def _test_result(*, name: str, meta: str, status: str, duration: str, expected: str, observed: str,
                  steps: str = "", evidence: str = "", facts: tuple[tuple[str, str], ...] = ()) -> str:
     """Render a test with escaped text fields and preformatted steps and evidence."""
@@ -229,17 +265,144 @@ def _test_result(*, name: str, meta: str, status: str, duration: str, expected: 
 </dl>{sections}</div></details>"""
 
 
-def _test_table(tests: list[TestRecord], run_dir: Path, run_id: str) -> str:
+def _test_list(tests: list[TestRecord], run_dir: Path, run_id: str) -> str:
     rows = []
-    order = {"fail": 0, "flaky": 1, "needs_review": 2, "blocked": 3, "pass": 4}
-    for t in sorted(tests, key=lambda t: (order.get(t.status, 9), t.category, t.route)):
+    for t in sorted(tests, key=lambda t: (CHECK_PRIORITY.get(t.status, 9), t.category, t.route)):
         rows.append(_test_result(
             name=t.name, meta=" · ".join(value for value in (t.category, t.technique, t.route) if value),
             status=t.status, duration=f"{t.duration_ms} ms", expected=t.expected, observed=t.observed,
             steps=_steps(t.steps), evidence=_evidence(t.evidence, run_dir, run_id),
             facts=(("Code", t.code_ref), ("QA data", t.qa_data), ("Cleanup", t.cleanup)),
         ))
-    return '<h2 id="tests">Tests</h2><div class="test-list">' + ("".join(rows) or "<p>No tests were recorded.</p>") + "</div>"
+    return '<div class="test-list">' + ("".join(rows) or "<p>No tests were recorded.</p>") + "</div>"
+
+
+def _screen_outcomes(counts: Counter) -> str:
+    return "".join(_badge(status, label=f"{counts[status]} {label.lower()}")
+                   for status, label in CHECK_STATES if counts[status])
+
+
+def _screen_screenshot(pages: list[ObservedPage], title: str, run_dir: Path, run_id: str) -> str:
+    shots = {}
+    for page in pages:
+        paths = [page.screenshot, *(v.get("screenshot", "") for v in page.viewports.values() if isinstance(v, dict))]
+        for path in paths:
+            if path and Path(path).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+                if href := artifact_href(path, run_dir, run_id):
+                    shots[href] = None
+    if not shots:
+        return '<p class="screen-no-shot">Screenshot unavailable</p>'
+    href, *additional = shots
+    others = "".join(f'<a class="evidence-link" href="{_e(url)}" target="_blank" rel="noopener">Screenshot {i}</a>'
+                     for i, url in enumerate(additional, start=2))
+    return f'''<figure class="screen-screenshot">
+<a href="{_e(href)}" target="_blank" rel="noopener" aria-label="Open full screenshot of {_e(title)} in a new tab">
+<img src="{_e(href)}" alt="Screenshot of {_e(title)}" loading="lazy" decoding="async">
+<span>Open full screenshot <span aria-hidden="true">↗</span></span></a>
+{f'<figcaption>{others}</figcaption>' if others else ''}</figure>'''
+
+
+def _screen_metrics(pages: list[ObservedPage]) -> str:
+    viewports = (v for p in pages for v in p.viewports.values() if isinstance(v, dict))
+    issues = sum(v.get("issues", sum(len(v.get(key) or []) for key in ("overflowing", "overlaps", "smallTargets", "clipped"))) for v in viewports)
+    longest_load = max(p.load_ms for p in pages)
+    values = [
+        ("Longest screen load" if len(pages) > 1 else "Screen load time", f"{longest_load} ms" if longest_load else ""),
+        ("Console errors", sum(len(p.console_errors) + len(p.page_errors) for p in pages)),
+        ("Failed requests", sum(len(p.failed_requests) for p in pages)),
+        ("Layout issues", issues),
+    ]
+    rows = "".join(f"<div><dt>{label}</dt><dd>{value}</dd></div>" for label, value in values if value)
+    return f'<dl class="screen-metrics">{rows}</dl>' if rows else ""
+
+
+def _screen_component_table(components: list[ComponentRecord], tests: list[TestRecord], title: str) -> str:
+    if not components:
+        return '<p class="screen-empty">No components were recorded on this screen.</p>'
+    checks: dict[str, Counter] = defaultdict(Counter)
+    for test in tests:
+        if test.component_key:
+            checks[test.component_key][test.status] += 1
+    rows = []
+    for component in sorted(components, key=lambda c: (
+        min((CHECK_PRIORITY.get(status, 9) for status in checks.get(c.key, {c.status: 1})), default=9),
+        (c.name or c.label).casefold(), c.kind,
+    )):
+        name = component.name or component.label or component.selector or "Unnamed control"
+        recorded = checks[component.key]
+        results = _screen_outcomes(recorded) or _badge(component.status)
+        detail = _e(component.notes) if component.status in ("blocked", "skipped") and not recorded else ""
+        kind = {"input": "Text field", "select": "Dropdown", "menuitem": "Menu item", "switch": "Toggle"}.get(component.kind, component.kind.capitalize())
+        rows.append(f'''<tr><th scope="row">{_e(name)}</th><td>{_e(kind)}</td>
+<td><div class="screen-outcomes">{results}</div>{f'<small>{detail}</small>' if detail else ''}</td></tr>''')
+    return f'''<div class="table-wrap screen-components" tabindex="0" role="region" aria-label="Components on {_e(title)}">
+<table><thead><tr><th scope="col">Component</th><th scope="col">Type</th><th scope="col">Result</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table></div>'''
+
+
+def _screen_results(pages: list[ObservedPage], components: list[ComponentRecord], tests: list[TestRecord],
+                    run_dir: Path, run_id: str) -> tuple[str, list[ComponentRecord], list[TestRecord]]:
+    pages_by_route = defaultdict(list)
+    route_by_url = {}
+    for page in pages:
+        pages_by_route[page.route].append(page)
+        if page.url:
+            route_by_url[page.url] = page.route
+    comp_by_route, tests_by_route = defaultdict(list), defaultdict(list)
+    route_by_component = {}
+    other_components, other_tests = [], []
+    for component in components:
+        route = route_by_url.get(component.page_url, component.route)
+        if component.source != "code" and route in pages_by_route:
+            comp_by_route[route].append(component)
+            route_by_component[component.key] = route
+        else:
+            other_components.append(component)
+    for test in tests:
+        route = route_by_component.get(test.component_key)
+        if route is None and test.technique not in DEVICE_PERF_TECHNIQUES and test.category != "platform":
+            route = test.route
+        if route in pages_by_route:
+            tests_by_route[route].append(test)
+        else:
+            other_tests.append(test)
+    if not pages_by_route:
+        return '<h2>Screens</h2><p class="empty-state">No screens were captured.</p>', other_components, other_tests
+
+    titles = {route: views[0].title or route.removeprefix("screen:") or "Untitled screen" for route, views in pages_by_route.items()}
+    repeated = Counter(titles.values())
+    cards, index = [], []
+    for number, (route, views) in enumerate(pages_by_route.items(), start=1):
+        route_label = route.removeprefix("screen:")
+        path = [label for label in views[0].state.get("path", []) if label]
+        title = titles[route]
+        if repeated[title] > 1:
+            title = path[-1] if path else (route_label or title)
+        breadcrumb = " → ".join(path)
+        subtitle = breadcrumb if breadcrumb and breadcrumb != title else route_label
+        screen_tests = tests_by_route[route]
+        screen_components = comp_by_route[route]
+        anchor = f"screen-{number}"
+        label = _e(title)
+        status_counts = Counter(test.status for test in screen_tests)
+        counts = _screen_outcomes(status_counts)
+        components_html = _screen_component_table(screen_components, screen_tests, title)
+        tests_html = (f'<details class="screen-checks"><summary>Checks and evidence ({len(screen_tests)})</summary>'
+                      f'{_test_list(screen_tests, run_dir, run_id)}</details>') if screen_tests else ''
+        count_label = f"{len(screen_tests)} {'check' if len(screen_tests) == 1 else 'checks'}"
+        if status_counts["fail"]:
+            count_label += f' · {status_counts["fail"]} failed'
+        index.append(f'<li><a href="#{anchor}"><strong>{label}</strong><span>{count_label}</span></a></li>')
+        cards.append(f'''<article class="screen-card" id="{anchor}" aria-labelledby="{anchor}-title">
+<header class="screen-header"><div><h3 id="{anchor}-title">{label}</h3>
+{f'<p>{_e(subtitle)}</p>' if subtitle and subtitle != title else ''}</div>
+<div class="screen-outcomes">{counts or '<span class="screen-empty">No recorded checks</span>'}</div></header>
+<div class="screen-body">
+{_screen_screenshot(views, title, run_dir, run_id)}
+<div class="screen-results">{components_html}{_screen_metrics(views)}</div></div>
+{tests_html}</article>''')
+    screen_index = '<nav class="screen-index" aria-label="Jump to a screen"><ul>' + ''.join(index) + '</ul></nav>' if len(index) > 1 else ""
+    return '<h2>Screens</h2>' + screen_index + '<div class="screen-list">' + ''.join(cards) + '</div>', other_components, other_tests
 
 
 def _finding_card(*, severity: str, status: str, title_html: str, category_html: str = "", route_html: str = "",
@@ -288,13 +451,17 @@ def navigation_script() -> str:
 
 
 def _report_document(run_id: str, *, mode: str = "", platform: str = "", target: str = "", meta_html: str = "", summary_html: str = "",
-                     counts: dict | None = None, legs_html: str = "", findings_html: str = "", sections=()) -> str:
+                     counts: dict | None = None, legs_html: str = "", screen_html: str = "", findings_html: str = "", sections=()) -> str:
     section_items = [(anchor, label, body) for anchor, label, body in sections if body]
     with_overview = " has-overview" if counts is not None else ""
     scopes = "<span aria-hidden=\"true\"> / </span>".join(_e(x) for x in (platform, mode) if x)
-    nav_html = '<a href="#findings" aria-current="location">Findings</a>' + "".join(
-        f'<a href="#{_e(anchor)}">{_e(label)}</a>' for anchor, label, _ in section_items
-    )
+    primary = "screens" if screen_html else "findings"
+    links = [("screens", "Screens")] if screen_html else []
+    links.append(("findings", "Findings"))
+    links.extend((anchor, label) for anchor, label, _ in section_items)
+    active_link = ' aria-current="location"'
+    nav_html = "".join(f'<a href="#{_e(anchor)}"{active_link if anchor == primary else ""}>{_e(label)}</a>'
+                       for anchor, label in links)
     blocks = []
     for anchor, _, body in section_items:
         attribute = f'id="{_e(anchor)}"'
@@ -302,11 +469,13 @@ def _report_document(run_id: str, *, mode: str = "", platform: str = "", target:
         blocks.append(f'<section class="report-section"{block_id}>{body}</section>')
     section_html = "".join(blocks)
     empty_findings = '<p class="empty-state">No findings were recorded for this run.</p>'
+    screen_section = f'<section class="report-section screen-section" id="screens">{screen_html}</section>' if screen_html else ''
+    marker = SCREEN_RESULTS_MARKER if screen_html else ''
     return f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-{REPORT_LAYOUT_MARKER}{REPORT_NAVIGATION_MARKER}<title>QA report · {_e(run_id)}</title>
+{REPORT_LAYOUT_MARKER}{REPORT_NAVIGATION_MARKER}{marker}<title>QA report · {_e(run_id)}</title>
 <style>{REPORT_CSS.read_text(encoding="utf-8")}</style></head>
-<body><a class="skip-link" href="#findings">Skip to findings</a>
+<body><a class="skip-link" href="#{primary}">Skip to {primary}</a>
 <header class="report-top"><div class="report-width">
   <a class="back-link" href="/runs/{quote(run_id, safe='')}">← Back to run</a>
   <span class="report-id">Run <code>{_e(run_id)}</code></span>
@@ -323,6 +492,7 @@ def _report_document(run_id: str, *, mode: str = "", platform: str = "", target:
   <nav class="jump-nav" aria-label="Report sections">{nav_html}</nav>
   {legs_html}
   {f'<details class="run-metrics"><summary>Run metrics</summary>{summary_html}</details>' if summary_html else ''}
+  {screen_section}
   <section class="findings-section" id="findings" aria-labelledby="findings-title">
     <div class="section-heading">
       <h2 id="findings-title">Findings</h2>
@@ -379,8 +549,14 @@ def _format_finished(value: str | None) -> str:
     return stamp.strftime("%d %b %Y, %H:%M UTC")
 
 
-def write_report(run_dir: Path, run_id: str, meta: dict, stats: dict, pages: list[ObservedPage], components: list[ComponentRecord], tests: list[TestRecord], findings: list[FindingRecord]) -> Path:
+def render_report(run_dir: Path, run_id: str, meta: dict, stats: dict, pages: list[ObservedPage], components: list[ComponentRecord],
+                  tests: list[TestRecord], findings: list[FindingRecord], *, archived: bool = False) -> str:
     native = stats.get("platform") in NATIVE
+    mode = stats.get("test_mode")
+    show_device_evidence = mode != "backend" and (mode != "full" or bool(pages))
+    screen_html, other_components, other_tests = "", components, tests
+    if native and show_device_evidence:
+        screen_html, other_components, other_tests = _screen_results(pages, components, tests, run_dir, run_id)
     seen = set()
     uniq = []
     for f in findings:
@@ -403,12 +579,12 @@ def write_report(run_dir: Path, run_id: str, meta: dict, stats: dict, pages: lis
             steps_html=_steps(f.steps), evidence_html=_evidence(f.evidence, run_dir, run_id),
         ))
     comp_rows = []
-    for c in sorted(components, key=lambda c: (c.route, c.kind, c.label or c.name)):
+    for c in sorted(other_components, key=lambda c: (c.route, c.kind, c.label or c.name)):
         via = " > ".join(s.get("name") or "?" for s in (c.reveal or []))
         ai = (c.intent or {}).get("llm_expected")
         comp_rows.append(f"<tr class='cst-{_e(c.status)}'><td>{_e(c.route)}</td><td>{_e(c.kind)}</td><td>{_e(c.label or c.name)}</td><td>{_e(c.source)}</td><td><small>{_e(via)}</small></td><td>{_e(c.action_class)}</td><td>{_e(c.status)}</td><td><small>{_e(c.code_file)}{(':' + str(c.code_line)) if c.code_line else ''}</small></td><td><small>{_e('; '.join((c.intent or {}).get('expected', [])[:3]))}{('<br><i>AI: ' + _e(ai) + '</i>') if ai else ''}</small></td><td><small>{_e(c.notes)}</small></td></tr>")
     page_rows = []
-    for p in pages:
+    for p in pages if not native else []:
         issues = sum(len(v.get(x, []) or []) for v in p.viewports.values() if isinstance(v, dict) for x in ("overflowing", "overlaps", "smallTargets", "clipped"))
         shots = " ".join(x for x in (_link(v.get("screenshot", ""), run_dir, run_id, k) for k, v in p.viewports.items() if isinstance(v, dict) and v.get("screenshot")) if x)
         page_rows.append(f"<tr><td>{_e(p.route)}</td><td>{_e(p.title)}</td><td>{_e(p.status_code)}</td><td>{len(p.elements)}</td><td>{len(p.console_errors) + len(p.page_errors)}</td><td>{len(p.failed_requests)}</td><td>{issues}</td><td>{p.load_ms} ms</td><td>{shots}</td></tr>")
@@ -431,30 +607,38 @@ def write_report(run_dir: Path, run_id: str, meta: dict, stats: dict, pages: lis
 <div class="stat"><b>{len(tests)}</b>tests ({', '.join(f'{k} {v}' for k, v in sorted(test_counts.items()))})</div>
 <div class="stat"><b>{sum(1 for f in uniq if f.status == 'reported')}</b>findings reported ({sum(1 for f in uniq if f.status != 'reported')} need review)</div>
 </div>"""
-    mode = stats.get("test_mode")
-    show_device_evidence = mode != "backend" and (mode != "full" or bool(pages))
     backend_section = ""
     if mode in ("backend", "full"):
         inventory = _link("backend.json", run_dir, run_id, "Open backend route inventory")
         backend_section = f"<h2>Backend source review</h2><p>API routes identified from source. {inventory}</p>"
-    noun = "Screens" if native else "Pages"
     expected_heading = "Expected" if native and stats.get("code_available") is False else "Expected (from code)"
-    device_pages = "" if not show_device_evidence else f"""<h2>{noun}</h2>
-<div class="table-wrap" tabindex="0" role="region" aria-label="{noun} inspected"><table><thead><tr><th>Route</th><th>Title</th><th>HTTP</th><th>Controls</th><th>Console errors</th><th>Failed requests</th><th>Layout issues</th><th>{'Screen' if native else 'Page'} load time</th><th>Screenshots</th></tr></thead><tbody>{''.join(page_rows)}</tbody></table></div>"""
-    component_section = "" if not show_device_evidence else f"""<h2>Components</h2>
+    device_pages = "" if native else f"""<h2>Pages</h2>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Pages inspected"><table><thead><tr><th>Route</th><th>Title</th><th>HTTP</th><th>Controls</th><th>Console errors</th><th>Failed requests</th><th>Layout issues</th><th>Page load time</th><th>Screenshots</th></tr></thead><tbody>{''.join(page_rows)}</tbody></table></div>"""
+    component_heading = "Other components" if screen_html else "Components"
+    component_section = "" if not show_device_evidence or (screen_html and not comp_rows) else f"""<h2>{component_heading}</h2>
 <div class="table-wrap" tabindex="0" role="region" aria-label="Components"><table><thead><tr><th>Route</th><th>Kind</th><th>Label</th><th>Source</th><th>Reached via</th><th>Action class</th><th>Status</th><th>Code</th><th>{expected_heading}</th><th>Notes</th></tr></thead><tbody>{''.join(comp_rows)}</tbody></table></div>"""
     technique_table = f"""<div class="table-wrap" tabindex="0" role="region" aria-label="Tests by technique">
 <table><thead><tr><th>Technique</th><th>Pass</th><th>Fail</th><th>Flaky</th><th>Blocked</th><th>Needs review</th></tr></thead><tbody>{technique_rows}</tbody></table></div>"""
-    tests_section = (f'{_test_table(tests, run_dir, run_id)}<details class="technique-breakdown"><summary>Tests by technique</summary>{technique_table}</details>'
-                     if native else f'<h2>Tests by technique</h2>{technique_table}')
+    tests_heading = "Tests"
+    if native:
+        if screen_html:
+            tests_heading = "Other checks" if other_tests else "Test breakdown"
+        if other_tests or not screen_html:
+            tests_section = (f'<h2 id="tests">{tests_heading}</h2>{_test_list(other_tests, run_dir, run_id)}'
+                             f'<details class="technique-breakdown"><summary>Tests by technique</summary>{technique_table}</details>')
+        else:
+            tests_section = f'<h2 id="tests">Tests by technique</h2>{technique_table}'
+    else:
+        tests_section = f'<h2>Tests by technique</h2>{technique_table}'
     sections = [
-        ("tests", "Tests", tests_section),
-        ("screens" if native else "pages", noun, device_pages),
+        ("desktop-coverage", "Desktop coverage", _desktop_coverage_section(stats, run_dir, run_id)),
+        ("tests", tests_heading, tests_section),
+        ("pages", "Pages", device_pages),
         ("performance", "Performance", _perf_section(stats, tests) if native else ""),
         ("backend", "Backend", backend_section),
         ("journeys", "Journeys", _journey_section(stats) if native and not mode else ""),
         ("held-actions", "Held actions", _held_section(stats) if native and show_device_evidence else ""),
-        ("components", "Components", component_section),
+        ("components", component_heading, component_section),
     ]
     metadata = " · ".join(value for value in (_e(meta.get("framework")), _e(_format_finished(meta.get("finished_at")))) if value)
     sources = []
@@ -468,13 +652,19 @@ def write_report(run_dir: Path, run_id: str, meta: dict, stats: dict, pages: lis
     elif meta.get("repo_url"):
         commit = " @ " + _e(meta["commit_sha"][:10]) if meta.get("commit_sha") else ""
         metadata += f'<p>{_e(meta["repo_url"])}{commit}</p>'
+    if archived:
+        metadata += f'<p>{_link("report.html", run_dir, run_id, "Original report and evidence")}</p>'
     platform = stats.get("platform") or "web"
     label = {"ios": "iOS", "macos": "macOS"}.get(platform, platform.capitalize())
-    doc = _report_document(
+    return _report_document(
         run_id, mode=f"{mode.capitalize()} testing" if mode else "", platform=label,
         target=str(meta.get("live_url") or "").removeprefix(f"{platform}: "), meta_html=metadata, summary_html=summary, counts=test_counts,
-        legs_html=_leg_outcomes(stats) if native else "", findings_html="".join(cards), sections=sections,
+        legs_html=_leg_outcomes(stats) if native else "", screen_html=screen_html, findings_html="".join(cards), sections=sections,
     )
+
+
+def write_report(run_dir: Path, run_id: str, meta: dict, stats: dict, pages: list[ObservedPage], components: list[ComponentRecord], tests: list[TestRecord], findings: list[FindingRecord]) -> Path:
+    doc = render_report(run_dir, run_id, meta, stats, pages, components, tests, findings)
     out = run_dir / "report.html"
     out.write_text(doc, encoding="utf-8")
     return out
